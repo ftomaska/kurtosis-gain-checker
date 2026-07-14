@@ -47,15 +47,17 @@ Optional (only for the raw-TIFF NormCorre fallback in gain mode): caiman
 # Bump this on every change so a running instance's window title can be checked
 # against what's actually in this file -- handy when the app runs on a machine
 # separate from wherever this source file is being edited.
-APP_VERSION = "2026-07-14.8"
+APP_VERSION = "2026-07-14.9"
 
 import os
 import gc
 import glob
+import logging
+import time
 import threading
 import traceback
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 
 import math
 import numpy as np
@@ -335,6 +337,35 @@ def _resolve_raw_tiffs(plane_dir, ops):
     return None
 
 
+class _ProgressLogHandler(logging.Handler):
+    """Forwards CaImAn's own logging output to the app's status bar/progress
+    callback. CaImAn reports its internal progress via the standard `logging`
+    module (its own demo notebooks tell you to set logging.INFO to watch
+    progress) rather than exposing a progress-percent callback, so listening
+    on the logger is the documented, stable way to surface real sub-step
+    text (e.g. per-chunk/per-file messages) instead of a single static
+    "running..." string. Throttled so a chatty logger can't flood the Tk
+    event queue with after() calls."""
+
+    def __init__(self, progress_cb, min_interval=0.2):
+        super().__init__(level=logging.INFO)
+        self.progress_cb = progress_cb
+        self.min_interval = min_interval
+        self._last = 0.0
+
+    def emit(self, record):
+        now = time.monotonic()
+        if now - self._last < self.min_interval:
+            return
+        self._last = now
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return
+        if msg:
+            self.progress_cb(f"NormCorre: {msg}")
+
+
 def run_normcorre(tiff_paths, pw_rigid, progress_cb=None):
     """Priority 3 (last resort): motion-correct raw TIFFs with CaImAn's NoRMCorre."""
     try:
@@ -357,17 +388,41 @@ def run_normcorre(tiff_paths, pw_rigid, progress_cb=None):
     if progress_cb:
         progress_cb("Running NoRMCorre motion correction (this can take a while)...")
 
-    mc = MotionCorrect(
-        tiff_paths, dview=None,
-        max_shifts=(6, 6), niter_rig=1,
-        strides=(48, 48), overlaps=(24, 24),
-        max_deviation_rigid=3, shifts_opencv=True,
-        nonneg_movie=True, border_nan="copy",
-        pw_rigid=pw_rigid,
-    )
-    mc.motion_correct(save_movie=True)
-    mmap_file = mc.fname_tot_els if pw_rigid else mc.fname_tot_rig
-    m = cm.load(mmap_file[0] if isinstance(mmap_file, (list, tuple)) else mmap_file)
+    log_handler = None
+    caiman_logger = logging.getLogger("caiman")
+    prev_level = caiman_logger.level
+    if progress_cb:
+        log_handler = _ProgressLogHandler(progress_cb)
+        caiman_logger.addHandler(log_handler)
+        caiman_logger.setLevel(logging.INFO)
+
+    try:
+        mc = MotionCorrect(
+            tiff_paths, dview=None,
+            max_shifts=(6, 6), niter_rig=1,
+            strides=(48, 48), overlaps=(24, 24),
+            max_deviation_rigid=3, shifts_opencv=True,
+            nonneg_movie=True, border_nan="copy",
+            pw_rigid=pw_rigid,
+        )
+        mc.motion_correct(save_movie=True)
+    finally:
+        if log_handler is not None:
+            caiman_logger.removeHandler(log_handler)
+            caiman_logger.setLevel(prev_level)
+
+    # mc.fname_tot_rig / mc.fname_tot_els point at CaImAn's per-tiff-file
+    # mmaps from the motion-correction step, not a single joined array --
+    # loading those directly with cm.load() is what produces CaImAn's
+    # "The file is in F order, it should be in C order (see save_memmap
+    # function)" error. The fix is the same explicit re-join CaImAn's own
+    # demo pipelines use: cm.save_memmap(..., order='C') merges them into
+    # one guaranteed C-order file before loading.
+    fname_mc = mc.fname_tot_els if pw_rigid else mc.fname_tot_rig
+    if progress_cb:
+        progress_cb("NormCorre: joining motion-corrected chunks into one file...")
+    fname_joined = cm.save_memmap(fname_mc, base_name="memmap_gain_", order="C")
+    m = cm.load(fname_joined)
     arr = np.asarray(m).astype(np.float32)
     return arr
 
@@ -938,6 +993,27 @@ class KurtosisChecker:
         tk.Label(status_row, textvariable=self.status_var, bg=BG_MID, fg=TEXT_DIM,
                  font=("Helvetica", 10)).pack(side=tk.LEFT, padx=14, pady=(0, 4))
 
+        # ── progress bar row — hidden until Run Analysis starts, covers the
+        # NormCorre / CNMF / reg_tif-read steps that can take a while with
+        # no other feedback than the status text above ─────────────────────
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure("Gain.Horizontal.TProgressbar",
+                         troughcolor=BG_PANEL, background=ACCENT,
+                         bordercolor=BG_MID, lightcolor=ACCENT, darkcolor=ACCENT)
+        self._progress_row = tk.Frame(self.root, bg=BG_MID)
+        self._progress_row.pack(fill=tk.X)
+        self.gain_progress_bar = ttk.Progressbar(
+            self._progress_row, orient="horizontal", mode="determinate", value=0,
+            style="Gain.Horizontal.TProgressbar")
+        self.gain_progress_bar.pack(fill=tk.X, padx=14, pady=(0, 6))
+        # idle by default (mode="determinate", value=0 looks like an empty
+        # bar); _progress_start()/_progress_stop() switch it to an animated
+        # indeterminate bar while Run Analysis is doing real work
+
         # ── settings panels (hidden by default) ─────────────────────────
         self._settings_shared = tk.Frame(self.root, bg="#141414", pady=6)
         self._settings_kurtosis = tk.Frame(self.root, bg="#141414", pady=6)
@@ -999,18 +1075,28 @@ class KurtosisChecker:
         ent(self.dff_pct, 3)
 
     def _build_settings_gain(self, sf):
-        def lbl(t, dim=False, parent=sf):
+        # Two stacked rows instead of one long horizontal strip -- a single
+        # row of this many items (especially the longer checkbox labels)
+        # overflows past the window edge and gets silently cropped rather
+        # than wrapping, which is why "CNMF cell radius" was getting cut off.
+        row1 = tk.Frame(sf, bg="#141414")
+        row1.pack(fill=tk.X, anchor="w")
+        row2 = tk.Frame(sf, bg="#141414")
+        row2.pack(fill=tk.X, anchor="w", pady=(4, 0))
+
+        def lbl(t, dim=False, parent=row1):
             tk.Label(parent, text=t, bg="#141414",
                      fg=TEXT_DIM if dim else TEXT_MAIN,
                      font=("Helvetica", 10)).pack(side=tk.LEFT, padx=(0, 2))
 
-        def ent(var, w=6, parent=sf):
+        def ent(var, w=6, parent=row1):
             e = tk.Entry(parent, textvariable=var, width=w,
                          bg=BG_PANEL, fg="white", insertbackground="white",
                          relief=tk.FLAT, font=("Helvetica", 10))
             e.pack(side=tk.LEFT)
             return e
 
+        # ── row 1: numeric fit/analysis parameters ──────────────────────
         lbl("   ENF:")
         self.enf_var = tk.DoubleVar(value=1.2)
         ent(self.enf_var, 5)
@@ -1030,37 +1116,40 @@ class KurtosisChecker:
         self.max_frames_var = tk.IntVar(value=2000)
         ent(self.max_frames_var, 6)
 
-        lbl("   |", dim=True)
+        lbl("   |", dim=True); lbl("CNMF cell radius (px):")
+        self.cnmf_gsig_var = tk.IntVar(value=6)
+        ent(self.cnmf_gsig_var, 3)
+
+        # ── row 2: checkboxes (these have the longest labels) ───────────
+        def lbl2(t, dim=False):
+            lbl(t, dim=dim, parent=row2)
+
         self.exclude_roi_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(sf, text="Exclude cell ROIs",
+        tk.Checkbutton(row2, text="Exclude cell ROIs",
                         variable=self.exclude_roi_var, bg="#141414", fg=TEXT_MAIN,
                         selectcolor="#141414", activebackground="#141414",
-                        activeforeground="white", font=("Helvetica", 10)).pack(side=tk.LEFT, padx=(4, 0))
+                        activeforeground="white", font=("Helvetica", 10)).pack(side=tk.LEFT, padx=(0, 0))
 
-        lbl("   |", dim=True)
+        lbl2("   |", dim=True)
         self.pw_rigid_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(sf, text="NormCorre: piecewise-rigid",
+        tk.Checkbutton(row2, text="NormCorre: piecewise-rigid",
                         variable=self.pw_rigid_var, bg="#141414", fg=TEXT_MAIN,
                         selectcolor="#141414", activebackground="#141414",
                         activeforeground="white", font=("Helvetica", 10)).pack(side=tk.LEFT, padx=(4, 0))
 
-        lbl("   |", dim=True)
+        lbl2("   |", dim=True)
         self.skip_mc_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(sf, text="Skip motion correction (manual TIFF already registered)",
+        tk.Checkbutton(row2, text="Skip motion correction (manual TIFF already registered)",
                         variable=self.skip_mc_var, bg="#141414", fg=TEXT_MAIN,
                         selectcolor="#141414", activebackground="#141414",
                         activeforeground="white", font=("Helvetica", 10)).pack(side=tk.LEFT, padx=(4, 0))
 
-        lbl("   |", dim=True)
+        lbl2("   |", dim=True)
         self.save_mc_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(sf, text="Save motion-corrected TIFF (reg_tif)",
+        tk.Checkbutton(row2, text="Save motion-corrected TIFF (reg_tif)",
                         variable=self.save_mc_var, bg="#141414", fg=TEXT_MAIN,
                         selectcolor="#141414", activebackground="#141414",
                         activeforeground="white", font=("Helvetica", 10)).pack(side=tk.LEFT, padx=(4, 0))
-
-        lbl("   |", dim=True); lbl("CNMF cell radius (px):")
-        self.cnmf_gsig_var = tk.IntVar(value=6)
-        ent(self.cnmf_gsig_var, 3)
 
     def _toggle_settings(self):
         if self._settings_open:
@@ -1818,12 +1907,30 @@ class KurtosisChecker:
                 return
 
         self.status_var.set("Locating registered movie...")
+        self._progress_start()
         self.root.update_idletasks()
         t = threading.Thread(target=self._run_gain_worker, daemon=True)
         t.start()
 
     def _gain_progress(self, msg):
         self.root.after(0, lambda: self.status_var.set(msg))
+
+    def _progress_start(self):
+        """Switch the progress bar to an animated indeterminate state.
+        Safe to call from any thread (marshals onto the main loop)."""
+        def _do():
+            self.gain_progress_bar.config(mode="indeterminate")
+            self.gain_progress_bar.start(15)
+        self.root.after(0, _do)
+
+    def _progress_stop(self):
+        """Stop animating and reset the progress bar to idle/empty.
+        Safe to call from any thread (marshals onto the main loop)."""
+        def _do():
+            self.gain_progress_bar.stop()
+            self.gain_progress_bar.config(mode="determinate")
+            self.gain_progress_bar["value"] = 0
+        self.root.after(0, _do)
 
     def _ask_yesno_blocking(self, title, message):
         """Show a yes/no dialog from this background worker thread and block
@@ -1915,10 +2022,12 @@ class KurtosisChecker:
                                    mu_bin=mu_bin, var_bin=var_bin, n_bin=n_bin,
                                    fit=fit, flux=flux, flux_med=med, flux_sem=sem)
 
+            self._progress_stop()
             self.root.after(0, self._render_gain_results)
         except Exception as e:
             traceback.print_exc()
             msg = str(e)
+            self._progress_stop()
             self.root.after(0, lambda: messagebox.showerror("Analysis failed", msg))
             self.root.after(0, lambda: self.status_var.set("Analysis failed — see error dialog"))
 

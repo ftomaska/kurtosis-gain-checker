@@ -60,6 +60,8 @@ Once CaImAn is installed:
 
 **CNMF segmentation prompt:** if NormCorre just ran and there's no `F.npy` available (so the photon-flux panel would otherwise stay empty), the tool asks whether to run CaImAn's CNMF on the freshly-registered movie to detect cells and extract traces on the spot. Accepting fills in the flux panel using CNMF-derived footprints; the results panel labels these cells "CaImAn CNMF (unverified — sanity-check!)" in place of the usual "Suite2p F.npy" label, as a reminder to check the footprints/traces before trusting the numbers — this integration hasn't been validated against a real CaImAn install yet. The **"CNMF cell radius (px)"** setting (default 6) controls the expected cell size (`gSig`) passed to CNMF.
 
+**Progress feedback:** a progress bar appears below the status line for the whole duration of Run Analysis. During NormCorre specifically, the status text is fed live from CaImAn's own logging output (its documented progress-reporting mechanism), so you see real sub-step messages instead of a single static "running..." line.
+
 ### No Suite2p output at all
 
 If the selected folder has no `ops.npy` anywhere, the tool offers to run the PTC gain estimate directly on manually-selected TIFF file(s), bypassing Suite2p entirely. Without `F.npy`, only the gain estimate is available — the per-cell photon-flux panel is unavailable in this mode. A **"Skip motion correction"** setting lets you tell it the TIFF is already registered, avoiding an unnecessary NormCorre pass.
