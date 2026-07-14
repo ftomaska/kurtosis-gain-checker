@@ -47,7 +47,7 @@ Optional (only for the raw-TIFF NormCorre fallback in gain mode): caiman
 # Bump this on every change so a running instance's window title can be checked
 # against what's actually in this file -- handy when the app runs on a machine
 # separate from wherever this source file is being edited.
-APP_VERSION = "2026-07-14.12"
+APP_VERSION = "2026-07-15.3"
 
 import os
 import gc
@@ -622,7 +622,8 @@ def roi_exclusion_mask(stat, Ly, Lx):
     return mask
 
 
-def footprints_to_raw_traces(movie_arr, A, dims, threshold=0.2, min_pixels=9):
+def footprints_to_raw_traces(movie_arr, A, dims, threshold=0.2, min_pixels=9,
+                              return_indices=False):
     """Convert CNMF spatial footprints into raw pixel-sum traces read directly
     from the movie -- deliberately NOT CNMF's own C trace. CNMF's C is in the
     factorization's internal scale (A is typically close to unit-norm per
@@ -635,6 +636,10 @@ def footprints_to_raw_traces(movie_arr, A, dims, threshold=0.2, min_pixels=9):
 
     Returns (F, npix): F is (n_components_kept, T), npix is (n_components_kept,).
     Components thresholded down to fewer than min_pixels are dropped.
+    If return_indices=True, also returns kept_idx -- the column indices into
+    the *input* A that ended up in F/npix (row i of F/npix corresponds to
+    kept_idx[i]) -- so a caller juggling multiple component-quality arrays
+    (e.g. for a mask-overlay viewer) can line them back up.
     """
     Ly, Lx = dims
     A_dense = np.asarray(A.todense()) if hasattr(A, "todense") else np.asarray(A)
@@ -643,7 +648,7 @@ def footprints_to_raw_traces(movie_arr, A, dims, threshold=0.2, min_pixels=9):
     # Fortran-order per-frame flatten, to match A's column layout
     flat_movie = movie_arr.transpose(0, 2, 1).reshape(T, Ly * Lx).astype(np.float64)
 
-    F_list, npix_list = [], []
+    F_list, npix_list, idx_list = [], [], []
     for i in range(n_components):
         comp = A_dense[:, i]
         peak = comp.max()
@@ -655,16 +660,50 @@ def footprints_to_raw_traces(movie_arr, A, dims, threshold=0.2, min_pixels=9):
             continue
         F_list.append(flat_movie[:, mask].sum(axis=1))
         npix_list.append(n)
+        idx_list.append(i)
 
     if not F_list:
-        return np.zeros((0, T)), np.zeros((0,), dtype=int)
-    return np.array(F_list), np.array(npix_list, dtype=int)
+        F, npix = np.zeros((0, T)), np.zeros((0,), dtype=int)
+    else:
+        F, npix = np.array(F_list), np.array(npix_list, dtype=int)
+    if return_indices:
+        return F, npix, np.array(idx_list, dtype=int)
+    return F, npix
 
 
-def run_cnmf_segmentation(movie_arr, fs, gsig, progress_cb=None):
+def rank_and_keep_top_fraction(scores, keep_fraction=0.6):
+    """Given a 1D array of per-component quality scores (higher = better),
+    return the indices of the top `keep_fraction` of them, sorted best-first.
+    Always keeps at least 1 component if scores is non-empty."""
+    n = len(scores)
+    if n == 0:
+        return np.array([], dtype=int)
+    n_keep = max(1, math.ceil(n * keep_fraction))
+    order = np.argsort(-np.asarray(scores))  # best (highest) first
+    return order[:n_keep]
+
+
+def run_cnmf_segmentation(movie_arr, fs, gsig, progress_cb=None, keep_fraction=0.6):
     """Run CaImAn's CNMF purely for ROI/footprint detection on an already
     motion-corrected movie, then re-derive raw pixel-sum traces from those
     footprints via footprints_to_raw_traces (see its docstring for why).
+
+    After fitting, attempts CaImAn's own component-quality evaluation
+    (estimates.evaluate_components) and keeps only the top `keep_fraction`
+    of components by whatever quality score that produced -- CaImAn's CNN
+    classifier probability (cnn_preds, a real 0-1 probability) if available,
+    otherwise the r_value spatial-consistency score as a fallback (NOT a
+    true probability, just a ranking proxy -- flagged as such in mask_info).
+    If evaluation fails entirely (e.g. no CNN model installed and an older
+    CaImAn without r_values), all components are kept and mask_info notes
+    that no quality filtering was applied.
+
+    Returns (F, npix, mask_info). mask_info is a dict with everything needed
+    to render a footprint-overlay sanity-check view: dims, A_kept (dense,
+    Ly*Lx x n_kept -- the ones that survived quality filtering, before the
+    footprints_to_raw_traces pixel-count threshold), A_rejected (dense, the
+    quality-filtered-out ones), quality_metric ("CNN probability" /
+    "r_value (not a true probability)" / None), n_total, n_kept.
 
     NOTE: unlike the rest of this tool's gain-mode pipeline, this specific
     function has not been exercised against a real CaImAn install (not
@@ -719,22 +758,80 @@ def run_cnmf_segmentation(movie_arr, fs, gsig, progress_cb=None):
             "and check the console/terminal for CaImAn's own log output for the real cause."
         )
 
-    n_found = cnm.estimates.A.shape[1]
+    A_full = cnm.estimates.A
+    A_full_dense = np.asarray(A_full.todense()) if hasattr(A_full, "todense") else np.asarray(A_full)
+    n_found = A_full_dense.shape[1]
     if progress_cb:
-        progress_cb(f"CNMF found {n_found} candidate component(s); extracting raw traces...")
+        progress_cb(f"CNMF found {n_found} candidate component(s); evaluating quality...")
 
-    F, npix = footprints_to_raw_traces(movie_arr, cnm.estimates.A, (Ly, Lx),
-                                        min_pixels=max(4, int(np.pi * (gsig / 2) ** 2 * 0.3)))
-    return F, npix
+    # --- quality-based filtering: keep only the top `keep_fraction` ---
+    quality_metric = None
+    quality_scores_kept = None
+    quality_idx = np.arange(n_found)  # default: no filtering
+    try:
+        cnm.estimates.evaluate_components(images, cnm.params, dview=None)
+        cnn_preds = getattr(cnm.estimates, "cnn_preds", None)
+        r_values = getattr(cnm.estimates, "r_values", None)
+        scores = None
+        if cnn_preds is not None and len(cnn_preds) == n_found and np.all(np.isfinite(cnn_preds)) \
+                and not np.all(np.asarray(cnn_preds) < 0):
+            scores = np.asarray(cnn_preds, dtype=float)
+            quality_metric = "CNN probability"
+        elif r_values is not None and len(r_values) == n_found:
+            scores = np.asarray(r_values, dtype=float)
+            quality_metric = "r_value (spatial consistency -- not a true probability)"
+        if scores is not None:
+            quality_idx = rank_and_keep_top_fraction(scores, keep_fraction)
+            quality_idx = np.sort(quality_idx)  # keep stable column order
+            quality_scores_kept = scores[quality_idx]
+            if progress_cb:
+                progress_cb(f"Keeping top {int(round(keep_fraction * 100))}% by {quality_metric}: "
+                            f"{len(quality_idx)}/{n_found} component(s)")
+    except Exception as e:
+        # CNMF quality evaluation is optional (needs a CNN model file for the
+        # cnn_preds path, and isn't available on every CaImAn version) -- if
+        # it fails for any reason, fall back to keeping everything rather
+        # than losing the whole run over a metrics-only step.
+        if progress_cb:
+            progress_cb(f"Component-quality evaluation unavailable ({e}); keeping all components.")
+
+    rejected_idx = np.setdiff1d(np.arange(n_found), quality_idx)
+    A_quality_kept = A_full_dense[:, quality_idx]
+
+    F, npix, kept_of_quality = footprints_to_raw_traces(
+        movie_arr, A_quality_kept, (Ly, Lx),
+        min_pixels=max(4, int(np.pi * (gsig / 2) ** 2 * 0.3)),
+        return_indices=True)
+
+    mask_info = dict(
+        dims=(Ly, Lx),
+        A_kept=A_quality_kept[:, kept_of_quality] if len(kept_of_quality) else A_quality_kept[:, :0],
+        A_rejected=A_full_dense[:, rejected_idx],
+        quality_metric=quality_metric,
+        quality_scores_kept=(quality_scores_kept[kept_of_quality]
+                              if quality_scores_kept is not None and len(kept_of_quality) else None),
+        n_total=n_found,
+        n_kept=int(F.shape[0]),
+    )
+    return F, npix, mask_info
 
 
-def compute_ptc(movie_arr, spatial_bin=1, exclude_mask=None, n_mean_bins=40, chunk=200):
+def compute_ptc(movie_arr, spatial_bin=1, exclude_mask=None, n_mean_bins=40, chunk=200,
+                 margin=0):
     """Frame-differencing mean/variance PTC estimate, streamed in chunks so
     peak memory stays ~O(chunk x Y x X) instead of O(T x Y x X).
 
     For consecutive frame pairs (i, i+1): mean = (f_i+f_{i+1})/2,
     var = (f_i - f_{i+1})^2 / 2  (unbiased shot-noise variance estimator;
-    slow biological/structural signal cancels in the difference).
+    slow biological/structural signal cancels in the difference). This
+    matches the Lees et al. 2025 (Nature Protocols, Procedure 7 / Box 7-8)
+    reference method exactly.
+
+    `margin` crops this many pixels off each edge of every frame before
+    anything else (mean/var computation, binning) -- matches that same
+    reference method's practice of excluding blanking-artifact edges
+    (common on resonant-scan two-photon systems) from the PTC estimate.
+    Default 0 preserves the original no-cropping behavior.
 
     Returns per-pixel arrays (mu_px, var_px) and binned arrays
     (mu_bin, var_bin, n_bin) for plotting/fitting.
@@ -743,7 +840,17 @@ def compute_ptc(movie_arr, spatial_bin=1, exclude_mask=None, n_mean_bins=40, chu
     if T < 2:
         raise RuntimeError("Need at least 2 frames for a PTC estimate.")
 
-    Y, X = movie_arr.shape[1], movie_arr.shape[2]
+    Y0, X0 = movie_arr.shape[1], movie_arr.shape[2]
+    margin = max(0, int(margin))
+    if margin > 0:
+        if margin * 2 >= min(Y0, X0):
+            raise RuntimeError(
+                f"Edge margin ({margin}px) is too large for a {Y0}x{X0} frame -- "
+                f"nothing would be left to analyze.")
+        if exclude_mask is not None:
+            exclude_mask = exclude_mask[margin:Y0 - margin, margin:X0 - margin]
+    Y, X = Y0 - 2 * margin, X0 - 2 * margin
+
     if spatial_bin > 1:
         Yb, Xb = Y // spatial_bin, X // spatial_bin
     else:
@@ -757,6 +864,8 @@ def compute_ptc(movie_arr, spatial_bin=1, exclude_mask=None, n_mean_bins=40, chu
     while i < T - 1:
         j = min(i + chunk, T - 1)
         block = np.asarray(movie_arr[i:j + 1]).astype(np.float32)
+        if margin > 0:
+            block = block[:, margin:Y0 - margin, margin:X0 - margin]
         if spatial_bin > 1:
             block = block[:, :Yb * spatial_bin, :Xb * spatial_bin]
             # sum (not mean) across the binned pixels: for independent shot-noise
@@ -871,10 +980,20 @@ _NEURON_BODY = {
                   (83, 74), (88, 68), (81, 62)],
 }
 
-# Three expressions traced from Filip's sketches: neutral (calm, flat mouth,
-# antenna up-right), surprised (raised brow, round eye, small "o" mouth,
-# antenna straight up), annoyed (furrowed brow, squint, antenna curling
-# left). Swapped on photon impact.
+# Three expressions traced from Filip's actual SVG references (N1/N2/N3,
+# uploaded as real files -- much higher fidelity than the earlier
+# flattened chat pastes this was first guessed from):
+#   N1 = neutral: antenna sweeps up-right to a small chevron tip, calm
+#        round eye with an off-center pupil, flat mouth line.
+#   N2 = annoyed: antenna goes straight up into a fanned rake of ticks,
+#        a furrowed two-stroke eyebrow angled down over the eye, plus a
+#        small separate "mole" dot lower on the face.
+#   N3 = surprised: antenna is a big sweeping arc off to the left with a
+#        small separate tick-rake beside it, and the eye is a large,
+#        almost entirely dark almond (drawn filled, not white+pupil) --
+#        the "wide-eyed shock" look, with a tiny white catch-light
+#        instead of a normal pupil so it doesn't just vanish into black.
+# Swapped on photon impact.
 _NEURON_EXPR = {
     "neutral": dict(
         antenna=[(0, -75), (18, -100), (40, -128), (62, -148)],
@@ -882,29 +1001,36 @@ _NEURON_EXPR = {
                         [(62, -150), (70, -166)], [(68, -152), (76, -170)]],
         eyelid=[(-20, -42), (-2, -47), (18, -44)],
         eye_center=(-2, -35), eye_rx=19, eye_ry=14,
-        pupil_center=(2, -33), pupil_r=5,
+        eye_fill="white",
+        pupil_center=(3, -32), pupil_r=6, pupil_fill=None,
         mouth=[(-14, -10), (20, -12)],
         eyebrow=None,
+        extra_dots=None,
     ),
     "surprised": dict(
-        antenna=[(0, -75), (2, -105), (4, -132), (6, -150)],
-        antenna_ticks=[[(-10, -142), (-4, -158)], [(0, -146), (4, -163)],
-                        [(8, -146), (10, -163)], [(16, -142), (16, -158)]],
+        antenna=[(0, -75), (-16, -92), (-30, -104), (-38, -118), (-40, -136)],
+        antenna_ticks=[[(-52, -100), (-64, -104)], [(-54, -110), (-66, -116)],
+                        [(-52, -120), (-64, -124)]],
         eyelid=None,
-        eye_center=(0, -35), eye_rx=22, eye_ry=20,
-        pupil_center=(2, -37), pupil_r=4,
-        mouth_circle=(24, -8, 8),
-        eyebrow=[(-22, -55), (18, -62)],
+        eye_center=(0, -34), eye_rx=23, eye_ry=19,
+        eye_fill="#161616",
+        pupil_center=(6, -40), pupil_r=3.5, pupil_fill="white",
+        mouth=[(-12, -8), (18, -9)],
+        eyebrow=None,
+        extra_dots=None,
     ),
     "annoyed": dict(
-        antenna=[(0, -75), (-20, -95), (-38, -108), (-50, -112)],
-        antenna_ticks=[[(-58, -100), (-70, -108)], [(-58, -108), (-70, -118)],
-                        [(-54, -116), (-64, -128)]],
-        eyelid=[(-22, -40), (0, -46), (20, -42)],
-        eye_center=(-2, -33), eye_rx=18, eye_ry=13,
-        pupil_center=(0, -31), pupil_r=4,
-        mouth=[(-10, -10), (22, -13)],
-        eyebrow=[(-24, -48), (20, -42)],
+        antenna=[(0, -75), (0, -105), (0, -132), (0, -150)],
+        antenna_ticks=[[(-16, -142), (-24, -152)], [(-8, -146), (-12, -158)],
+                        [(2, -148), (2, -160)], [(12, -146), (18, -157)],
+                        [(20, -142), (28, -150)]],
+        eyelid=None,
+        eye_center=(-2, -33), eye_rx=19, eye_ry=15,
+        eye_fill="white",
+        pupil_center=(4, -37), pupil_r=5, pupil_fill=None,
+        mouth=None,
+        eyebrow=[(-24, -50), (2, -44), (24, -50)],
+        extra_dots=[(26, -8, 4)],
     ),
 }
 
@@ -961,12 +1087,12 @@ def draw_neuron(canvas, cx, cy, scale, expr="neutral", distort=0.0, phase=0.0,
     (ex, ey), = xf([e["eye_center"]])
     erx, ery = e["eye_rx"] * unit, e["eye_ry"] * unit
     canvas.create_oval(ex - erx, ey - ery, ex + erx, ey + ery,
-                        fill="white", outline=outline, width=2, tags=tag)
+                        fill=e.get("eye_fill", "white"), outline=outline, width=2, tags=tag)
 
     (px, py), = xf([e["pupil_center"]])
     pr = e["pupil_r"] * unit
     canvas.create_oval(px - pr, py - pr, px + pr, py + pr,
-                        fill=outline, outline="", tags=tag)
+                        fill=e.get("pupil_fill") or outline, outline="", tags=tag)
 
     if e.get("mouth"):
         pts = xf(e["mouth"])
@@ -979,16 +1105,32 @@ def draw_neuron(canvas, cx, cy, scale, expr="neutral", distort=0.0, phase=0.0,
         canvas.create_oval(mx - mr_s, my - mr_s, mx + mr_s, my + mr_s,
                             outline=outline, width=2.5, tags=tag)
 
+    for dot in (e.get("extra_dots") or []):
+        dcx, dcy, dr = dot
+        (dx, dy), = xf([(dcx, dcy)])
+        dr_s = dr * unit
+        canvas.create_oval(dx - dr_s, dy - dr_s, dx + dr_s, dy + dr_s,
+                            outline=outline, width=1.5, tags=tag)
 
+
+# Traced from Filip's actual Ch.svg reference (a real uploaded file this
+# time, viewed at full resolution -- not eyeballed off a flattened chat
+# paste). Notable corrections from the earlier guess: a scalloped row of
+# small bumps along the top of the head, the eye is a plain circle
+# bisected by a line (not a filled pupil-in-white-oval), a small curled
+# "chin" loop under the jaw in addition to the two leg curls, and one more
+# ridge spike (6 total) than before.
 _CHAMELEON = dict(
+    head_bumps=[(-50, -22), (-44, -26), (-38, -22), (-32, -26), (-26, -22), (-20, -25)],
     body=[(-55, -5), (-40, -14), (-22, -18), (-2, -20), (18, -18), (34, -10),
           (46, 2), (54, 14), (58, 26)],
     belly=[(-50, 4), (-30, 10), (-8, 10), (14, 8), (32, 10), (44, 18), (52, 26)],
-    ridge_ticks=[[(-18, -19), (-14, -30)], [(-6, -20), (-3, -32)], [(6, -19), (10, -30)],
-                 [(18, -16), (23, -27)], [(30, -11), (36, -21)]],
+    ridge_ticks=[[(-28, -20), (-24, -31)], [(-18, -19), (-14, -30)], [(-6, -20), (-3, -32)],
+                 [(6, -19), (10, -30)], [(18, -16), (23, -27)], [(30, -11), (36, -21)]],
     eye_center=(-46, -10), eye_r=7,
-    pupil_center=(-47, -10), pupil_r=2.5,
+    eye_line=[(-53, -10), (-39, -10)],
     snout=[(-55, -5), (-66, -2), (-70, 2), (-64, 4), (-55, 2)],
+    chin_curl=[(-58, 4), (-63, 10), (-57, 15), (-50, 11)],
     leg1=[(-18, 9), (-22, 20), (-16, 26), (-8, 22)],
     leg2=[(14, 9), (10, 20), (18, 26), (26, 21)],
 )
@@ -1014,7 +1156,7 @@ def draw_chameleon(canvas, cx, cy, scale, tag="chameleon", outline="#111111"):
     def xf(pts):
         return [(cx + x * unit, cy + y * unit) for (x, y) in pts]
 
-    tail = _spiral_points(58, 26, 16, turns=1.4, n=20, direction=1)
+    tail = _spiral_points(58, 26, 16, turns=1.6, n=24, direction=1)
     pts = xf(tail)
     canvas.create_line(*[c for p in pts for c in p], fill=outline, width=2.5,
                         smooth=True, capstyle=tk.ROUND, tags=tag)
@@ -1026,6 +1168,10 @@ def draw_chameleon(canvas, cx, cy, scale, tag="chameleon", outline="#111111"):
     canvas.create_line(*[c for p in pts for c in p], fill=outline, width=2,
                         smooth=True, tags=tag)
 
+    pts = xf(_CHAMELEON["head_bumps"])
+    canvas.create_line(*[c for p in pts for c in p], fill=outline, width=1.5,
+                        smooth=True, tags=tag)
+
     for tick in _CHAMELEON["ridge_ticks"]:
         pts = xf(tick)
         canvas.create_line(*[c for p in pts for c in p], fill=outline, width=2, tags=tag)
@@ -1034,18 +1180,23 @@ def draw_chameleon(canvas, cx, cy, scale, tag="chameleon", outline="#111111"):
     canvas.create_line(*[c for p in pts for c in p], fill=outline, width=2,
                         smooth=True, tags=tag)
 
+    pts = xf(_CHAMELEON["chin_curl"])
+    canvas.create_line(*[c for p in pts for c in p], fill=outline, width=2,
+                        smooth=True, capstyle=tk.ROUND, tags=tag)
+
     for leg in ("leg1", "leg2"):
         pts = xf(_CHAMELEON[leg])
         canvas.create_line(*[c for p in pts for c in p], fill=outline, width=2,
                             smooth=True, tags=tag)
 
+    # eye: a plain circle bisected by a horizontal line, not a filled
+    # pupil-in-white-oval -- matches the actual sketch (Ch.svg)
     (ex, ey), = xf([_CHAMELEON["eye_center"]])
     er = _CHAMELEON["eye_r"] * unit
     canvas.create_oval(ex - er, ey - er, ex + er, ey + er,
-                        fill="white", outline=outline, width=1.5, tags=tag)
-    (px, py), = xf([_CHAMELEON["pupil_center"]])
-    pr = _CHAMELEON["pupil_r"] * unit
-    canvas.create_oval(px - pr, py - pr, px + pr, py + pr, fill=outline, outline="", tags=tag)
+                        fill="", outline=outline, width=1.5, tags=tag)
+    pts = xf(_CHAMELEON["eye_line"])
+    canvas.create_line(*[c for p in pts for c in p], fill=outline, width=1.5, tags=tag)
 
 
 def draw_photon(canvas, cx, cy, length, amplitude, angle_deg, phase, tag="photon",
@@ -1053,14 +1204,16 @@ def draw_photon(canvas, cx, cy, length, amplitude, angle_deg, phase, tag="photon
     """Draw a wavy red 'photon' squiggle centered at (cx, cy), `length` long,
     oscillating with `amplitude`, rotated to point along its direction of
     travel (`angle_deg`), animated via `phase`. Single clean line -- no
-    highlighter-style glow underneath -- matching the sketch's linework."""
+    highlighter-style glow underneath -- matching the sketch's linework.
+    Traced from Filip's actual PH.svg reference: 3 full up-humps across the
+    squiggle's length (previously 2, guessed off a flattened chat paste)."""
     canvas.delete(tag)
     n = 24
     local_pts = []
     for i in range(n + 1):
         t = i / n
         x = (t - 0.5) * length
-        y = amplitude * math.sin(t * 4 * math.pi + phase)
+        y = amplitude * math.sin(t * 6 * math.pi + phase)
         local_pts.append((x, y))
     rad = math.radians(angle_deg)
     cos_a, sin_a = math.cos(rad), math.sin(rad)
@@ -1354,14 +1507,20 @@ class MeanProjectionViewer:
     Uses a real embedded matplotlib canvas with its navigation toolbar
     (zoom/pan + a live cursor-position readout at the bottom-left) --
     unlike the main app's plot canvas, the toolbar is kept here on
-    purpose since that readout is the whole point of this window."""
+    purpose since that readout is the whole point of this window.
 
-    W, H = 640, 700
+    Rather than just showing the image and trusting the user to go set
+    "CNMF cell radius (px)" themselves afterward, this window asks
+    directly for the cell diameter (in px) they measured and hands that
+    back via on_continue -- the caller converts it to a radius and
+    updates the setting in the same flow."""
 
-    def __init__(self, root, mean_img, on_continue):
+    W, H = 640, 720
+
+    def __init__(self, root, mean_img, default_diameter, on_continue):
         self.on_continue = on_continue
         self.top = tk.Toplevel(root)
-        self.top.title("Mean projection — check cell size before CNMF")
+        self.top.title("Mean projection — measure cell diameter")
         self.top.configure(bg=BG_DARK)
         self.top.geometry(f"{self.W}x{self.H}")
         try:
@@ -1380,9 +1539,8 @@ class MeanProjectionViewer:
                  ).pack(pady=(12, 2))
         tk.Label(self.top,
                  text="Zoom/pan below (magnifying-glass tool, then scroll or "
-                      "drag a box) to count how many pixels a cell spans, then "
-                      "set “CNMF cell radius (px)” to roughly half that "
-                      "diameter. Cursor position in pixels shows at the "
+                      "drag a box) to count how many pixels a cell spans "
+                      "across. Cursor position in pixels shows at the "
                       "bottom-left of the toolbar as you hover.",
                  bg=BG_DARK, fg=TEXT_DIM, font=("Helvetica", 9),
                  wraplength=self.W - 40, justify="left").pack(pady=(0, 8))
@@ -1412,6 +1570,20 @@ class MeanProjectionViewer:
         self.toolbar.update()
         self.canvas.draw()
 
+        entry_row = tk.Frame(self.top, bg=BG_DARK)
+        entry_row.pack(pady=(10, 2))
+        tk.Label(entry_row, text="Cell diameter you measured (px):",
+                 bg=BG_DARK, fg=TEXT_MAIN, font=("Helvetica", 10)
+                 ).pack(side=tk.LEFT, padx=(0, 8))
+        self.diam_var = tk.StringVar(value=str(default_diameter))
+        entry = tk.Entry(entry_row, textvariable=self.diam_var, width=8,
+                          bg=BG_PANEL, fg=TEXT_BRIGHT, insertbackground=TEXT_BRIGHT,
+                          relief=tk.FLAT)
+        entry.pack(side=tk.LEFT)
+        tk.Label(entry_row, text="→ sets CNMF cell radius to half of this",
+                 bg=BG_DARK, fg=TEXT_DIM, font=("Helvetica", 9)
+                 ).pack(side=tk.LEFT, padx=(8, 0))
+
         btn_row = tk.Frame(self.top, bg=BG_DARK)
         btn_row.pack(pady=10)
         tk.Button(btn_row, text="Continue →", command=self._continue,
@@ -1419,12 +1591,112 @@ class MeanProjectionViewer:
                   relief=tk.FLAT, padx=16, pady=4).pack()
 
     def _continue(self):
+        diameter = None
+        try:
+            raw = self.diam_var.get().strip()
+            if raw:
+                v = float(raw)
+                if v > 0:
+                    diameter = v
+        except Exception:
+            diameter = None
         try:
             self.top.destroy()
         except Exception:
             pass
         if self.on_continue:
-            self.on_continue()
+            self.on_continue(diameter)
+
+
+class CNMFMaskViewer:
+    """Non-blocking sanity-check popup shown right after CNMF finishes: the
+    mean projection with footprint contours overlaid so you can actually
+    see the masks CNMF found, not just trust the flux histogram. Green =
+    kept (survived component-quality filtering), red = filtered out. Same
+    zoomable/pannable matplotlib canvas as MeanProjectionViewer -- doesn't
+    block the pipeline, it's purely for visual inspection."""
+
+    W, H = 640, 700
+    THRESHOLD = 0.2  # must match footprints_to_raw_traces' own default
+
+    def __init__(self, root, mean_img, mask_info):
+        Ly, Lx = mask_info["dims"]
+        self.top = tk.Toplevel(root)
+        self.top.title("CNMF footprints — sanity check")
+        self.top.configure(bg=BG_DARK)
+        self.top.geometry(f"{self.W}x{self.H}")
+        try:
+            root.update_idletasks()
+            rx, ry = root.winfo_rootx(), root.winfo_rooty()
+            rw, rh = root.winfo_width(), root.winfo_height()
+            x = rx + (rw - self.W) // 2
+            y = ry + (rh - self.H) // 2
+            self.top.geometry(f"{self.W}x{self.H}+{max(0, x)}+{max(0, y)}")
+        except Exception:
+            pass
+
+        tk.Label(self.top, text="CNMF footprints over mean projection",
+                 bg=BG_DARK, fg=TEXT_BRIGHT, font=("Helvetica", 12, "bold")
+                 ).pack(pady=(12, 2))
+        n_total = mask_info.get("n_total", 0)
+        n_kept = mask_info.get("n_kept", 0)
+        metric = mask_info.get("quality_metric") or "no quality filtering available"
+        tk.Label(self.top,
+                 text=f"Green = kept ({n_kept}/{n_total}) via {metric}   ·   "
+                      f"Red = filtered out. Zoom/pan to check whether the "
+                      f"green outlines actually look like cells before "
+                      f"trusting the flux numbers.",
+                 bg=BG_DARK, fg=TEXT_DIM, font=("Helvetica", 9),
+                 wraplength=self.W - 40, justify="left").pack(pady=(0, 8))
+
+        self.fig = Figure(facecolor=BG_DARK)
+        ax = self.fig.add_axes([0.09, 0.07, 0.87, 0.87])
+        ax.set_facecolor(BG_DARK)
+        vmin, vmax = np.percentile(mean_img, [1, 99.5])
+        if vmax <= vmin:
+            vmax = vmin + 1.0
+        ax.imshow(mean_img, cmap="gray", vmin=vmin, vmax=vmax, interpolation="nearest")
+
+        def _overlay(A_dense, color):
+            if A_dense is None:
+                return
+            for i in range(A_dense.shape[1]):
+                comp = A_dense[:, i]
+                peak = comp.max()
+                if peak <= 0:
+                    continue
+                # A columns are flattened with x-major/y-minor order (matches
+                # footprints_to_raw_traces' flat_movie convention) -- undo
+                # that back into a (Ly, Lx) image for plotting.
+                comp2d = comp.reshape((Lx, Ly)).T
+                try:
+                    ax.contour(comp2d, levels=[self.THRESHOLD * peak],
+                               colors=[color], linewidths=1.0)
+                except Exception:
+                    pass
+
+        _overlay(mask_info.get("A_rejected"), "#e74c3c")
+        _overlay(mask_info.get("A_kept"), "#2ecc71")
+
+        ax.set_xlabel("x (px)", color=TEXT_MAIN, fontsize=8)
+        ax.set_ylabel("y (px)", color=TEXT_MAIN, fontsize=8)
+        ax.tick_params(colors=TEXT_MAIN, labelsize=7)
+        for spine in ax.spines.values():
+            spine.set_color(TEXT_DIM)
+
+        canvas_frame = tk.Frame(self.top, bg=BG_DARK)
+        canvas_frame.pack(fill=tk.BOTH, expand=True, padx=10)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=canvas_frame)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        toolbar_frame = tk.Frame(self.top, bg=BG_MID)
+        toolbar_frame.pack(fill=tk.X)
+        self.toolbar = NavigationToolbar2Tk(self.canvas, toolbar_frame)
+        self.toolbar.update()
+        self.canvas.draw()
+
+        tk.Button(self.top, text="Close", command=self.top.destroy,
+                  bg=BG_PANEL, fg=TEXT_BRIGHT, font=("Helvetica", 10),
+                  relief=tk.FLAT, padx=16, pady=4).pack(pady=10)
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -1727,12 +1999,16 @@ class KurtosisChecker:
         self.fit_lo_var = tk.DoubleVar(value=0.0)
         ent(self.fit_lo_var, 4)
         lbl("–")
-        self.fit_hi_var = tk.DoubleVar(value=98.0)
+        self.fit_hi_var = tk.DoubleVar(value=50.0)
         ent(self.fit_hi_var, 4)
 
         lbl("   |", dim=True); lbl("Spatial bin (px):")
         self.spatial_bin_var = tk.IntVar(value=1)
         ent(self.spatial_bin_var, 3)
+
+        lbl("   |", dim=True); lbl("Edge margin (px):")
+        self.margin_var = tk.IntVar(value=0)
+        ent(self.margin_var, 3)
 
         lbl("   |", dim=True); lbl("Max frames:")
         self.max_frames_var = tk.IntVar(value=2000)
@@ -2604,15 +2880,37 @@ class KurtosisChecker:
         (worker) thread until the user closes it, so it's seen and
         dismissed before the CNMF prompt fires. Same main-thread-marshal
         pattern as _ask_yesno_blocking, since Tk windows must be created
-        on the main thread."""
+        on the main thread.
+
+        The viewer asks the user directly for the cell diameter (px) they
+        measured; if they gave one, it's converted to a radius (diameter/2,
+        rounded, floor of 2) and written into cnmf_gsig_var right here, so
+        the CNMF call that follows uses it automatically instead of relying
+        on whatever was left in the Settings panel."""
         event = threading.Event()
+        result = {}
         mean_img = np.asarray(movie_array).astype(np.float32).mean(axis=0)
+        try:
+            default_diameter = max(2, int(self.cnmf_gsig_var.get())) * 2
+        except Exception:
+            default_diameter = 12
 
         def _show():
-            MeanProjectionViewer(self.root, mean_img, on_continue=event.set)
+            def _on_continue(diameter):
+                result["diameter"] = diameter
+                event.set()
+            MeanProjectionViewer(self.root, mean_img, default_diameter,
+                                  on_continue=_on_continue)
 
         self.root.after(0, _show)
         event.wait()
+
+        diameter = result.get("diameter")
+        if diameter is not None:
+            new_radius = max(2, round(diameter / 2))
+            self.cnmf_gsig_var.set(new_radius)
+            self._gain_progress(
+                f"Cell diameter set to {diameter:.0f}px -> CNMF radius {new_radius}px")
 
     def _parse_frame_start(self):
         """Parse the "Start frame" setting: blank -> None (auto-centered,
@@ -2660,8 +2958,10 @@ class KurtosisChecker:
                 exclude_mask = roi_exclusion_mask(self.g_stat, Ly, Lx)
 
             spatial_bin = max(1, int(self.spatial_bin_var.get()))
+            margin = max(0, int(self.margin_var.get()))
             mu_flat, var_flat, mu_bin, var_bin, n_bin = compute_ptc(
-                movie.array, spatial_bin=spatial_bin, exclude_mask=exclude_mask)
+                movie.array, spatial_bin=spatial_bin, exclude_mask=exclude_mask,
+                margin=margin)
 
             fit = fit_gain(mu_bin, var_bin, n_bin,
                             self.fit_lo_var.get(), self.fit_hi_var.get(), self.enf_var.get())
@@ -2689,8 +2989,11 @@ class KurtosisChecker:
                 if want_cnmf:
                     gsig = max(2, int(self.cnmf_gsig_var.get()))
                     fs_for_cnmf = max(0.1, float(self.fs_var.get()))
-                    F_cnmf, npix_cnmf = run_cnmf_segmentation(
+                    F_cnmf, npix_cnmf, mask_info = run_cnmf_segmentation(
                         movie.array, fs_for_cnmf, gsig, progress_cb=self._gain_progress)
+                    mean_img_for_mask = movie.array.mean(axis=0)
+                    self.root.after(0, lambda: CNMFMaskViewer(
+                        self.root, mean_img_for_mask, mask_info))
                     if F_cnmf.shape[0] > 0:
                         F_for_flux = F_cnmf
                         cnmf_used = True
