@@ -47,17 +47,18 @@ Optional (only for the raw-TIFF NormCorre fallback in gain mode): caiman
 # Bump this on every change so a running instance's window title can be checked
 # against what's actually in this file -- handy when the app runs on a machine
 # separate from wherever this source file is being edited.
-APP_VERSION = "2026-07-14.9"
+APP_VERSION = "2026-07-14.10"
 
 import os
 import gc
 import glob
 import logging
+import random
 import time
 import threading
 import traceback
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox
 
 import math
 import numpy as np
@@ -446,24 +447,37 @@ def save_reg_tif_chunks(arr, reg_dir, chunk_size=500, progress_cb=None):
     return n_files
 
 
-def _normcorre_then_maybe_save(tiff_paths, max_frames, pw_rigid, save_mc, save_dir, progress_cb=None):
+def _normcorre_then_maybe_save(tiff_paths, max_frames, pw_rigid, save_mc, save_dir, progress_cb=None,
+                                on_normcorre_start=None, on_normcorre_done=None):
     """Run NormCorre, optionally save the full result as reg_tif chunks
     (saved BEFORE the max_frames window is applied, so the complete
     registered movie is preserved for next time even if this run only
-    analyzed a subset of it), then trim to the analysis window."""
-    arr = run_normcorre(tiff_paths, pw_rigid, progress_cb=progress_cb)
-    note_suffix = ""
-    if save_mc:
-        try:
-            reg_dir = os.path.join(save_dir, "reg_tif")
-            n = save_reg_tif_chunks(arr, reg_dir, progress_cb=progress_cb)
-            note_suffix = f"; saved {n} chunk file(s) to {reg_dir} for next time"
-        except Exception as e:
-            note_suffix = f"; WARNING: failed to save motion-corrected TIFF ({e})"
-    if arr.shape[0] > max_frames:
-        start, end = contiguous_window(arr.shape[0], max_frames)
-        arr = arr[start:end]
-    return arr, note_suffix
+    analyzed a subset of it), then trim to the analysis window.
+
+    on_normcorre_start/on_normcorre_done bracket the whole "NormCorre is
+    genuinely needed" window (this function is only called when reg_tif
+    wasn't found) -- the GUI uses these to show/hide the big motion-
+    correction overlay. on_normcorre_done always fires, even on error, so
+    the overlay never gets stuck open."""
+    if on_normcorre_start:
+        on_normcorre_start()
+    try:
+        arr = run_normcorre(tiff_paths, pw_rigid, progress_cb=progress_cb)
+        note_suffix = ""
+        if save_mc:
+            try:
+                reg_dir = os.path.join(save_dir, "reg_tif")
+                n = save_reg_tif_chunks(arr, reg_dir, progress_cb=progress_cb)
+                note_suffix = f"; saved {n} chunk file(s) to {reg_dir} for next time"
+            except Exception as e:
+                note_suffix = f"; WARNING: failed to save motion-corrected TIFF ({e})"
+        if arr.shape[0] > max_frames:
+            start, end = contiguous_window(arr.shape[0], max_frames)
+            arr = arr[start:end]
+        return arr, note_suffix
+    finally:
+        if on_normcorre_done:
+            on_normcorre_done()
 
 
 def probe_tiff_shape(paths):
@@ -515,7 +529,8 @@ def load_tiffs_direct(paths, max_frames):
 
 
 def load_registered_movie(plane_dir, ops, max_frames, pw_rigid, progress_cb=None,
-                           ask_raw_dir=None, save_mc=False):
+                           ask_raw_dir=None, save_mc=False,
+                           on_normcorre_start=None, on_normcorre_done=None):
     """Try reg_tif -> raw tiff + NormCorre, in order.
 
     Suite2p's own data.bin is intentionally never used here — it's a
@@ -549,13 +564,15 @@ def load_registered_movie(plane_dir, ops, max_frames, pw_rigid, progress_cb=None
         )
 
     arr, note_suffix = _normcorre_then_maybe_save(
-        tiff_paths, max_frames, pw_rigid, save_mc, plane_dir, progress_cb=progress_cb)
+        tiff_paths, max_frames, pw_rigid, save_mc, plane_dir, progress_cb=progress_cb,
+        on_normcorre_start=on_normcorre_start, on_normcorre_done=on_normcorre_done)
     return RegisteredMovie(arr, "normcorre",
                             f"{len(tiff_paths)} raw TIFF(s), {arr.shape[0]} frames after "
                             f"motion correction{note_suffix}")
 
 
-def load_registered_movie_manual(raw_tiffs, max_frames, pw_rigid, skip_mc, save_mc, progress_cb=None):
+def load_registered_movie_manual(raw_tiffs, max_frames, pw_rigid, skip_mc, save_mc, progress_cb=None,
+                                  on_normcorre_start=None, on_normcorre_done=None):
     """Manual-TIFF-mode equivalent of load_registered_movie (no Suite2p ops.npy
     available). Checks for a reg_tif/ folder next to the source TIFFs first —
     including one saved by an earlier run of this same tool — before running
@@ -569,7 +586,8 @@ def load_registered_movie_manual(raw_tiffs, max_frames, pw_rigid, skip_mc, save_
         return load_tiffs_direct(raw_tiffs, max_frames)
 
     arr, note_suffix = _normcorre_then_maybe_save(
-        raw_tiffs, max_frames, pw_rigid, save_mc, source_dir, progress_cb=progress_cb)
+        raw_tiffs, max_frames, pw_rigid, save_mc, source_dir, progress_cb=progress_cb,
+        on_normcorre_start=on_normcorre_start, on_normcorre_done=on_normcorre_done)
     return RegisteredMovie(arr, "normcorre",
                             f"{len(raw_tiffs)} raw TIFF(s), {arr.shape[0]} frames after "
                             f"motion correction{note_suffix}")
@@ -800,6 +818,446 @@ def photon_flux_per_cell(F, gain_true, fs):
 
 
 # ═════════════════════════════════════════════════════════════════════════
+# Loading-animation artwork: hand-drawn neuron / chameleon / photon,
+# vectorized from Filip's sketches. Used for the Gain Estimation progress
+# indicators -- the busy-state "photon hits neuron" strip, and the bigger
+# motion-correction distortion/reassembly overlay. All coordinates below
+# are in a local unit space (roughly -70..70) that gets scaled/translated
+# at draw time, so the same data works at any on-screen size.
+# ═════════════════════════════════════════════════════════════════════════
+
+_NEURON_BODY = {
+    "triangle": [(0, -75), (45, 0), (-45, 0)],
+    "leg_left": [(-45, 0), (-58, 22), (-66, 45), (-72, 58), (-80, 68),
+                 (-88, 73), (-92, 68), (-86, 62)],
+    "leg_right": [(45, 0), (56, 24), (63, 46), (68, 58), (75, 68),
+                  (83, 74), (88, 68), (81, 62)],
+}
+
+# Three expressions traced from Filip's sketches: neutral (calm, flat mouth,
+# antenna up-right), surprised (raised brow, round eye, small "o" mouth,
+# antenna straight up), annoyed (furrowed brow, squint, antenna curling
+# left). Swapped on photon impact.
+_NEURON_EXPR = {
+    "neutral": dict(
+        antenna=[(0, -75), (18, -100), (40, -128), (62, -148)],
+        antenna_ticks=[[(50, -140), (62, -152)], [(56, -146), (66, -160)],
+                        [(62, -150), (70, -166)], [(68, -152), (76, -170)]],
+        eyelid=[(-20, -42), (-2, -47), (18, -44)],
+        eye_center=(-2, -35), eye_rx=19, eye_ry=14,
+        pupil_center=(2, -33), pupil_r=5,
+        mouth=[(-14, -10), (20, -12)],
+        eyebrow=None,
+    ),
+    "surprised": dict(
+        antenna=[(0, -75), (2, -105), (4, -132), (6, -150)],
+        antenna_ticks=[[(-10, -142), (-4, -158)], [(0, -146), (4, -163)],
+                        [(8, -146), (10, -163)], [(16, -142), (16, -158)]],
+        eyelid=None,
+        eye_center=(0, -35), eye_rx=22, eye_ry=20,
+        pupil_center=(2, -37), pupil_r=4,
+        mouth_circle=(24, -8, 8),
+        eyebrow=[(-22, -55), (18, -62)],
+    ),
+    "annoyed": dict(
+        antenna=[(0, -75), (-20, -95), (-38, -108), (-50, -112)],
+        antenna_ticks=[[(-58, -100), (-70, -108)], [(-58, -108), (-70, -118)],
+                        [(-54, -116), (-64, -128)]],
+        eyelid=[(-22, -40), (0, -46), (20, -42)],
+        eye_center=(-2, -33), eye_rx=18, eye_ry=13,
+        pupil_center=(0, -31), pupil_r=4,
+        mouth=[(-10, -10), (22, -13)],
+        eyebrow=[(-24, -48), (20, -42)],
+    ),
+}
+
+
+def draw_neuron(canvas, cx, cy, scale, expr="neutral", distort=0.0, phase=0.0,
+                 tag="neuron", body_color=None, outline="#111111"):
+    """Draw the hand-drawn neuron character at (cx, cy) with the given
+    scale (px per local unit). `expr` selects the face. `distort` in
+    [0, 1] applies scanline/phase jitter (bigger = more scrambled) that
+    the motion-correction overlay decays to zero as NormCorre "resolves"
+    the movie -- a visual stand-in for what motion correction does."""
+    body_color = body_color or "#2ecc71"
+    canvas.delete(tag)
+    unit = scale / 60.0
+
+    def xf(pts):
+        out = []
+        for (x, y) in pts:
+            jitter = (distort * 14 * math.sin(y * 0.15 + phase)
+                      + distort * 6 * math.sin(y * 0.4 - phase * 1.7))
+            out.append((cx + (x + jitter) * unit, cy + y * unit))
+        return out
+
+    tri = xf(_NEURON_BODY["triangle"])
+    canvas.create_polygon(*[c for p in tri for c in p], fill=body_color,
+                           outline=outline, width=2, tags=tag)
+
+    for leg in ("leg_left", "leg_right"):
+        pts = xf(_NEURON_BODY[leg])
+        canvas.create_line(*[c for p in pts for c in p], fill=outline, width=2.5,
+                            smooth=True, capstyle=tk.ROUND, tags=tag)
+
+    e = _NEURON_EXPR[expr]
+
+    pts = xf(e["antenna"])
+    canvas.create_line(*[c for p in pts for c in p], fill=outline, width=2.5,
+                        smooth=True, capstyle=tk.ROUND, tags=tag)
+    for tick in e["antenna_ticks"]:
+        pts = xf(tick)
+        canvas.create_line(*[c for p in pts for c in p], fill=outline, width=2, tags=tag)
+
+    if e.get("eyebrow"):
+        pts = xf(e["eyebrow"])
+        canvas.create_line(*[c for p in pts for c in p], fill=outline, width=3,
+                            capstyle=tk.ROUND, tags=tag)
+
+    if e.get("eyelid"):
+        pts = xf(e["eyelid"])
+        canvas.create_line(*[c for p in pts for c in p], fill=outline, width=2,
+                            smooth=True, tags=tag)
+
+    (ex, ey), = xf([e["eye_center"]])
+    erx, ery = e["eye_rx"] * unit, e["eye_ry"] * unit
+    canvas.create_oval(ex - erx, ey - ery, ex + erx, ey + ery,
+                        fill="white", outline=outline, width=2, tags=tag)
+
+    (px, py), = xf([e["pupil_center"]])
+    pr = e["pupil_r"] * unit
+    canvas.create_oval(px - pr, py - pr, px + pr, py + pr,
+                        fill=outline, outline="", tags=tag)
+
+    if e.get("mouth"):
+        pts = xf(e["mouth"])
+        canvas.create_line(*[c for p in pts for c in p], fill=outline, width=3,
+                            capstyle=tk.ROUND, tags=tag)
+    elif e.get("mouth_circle"):
+        mcx, mcy, mr = e["mouth_circle"]
+        (mx, my), = xf([(mcx, mcy)])
+        mr_s = mr * unit
+        canvas.create_oval(mx - mr_s, my - mr_s, mx + mr_s, my + mr_s,
+                            outline=outline, width=2.5, tags=tag)
+
+
+_CHAMELEON = dict(
+    body=[(-55, -5), (-40, -14), (-22, -18), (-2, -20), (18, -18), (34, -10),
+          (46, 2), (54, 14), (58, 26)],
+    belly=[(-50, 4), (-30, 10), (-8, 10), (14, 8), (32, 10), (44, 18), (52, 26)],
+    ridge_ticks=[[(-18, -19), (-14, -30)], [(-6, -20), (-3, -32)], [(6, -19), (10, -30)],
+                 [(18, -16), (23, -27)], [(30, -11), (36, -21)]],
+    eye_center=(-46, -10), eye_r=7,
+    pupil_center=(-47, -10), pupil_r=2.5,
+    snout=[(-55, -5), (-66, -2), (-70, 2), (-64, 4), (-55, 2)],
+    leg1=[(-18, 9), (-22, 20), (-16, 26), (-8, 22)],
+    leg2=[(14, 9), (10, 20), (18, 26), (26, 21)],
+)
+
+
+def _spiral_points(cx, cy, r0, turns=1.4, n=20, direction=1):
+    pts = []
+    for i in range(n + 1):
+        t = i / n
+        theta = direction * t * turns * 2 * math.pi
+        r = r0 * (1 - 0.85 * t)
+        pts.append((cx + r * math.cos(theta), cy + r * math.sin(theta)))
+    return pts
+
+
+def draw_chameleon(canvas, cx, cy, scale, tag="chameleon", body_color=None, outline="#111111"):
+    """Draw the hand-drawn chameleon (the 'light source' in the animation)
+    at (cx, cy), facing left, with the given scale (px per local unit)."""
+    body_color = body_color or "#159957"
+    canvas.delete(tag)
+    unit = scale / 60.0
+
+    def xf(pts):
+        return [(cx + x * unit, cy + y * unit) for (x, y) in pts]
+
+    body_pts = _CHAMELEON["body"] + list(reversed(_CHAMELEON["belly"]))
+    poly = xf(body_pts)
+    canvas.create_polygon(*[c for p in poly for c in p], fill=body_color,
+                           outline="", smooth=True, tags=tag)
+
+    tail = _spiral_points(58, 26, 16, turns=1.4, n=20, direction=1)
+    pts = xf(tail)
+    canvas.create_line(*[c for p in pts for c in p], fill=outline, width=2.5,
+                        smooth=True, capstyle=tk.ROUND, tags=tag)
+
+    pts = xf(_CHAMELEON["body"])
+    canvas.create_line(*[c for p in pts for c in p], fill=outline, width=2.5,
+                        smooth=True, capstyle=tk.ROUND, tags=tag)
+    pts = xf(_CHAMELEON["belly"])
+    canvas.create_line(*[c for p in pts for c in p], fill=outline, width=2,
+                        smooth=True, tags=tag)
+
+    for tick in _CHAMELEON["ridge_ticks"]:
+        pts = xf(tick)
+        canvas.create_line(*[c for p in pts for c in p], fill=outline, width=2, tags=tag)
+
+    pts = xf(_CHAMELEON["snout"])
+    canvas.create_line(*[c for p in pts for c in p], fill=outline, width=2,
+                        smooth=True, tags=tag)
+
+    for leg in ("leg1", "leg2"):
+        pts = xf(_CHAMELEON[leg])
+        canvas.create_line(*[c for p in pts for c in p], fill=outline, width=2,
+                            smooth=True, tags=tag)
+
+    (ex, ey), = xf([_CHAMELEON["eye_center"]])
+    er = _CHAMELEON["eye_r"] * unit
+    canvas.create_oval(ex - er, ey - er, ex + er, ey + er,
+                        fill="white", outline=outline, width=1.5, tags=tag)
+    (px, py), = xf([_CHAMELEON["pupil_center"]])
+    pr = _CHAMELEON["pupil_r"] * unit
+    canvas.create_oval(px - pr, py - pr, px + pr, py + pr, fill=outline, outline="", tags=tag)
+
+
+def draw_photon(canvas, cx, cy, length, amplitude, angle_deg, phase, tag="photon",
+                 color="#e94560", highlight="#f7a4b0"):
+    """Draw a wavy red 'photon' squiggle centered at (cx, cy), `length` long,
+    oscillating with `amplitude`, rotated to point along its direction of
+    travel (`angle_deg`), animated via `phase`."""
+    canvas.delete(tag)
+    n = 24
+    local_pts = []
+    for i in range(n + 1):
+        t = i / n
+        x = (t - 0.5) * length
+        y = amplitude * math.sin(t * 4 * math.pi + phase)
+        local_pts.append((x, y))
+    rad = math.radians(angle_deg)
+    cos_a, sin_a = math.cos(rad), math.sin(rad)
+    pts = []
+    for (x, y) in local_pts:
+        rx = x * cos_a - y * sin_a
+        ry = x * sin_a + y * cos_a
+        pts.append((cx + rx, cy + ry))
+    flat = [c for p in pts for c in p]
+    canvas.create_line(*flat, fill=highlight, width=7, smooth=True,
+                        capstyle=tk.ROUND, tags=tag)
+    canvas.create_line(*flat, fill=color, width=2.5, smooth=True,
+                        capstyle=tk.ROUND, tags=tag)
+
+
+class PhotonNeuronBar(tk.Canvas):
+    """Busy-state animation replacing the plain progress strip: a chameleon
+    (light source) launches red photon squiggles at the neuron; each impact
+    increments a running counter and swaps the neuron's expression for a
+    moment. Purely decorative -- ticks continuously while Run Analysis is
+    doing anything (reg_tif read / PTC compute / CNMF), not tied to a real
+    progress metric, since most of those steps don't expose one either."""
+
+    HEIGHT = 110
+
+    def __init__(self, parent, **kw):
+        super().__init__(parent, height=self.HEIGHT, bg=BG_MID, highlightthickness=0, **kw)
+        self._width = 400
+        self._running = False
+        self._job = None
+        self._hits = 0
+        self._expr = "neutral"
+        self._expr_until = 0.0
+        self._flight_frac = None
+        self._flight_t0 = 0.0
+        self._next_launch = 0.0
+        self._t0 = None
+        self.bind("<Configure>", self._on_resize)
+
+    def _on_resize(self, event):
+        self._width = event.width
+        if not self._running:
+            self._render(0.0)
+
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        self._hits = 0
+        self._expr = "neutral"
+        self._t0 = time.monotonic()
+        self._next_launch = 0.4
+        self._flight_frac = None
+        self._tick()
+
+    def stop(self):
+        self._running = False
+        if self._job is not None:
+            try:
+                self.after_cancel(self._job)
+            except Exception:
+                pass
+            self._job = None
+        self.delete("all")
+
+    def _tick(self):
+        if not self._running:
+            return
+        t = time.monotonic() - self._t0
+        if self._flight_frac is None and t >= self._next_launch:
+            self._flight_frac = 0.0
+            self._flight_t0 = t
+        if self._flight_frac is not None:
+            dur = 0.55
+            frac = (t - self._flight_t0) / dur
+            if frac >= 1.0:
+                self._flight_frac = None
+                self._hits += 1
+                self._expr = random.choice(["surprised", "annoyed"])
+                self._expr_until = t + 0.5
+                self._next_launch = t + random.uniform(0.5, 1.1)
+            else:
+                self._flight_frac = frac
+        if self._expr != "neutral" and t >= self._expr_until:
+            self._expr = "neutral"
+        self._render(t)
+        self._job = self.after(33, self._tick)
+
+    def _render(self, t):
+        w = max(self._width, 60)
+        h = self.HEIGHT
+        cham_cx, cham_cy = w * 0.14, h * 0.50
+        nrn_cx, nrn_cy = w * 0.82, h * 0.58
+
+        draw_chameleon(self, cham_cx, cham_cy, scale=34, tag="cham")
+        draw_neuron(self, nrn_cx, nrn_cy, scale=30, expr=self._expr, tag="nrn")
+
+        if self._flight_frac is not None:
+            x0, y0 = cham_cx + 26, cham_cy - 6
+            x1, y1 = nrn_cx - 40, nrn_cy - 45
+            fx = x0 + (x1 - x0) * self._flight_frac
+            fy = y0 + (y1 - y0) * self._flight_frac
+            angle = math.degrees(math.atan2(y1 - y0, x1 - x0))
+            draw_photon(self, fx, fy, length=26, amplitude=7,
+                        angle_deg=angle, phase=t * 14, tag="photon")
+        else:
+            self.delete("photon")
+
+        self.delete("counter")
+        self.create_text(nrn_cx, h - 8, text=f"{self._hits} photons detected",
+                          fill=TEXT_DIM, font=("Helvetica", 9), tags="counter")
+
+
+class MotionCorrectionOverlay:
+    """Big, centered popup shown specifically while NormCorre motion
+    correction is running. Shows a progress bar driven by CaImAn's own
+    log-line events (via the existing progress_cb channel) and a neuron
+    drawing whose scanline/phase distortion decays to zero as those events
+    accumulate, visually 'resolving' into the clean drawing -- a metaphor
+    for what motion correction does to the movie.
+
+    NOTE: CaImAn's motion_correct() is one blocking call with no true
+    frame-level percentage exposed, so the bar is a step-count heuristic
+    (each distinct log line nudges it forward, capped short of 100% until
+    the call actually returns) rather than an exact percentage. The UI
+    says so plainly rather than implying more precision than it has."""
+
+    W, H = 560, 560
+
+    def __init__(self, root):
+        self.top = tk.Toplevel(root)
+        self.top.title("Motion correction running...")
+        self.top.configure(bg=BG_DARK)
+        try:
+            self.top.resizable(False, False)
+        except Exception:
+            pass
+        self.top.geometry(f"{self.W}x{self.H}")
+        try:
+            root.update_idletasks()
+            rx, ry = root.winfo_rootx(), root.winfo_rooty()
+            rw, rh = root.winfo_width(), root.winfo_height()
+            x = rx + (rw - self.W) // 2
+            y = ry + (rh - self.H) // 2
+            self.top.geometry(f"{self.W}x{self.H}+{max(0, x)}+{max(0, y)}")
+        except Exception:
+            pass
+
+        tk.Label(self.top, text="Registering movie with NoRMCorre...",
+                 bg=BG_DARK, fg=TEXT_BRIGHT, font=("Helvetica", 13, "bold")
+                 ).pack(pady=(18, 4))
+
+        self._bar_w = self.W - 60
+        self.bar_canvas = tk.Canvas(self.top, width=self._bar_w, height=18,
+                                     bg=BG_DARK, highlightthickness=0)
+        self.bar_canvas.pack(pady=(6, 2))
+
+        self.pct_label = tk.Label(self.top, text="0%", bg=BG_DARK, fg=TEXT_DIM,
+                                   font=("Helvetica", 10))
+        self.pct_label.pack()
+
+        self.msg_var = tk.StringVar(value="Starting NoRMCorre...")
+        tk.Label(self.top, textvariable=self.msg_var, bg=BG_DARK, fg=TEXT_DIM,
+                 font=("Helvetica", 9), wraplength=self.W - 40
+                 ).pack(pady=(2, 8))
+
+        self._art_w = self.W - 40
+        self._art_h = self.H - 190
+        self.art_canvas = tk.Canvas(self.top, width=self._art_w, height=self._art_h,
+                                     bg=BG_DARK, highlightthickness=0)
+        self.art_canvas.pack()
+
+        self._progress = 0.0
+        self._phase = 0.0
+        self._closing = False
+        self._render_bar()
+        self._render_art()
+
+    def _render_bar(self):
+        c = self.bar_canvas
+        c.delete("all")
+        w, h = self._bar_w, 18
+        c.create_rectangle(0, 2, w, h - 2, fill=BG_PANEL, outline="")
+        fill_w = int(w * min(1.0, max(0.0, self._progress)))
+        if fill_w > 0:
+            c.create_rectangle(0, 2, fill_w, h - 2, fill=ACCENT, outline="")
+        try:
+            self.pct_label.config(text=f"{int(self._progress * 100)}%")
+        except Exception:
+            pass
+
+    def _render_art(self):
+        cx, cy = self._art_w / 2, self._art_h / 2
+        distort = max(0.0, 1.0 - self._progress)
+        draw_neuron(self.art_canvas, cx, cy, scale=120, expr="neutral",
+                    distort=distort, phase=self._phase, tag="neuron")
+
+    def tick(self, msg=None):
+        """Called (via the app's progress_cb channel) each time a new
+        CaImAn log line / status message arrives during motion correction."""
+        if self._closing:
+            return
+        if msg:
+            try:
+                self.msg_var.set(msg)
+            except Exception:
+                pass
+        self._progress += (0.95 - self._progress) * 0.18
+        self._progress = min(self._progress, 0.95)
+        self._phase += 0.35
+        self._render_bar()
+        self._render_art()
+
+    def close(self, success=True):
+        if self._closing:
+            return
+        self._closing = True
+        self._progress = 1.0
+        self._phase = 0.0
+        try:
+            self.msg_var.set("Done." if success else "Stopped.")
+        except Exception:
+            pass
+        self._render_bar()
+        self._render_art()
+        try:
+            self.top.after(450, self.top.destroy)
+        except Exception:
+            pass
+
+
+# ═════════════════════════════════════════════════════════════════════════
 # Main app
 # ═════════════════════════════════════════════════════════════════════════
 
@@ -828,6 +1286,9 @@ class KurtosisChecker:
         # gain-mode state: manual-TIFF fallback (no Suite2p output found)
         self.g_raw_tiffs = None       # list of paths, or None if using Suite2p
         self.g_raw_shape = None       # (Ly, Lx, total_frames) probed at load time
+
+        # big centered popup shown only while NormCorre is genuinely running
+        self._motion_overlay = None
 
         self.tab_var = tk.StringVar(value="kurtosis")  # "kurtosis" | "gain"
 
@@ -995,24 +1456,14 @@ class KurtosisChecker:
 
         # ── progress bar row — hidden until Run Analysis starts, covers the
         # NormCorre / CNMF / reg_tif-read steps that can take a while with
-        # no other feedback than the status text above ─────────────────────
-        style = ttk.Style()
-        try:
-            style.theme_use("clam")
-        except tk.TclError:
-            pass
-        style.configure("Gain.Horizontal.TProgressbar",
-                         troughcolor=BG_PANEL, background=ACCENT,
-                         bordercolor=BG_MID, lightcolor=ACCENT, darkcolor=ACCENT)
+        # no other feedback than the status text above. Shows the
+        # photon-hits-neuron animation instead of a generic striped bar ───
         self._progress_row = tk.Frame(self.root, bg=BG_MID)
         self._progress_row.pack(fill=tk.X)
-        self.gain_progress_bar = ttk.Progressbar(
-            self._progress_row, orient="horizontal", mode="determinate", value=0,
-            style="Gain.Horizontal.TProgressbar")
+        self.gain_progress_bar = PhotonNeuronBar(self._progress_row)
         self.gain_progress_bar.pack(fill=tk.X, padx=14, pady=(0, 6))
-        # idle by default (mode="determinate", value=0 looks like an empty
-        # bar); _progress_start()/_progress_stop() switch it to an animated
-        # indeterminate bar while Run Analysis is doing real work
+        # idle by default; _progress_start()/_progress_stop() start/stop
+        # the animation while Run Analysis is doing real work
 
         # ── settings panels (hidden by default) ─────────────────────────
         self._settings_shared = tk.Frame(self.root, bg="#141414", pady=6)
@@ -1914,22 +2365,48 @@ class KurtosisChecker:
 
     def _gain_progress(self, msg):
         self.root.after(0, lambda: self.status_var.set(msg))
+        self.root.after(0, lambda: self._motion_overlay_tick(msg))
 
     def _progress_start(self):
-        """Switch the progress bar to an animated indeterminate state.
+        """Start the photon-hits-neuron busy animation.
         Safe to call from any thread (marshals onto the main loop)."""
-        def _do():
-            self.gain_progress_bar.config(mode="indeterminate")
-            self.gain_progress_bar.start(15)
-        self.root.after(0, _do)
+        self.root.after(0, self.gain_progress_bar.start)
 
     def _progress_stop(self):
-        """Stop animating and reset the progress bar to idle/empty.
+        """Stop the busy animation and clear the strip.
         Safe to call from any thread (marshals onto the main loop)."""
+        self.root.after(0, self.gain_progress_bar.stop)
+
+    def _motion_overlay_start(self):
+        """Open the big centered motion-correction overlay. Called via
+        on_normcorre_start, from the worker thread -- marshals onto the
+        main loop. Safe to call even if one is already open (no-op)."""
         def _do():
-            self.gain_progress_bar.stop()
-            self.gain_progress_bar.config(mode="determinate")
-            self.gain_progress_bar["value"] = 0
+            if self._motion_overlay is None:
+                self._motion_overlay = MotionCorrectionOverlay(self.root)
+        self.root.after(0, _do)
+
+    def _motion_overlay_tick(self, msg=None):
+        """No-op unless the motion-correction overlay is currently open."""
+        if self._motion_overlay is not None:
+            try:
+                self._motion_overlay.tick(msg)
+            except Exception:
+                pass
+
+    def _motion_overlay_stop(self):
+        """Close the motion-correction overlay if one is open. Called via
+        on_normcorre_done, from the worker thread -- marshals onto the
+        main loop. Always fires (even on NormCorre failure) so the overlay
+        never gets stuck open."""
+        def _do():
+            if self._motion_overlay is not None:
+                ov = self._motion_overlay
+                self._motion_overlay = None
+                try:
+                    ov.close()
+                except Exception:
+                    pass
         self.root.after(0, _do)
 
     def _ask_yesno_blocking(self, title, message):
@@ -1955,12 +2432,16 @@ class KurtosisChecker:
                 movie = load_registered_movie(
                     self.g_plane_dir, self.g_ops, max_frames, pw_rigid,
                     progress_cb=self._gain_progress, ask_raw_dir=self._ask_raw_dir,
-                    save_mc=save_mc)
+                    save_mc=save_mc,
+                    on_normcorre_start=self._motion_overlay_start,
+                    on_normcorre_done=self._motion_overlay_stop)
             else:
                 movie = load_registered_movie_manual(
                     self.g_raw_tiffs, max_frames, pw_rigid,
                     skip_mc=bool(self.skip_mc_var.get()), save_mc=save_mc,
-                    progress_cb=self._gain_progress)
+                    progress_cb=self._gain_progress,
+                    on_normcorre_start=self._motion_overlay_start,
+                    on_normcorre_done=self._motion_overlay_stop)
 
             self._gain_progress(f"Computing PTC from {movie.source} ({movie.shape[0]} frames)...")
 
@@ -2028,6 +2509,7 @@ class KurtosisChecker:
             traceback.print_exc()
             msg = str(e)
             self._progress_stop()
+            self._motion_overlay_stop()  # safety net -- should already be closed via the finally in _normcorre_then_maybe_save
             self.root.after(0, lambda: messagebox.showerror("Analysis failed", msg))
             self.root.after(0, lambda: self.status_var.set("Analysis failed — see error dialog"))
 
