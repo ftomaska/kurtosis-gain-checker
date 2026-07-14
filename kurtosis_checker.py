@@ -47,7 +47,7 @@ Optional (only for the raw-TIFF NormCorre fallback in gain mode): caiman
 # Bump this on every change so a running instance's window title can be checked
 # against what's actually in this file -- handy when the app runs on a machine
 # separate from wherever this source file is being edited.
-APP_VERSION = "2026-07-14.11"
+APP_VERSION = "2026-07-14.12"
 
 import os
 import gc
@@ -67,7 +67,7 @@ import matplotlib
 matplotlib.use("TkAgg")
 from matplotlib.figure import Figure
 from matplotlib.gridspec import GridSpec
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from scipy import stats
 from scipy.ndimage import uniform_filter1d
 import scipy.io
@@ -699,7 +699,25 @@ def run_cnmf_segmentation(movie_arr, fs, gsig, progress_cb=None):
                   # frame-windowed movies this tool works with
     ))
     cnm = CNMF(n_processes=1, dview=None, params=opts)
-    cnm = cnm.fit(images)
+    try:
+        fitted = cnm.fit(images)
+    except Exception as e:
+        raise RuntimeError(f"CaImAn CNMF.fit() raised an error: {e}") from e
+
+    # Some CaImAn versions/code paths return None from fit() while mutating
+    # the CNMF object in place instead of returning the fitted object --
+    # fall back to the original `cnm` (still usable) rather than crashing
+    # on "'NoneType' object has no attribute 'estimates'".
+    if fitted is not None:
+        cnm = fitted
+    if cnm is None or getattr(cnm, "estimates", None) is None or getattr(cnm.estimates, "A", None) is None:
+        raise RuntimeError(
+            "CaImAn CNMF ran but produced no usable estimates (cnm.estimates.A is missing "
+            "or empty). This can happen if CNMF found zero components for this movie/gSig "
+            "combination, or if this installed CaImAn version's fit() behaves differently "
+            "than expected here. Try a different 'CNMF cell radius' setting or more frames, "
+            "and check the console/terminal for CaImAn's own log output for the real cause."
+        )
 
     n_found = cnm.estimates.A.shape[1]
     if progress_cb:
@@ -1056,6 +1074,38 @@ def draw_photon(canvas, cx, cy, length, amplitude, angle_deg, phase, tag="photon
                         capstyle=tk.ROUND, tags=tag)
 
 
+def draw_tally(canvas, x, y, count, tag="tally", stroke=2, line_h=16, line_w=6,
+                group_gap=9, color="#111111", max_groups=6):
+    """Draw `count` as classic 'gate' tally marks (four verticals per group
+    of five, with a diagonal fifth stroke crossing them), left to right
+    starting at (x, y) as the top-left anchor. Caps at `max_groups` full
+    groups to avoid overflowing the strip; anything beyond that collapses
+    to a '+N' text suffix instead of drawing hundreds of tiny lines.
+    Returns the x-coordinate just past the last mark drawn (for layout)."""
+    canvas.delete(tag)
+    full_groups, remainder = divmod(max(0, int(count)), 5)
+    cx = x
+    drawn_groups = min(full_groups, max_groups)
+    for _ in range(drawn_groups):
+        for i in range(4):
+            lx = cx + i * line_w
+            canvas.create_line(lx, y, lx, y + line_h, fill=color, width=stroke, tags=tag)
+        canvas.create_line(cx - 2, y + line_h + 2, cx + 3 * line_w + 2, y - 2,
+                            fill=color, width=stroke, tags=tag)
+        cx += 4 * line_w + group_gap
+
+    if full_groups > max_groups:
+        leftover = count - drawn_groups * 5
+        canvas.create_text(cx, y + line_h / 2, text=f"+{leftover}", fill=color,
+                            font=("Helvetica", 10, "bold"), anchor="w", tags=tag)
+        return cx + 28
+
+    for i in range(remainder):
+        lx = cx + i * line_w
+        canvas.create_line(lx, y, lx, y + line_h, fill=color, width=stroke, tags=tag)
+    return cx + remainder * line_w
+
+
 class PhotonNeuronBar(tk.Canvas):
     """Busy-state animation replacing the plain progress strip: a chameleon
     (light source) launches red photon squiggles at the neuron; each impact
@@ -1163,9 +1213,12 @@ class PhotonNeuronBar(tk.Canvas):
         else:
             self.delete("photon")
 
-        self.delete("counter")
-        self.create_text(nrn_cx, h - 10, text=f"{self._hits} photons detected",
-                          fill="#666666", font=("Helvetica", 9), tags="counter")
+        self.delete("counter_label")
+        label = self.create_text(14, h - 12, text="photons:", anchor="w",
+                                  fill="#666666", font=("Helvetica", 9), tags="counter_label")
+        bbox = self.bbox(label)
+        tally_x = (bbox[2] + 8) if bbox else 70
+        draw_tally(self, tally_x, h - 12, self._hits, tag="counter_tally", color="#666666")
 
 
 class MotionCorrectionOverlay:
@@ -1292,6 +1345,86 @@ class MotionCorrectionOverlay:
             self.top.after(450, self.top.destroy)
         except Exception:
             pass
+
+
+class MeanProjectionViewer:
+    """Zoomable/pannable viewer for a registered movie's mean projection,
+    shown right before the CNMF prompt so the user can eyeball how many
+    pixels a cell spans before picking the 'CNMF cell radius' setting.
+    Uses a real embedded matplotlib canvas with its navigation toolbar
+    (zoom/pan + a live cursor-position readout at the bottom-left) --
+    unlike the main app's plot canvas, the toolbar is kept here on
+    purpose since that readout is the whole point of this window."""
+
+    W, H = 640, 700
+
+    def __init__(self, root, mean_img, on_continue):
+        self.on_continue = on_continue
+        self.top = tk.Toplevel(root)
+        self.top.title("Mean projection — check cell size before CNMF")
+        self.top.configure(bg=BG_DARK)
+        self.top.geometry(f"{self.W}x{self.H}")
+        try:
+            root.update_idletasks()
+            rx, ry = root.winfo_rootx(), root.winfo_rooty()
+            rw, rh = root.winfo_width(), root.winfo_height()
+            x = rx + (rw - self.W) // 2
+            y = ry + (rh - self.H) // 2
+            self.top.geometry(f"{self.W}x{self.H}+{max(0, x)}+{max(0, y)}")
+        except Exception:
+            pass
+        self.top.protocol("WM_DELETE_WINDOW", self._continue)
+
+        tk.Label(self.top, text="Mean projection of the registered movie",
+                 bg=BG_DARK, fg=TEXT_BRIGHT, font=("Helvetica", 12, "bold")
+                 ).pack(pady=(12, 2))
+        tk.Label(self.top,
+                 text="Zoom/pan below (magnifying-glass tool, then scroll or "
+                      "drag a box) to count how many pixels a cell spans, then "
+                      "set “CNMF cell radius (px)” to roughly half that "
+                      "diameter. Cursor position in pixels shows at the "
+                      "bottom-left of the toolbar as you hover.",
+                 bg=BG_DARK, fg=TEXT_DIM, font=("Helvetica", 9),
+                 wraplength=self.W - 40, justify="left").pack(pady=(0, 8))
+
+        self.fig = Figure(facecolor=BG_DARK)
+        ax = self.fig.add_axes([0.09, 0.07, 0.87, 0.87])
+        ax.set_facecolor(BG_DARK)
+        vmin, vmax = np.percentile(mean_img, [1, 99.5])
+        if vmax <= vmin:
+            vmax = vmin + 1.0
+        ax.imshow(mean_img, cmap="gray", vmin=vmin, vmax=vmax,
+                  interpolation="nearest")
+        ax.set_xlabel("x (px)", color=TEXT_MAIN, fontsize=8)
+        ax.set_ylabel("y (px)", color=TEXT_MAIN, fontsize=8)
+        ax.tick_params(colors=TEXT_MAIN, labelsize=7)
+        for spine in ax.spines.values():
+            spine.set_color(TEXT_DIM)
+        self.ax = ax
+
+        canvas_frame = tk.Frame(self.top, bg=BG_DARK)
+        canvas_frame.pack(fill=tk.BOTH, expand=True, padx=10)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=canvas_frame)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        toolbar_frame = tk.Frame(self.top, bg=BG_MID)
+        toolbar_frame.pack(fill=tk.X)
+        self.toolbar = NavigationToolbar2Tk(self.canvas, toolbar_frame)
+        self.toolbar.update()
+        self.canvas.draw()
+
+        btn_row = tk.Frame(self.top, bg=BG_DARK)
+        btn_row.pack(pady=10)
+        tk.Button(btn_row, text="Continue →", command=self._continue,
+                  bg=ACCENT, fg="white", font=("Helvetica", 10, "bold"),
+                  relief=tk.FLAT, padx=16, pady=4).pack()
+
+    def _continue(self):
+        try:
+            self.top.destroy()
+        except Exception:
+            pass
+        if self.on_continue:
+            self.on_continue()
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -2466,6 +2599,21 @@ class KurtosisChecker:
         event.wait()
         return result.get("answer", False)
 
+    def _show_mean_projection_blocking(self, movie_array):
+        """Shows the zoomable mean-projection viewer and blocks this
+        (worker) thread until the user closes it, so it's seen and
+        dismissed before the CNMF prompt fires. Same main-thread-marshal
+        pattern as _ask_yesno_blocking, since Tk windows must be created
+        on the main thread."""
+        event = threading.Event()
+        mean_img = np.asarray(movie_array).astype(np.float32).mean(axis=0)
+
+        def _show():
+            MeanProjectionViewer(self.root, mean_img, on_continue=event.set)
+
+        self.root.after(0, _show)
+        event.wait()
+
     def _parse_frame_start(self):
         """Parse the "Start frame" setting: blank -> None (auto-centered,
         the original default behavior), otherwise an explicit non-negative
@@ -2525,6 +2673,9 @@ class KurtosisChecker:
             F_for_flux = self.g_F
             cnmf_used = False
             if F_for_flux is None:
+                self._gain_progress("Movie loaded — showing mean projection "
+                                     "for a cell-size check...")
+                self._show_mean_projection_blocking(movie.array)
                 movie_desc = ("the registered movie" if movie.source == "reg_tif"
                                else "the motion-corrected movie")
                 want_cnmf = self._ask_yesno_blocking(
