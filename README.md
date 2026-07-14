@@ -56,6 +56,10 @@ Once CaImAn is installed:
 2. Click **Run Analysis**. The tool tries to resolve the raw TIFF paths from `ops.npy` automatically; if those paths don't exist on this machine, it will prompt you to locate the raw TIFF folder manually.
 3. NoRMCorre runs (rigid by default; enable **piecewise-rigid** in Settings for non-rigid correction), then the PTC analysis proceeds as in Case 1.
 
+**Saving the motion-corrected movie:** the **"Save motion-corrected TIFF (reg_tif)"** setting (checked by default) writes the NormCorre output as `reg_tif/file000_chan0.tif`-style chunks next to the source data, matching Suite2p's own naming convention. Next time you load the same folder, the tool finds this `reg_tif/` export and uses it directly — NormCorre only ever needs to run once per recording.
+
+**CNMF segmentation prompt:** if NormCorre just ran and there's no `F.npy` available (so the photon-flux panel would otherwise stay empty), the tool asks whether to run CaImAn's CNMF on the freshly-registered movie to detect cells and extract traces on the spot. Accepting fills in the flux panel using CNMF-derived footprints; the results panel labels these cells "CaImAn CNMF (unverified — sanity-check!)" in place of the usual "Suite2p F.npy" label, as a reminder to check the footprints/traces before trusting the numbers — this integration hasn't been validated against a real CaImAn install yet. The **"CNMF cell radius (px)"** setting (default 6) controls the expected cell size (`gSig`) passed to CNMF.
+
 ### No Suite2p output at all
 
 If the selected folder has no `ops.npy` anywhere, the tool offers to run the PTC gain estimate directly on manually-selected TIFF file(s), bypassing Suite2p entirely. Without `F.npy`, only the gain estimate is available — the per-cell photon-flux panel is unavailable in this mode. A **"Skip motion correction"** setting lets you tell it the TIFF is already registered, avoiding an unnecessary NormCorre pass.
@@ -76,12 +80,14 @@ Gain Estimation mode is deliberately conservative about RAM:
 | Setting | Default | Meaning |
 |---|---|---|
 | ENF | 1.2 | Excess noise factor (GaAsP PMT); `gain_true = slope / ENF²` |
-| Fit range (pct of mean) | 40–98 | Which intensity-percentile bins are used for the shot-noise linear fit |
+| Fit range (pct of mean) | 0–98 | Which intensity-percentile bins are used for the shot-noise linear fit. Defaults to (almost) the full range — unlike a camera sensor, a PMT has no strong reason to have a read-noise floor eating into a large chunk of the dynamic range by default. Only raise the low end if the plot visibly flattens at low mean intensity for your setup. |
 | Spatial bin (px) | 1 | Superpixel binning before the PTC fit (summed, not averaged — gain estimate is invariant to this setting) |
 | Max frames | 2000 | Size of the contiguous frame window used for the PTC estimate |
 | Exclude cell ROIs | off | Restrict the PTC fit to background/non-cell pixels only |
 | NormCorre: piecewise-rigid | off | Use non-rigid motion correction instead of rigid (Case 2 only) |
 | Skip motion correction | off | Manual-TIFF mode only — skip NormCorre if the TIFF is already registered |
+| Save motion-corrected TIFF (reg_tif) | on | After NormCorre runs, save the result as `reg_tif/` chunks next to the source so future runs skip motion correction entirely |
+| CNMF cell radius (px) | 6 | Expected cell radius (`gSig`) passed to CaImAn CNMF, used only when it's offered to fill an empty flux panel after a fresh NormCorre run |
 
 Photon flux uses **raw F only** — no neuropil subtraction — consistent with the Wilt et al. convention that F0 includes all detected photons (signal + background).
 

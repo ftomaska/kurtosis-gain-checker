@@ -47,7 +47,7 @@ Optional (only for the raw-TIFF NormCorre fallback in gain mode): caiman
 # Bump this on every change so a running instance's window title can be checked
 # against what's actually in this file -- handy when the app runs on a machine
 # separate from wherever this source file is being edited.
-APP_VERSION = "2026-07-14.6"
+APP_VERSION = "2026-07-14.8"
 
 import os
 import gc
@@ -372,6 +372,45 @@ def run_normcorre(tiff_paths, pw_rigid, progress_cb=None):
     return arr
 
 
+def save_reg_tif_chunks(arr, reg_dir, chunk_size=500, progress_cb=None):
+    """Write a registered movie out as reg_tif-style chunk files
+    (file000_chan0.tif, file001_chan0.tif, ...) matching Suite2p's own
+    naming convention, so a future run picks it up automatically via
+    load_reg_tif without re-running motion correction."""
+    import tifffile
+    os.makedirs(reg_dir, exist_ok=True)
+    arr_i16 = np.clip(np.round(arr), -32768, 32767).astype(np.int16)
+    T = arr_i16.shape[0]
+    n_files = 0
+    for i, start in enumerate(range(0, T, chunk_size)):
+        chunk = arr_i16[start:start + chunk_size]
+        tifffile.imwrite(os.path.join(reg_dir, f"file{i:03d}_chan0.tif"), chunk)
+        n_files += 1
+    if progress_cb:
+        progress_cb(f"Saved motion-corrected movie: {n_files} file(s) in {reg_dir}")
+    return n_files
+
+
+def _normcorre_then_maybe_save(tiff_paths, max_frames, pw_rigid, save_mc, save_dir, progress_cb=None):
+    """Run NormCorre, optionally save the full result as reg_tif chunks
+    (saved BEFORE the max_frames window is applied, so the complete
+    registered movie is preserved for next time even if this run only
+    analyzed a subset of it), then trim to the analysis window."""
+    arr = run_normcorre(tiff_paths, pw_rigid, progress_cb=progress_cb)
+    note_suffix = ""
+    if save_mc:
+        try:
+            reg_dir = os.path.join(save_dir, "reg_tif")
+            n = save_reg_tif_chunks(arr, reg_dir, progress_cb=progress_cb)
+            note_suffix = f"; saved {n} chunk file(s) to {reg_dir} for next time"
+        except Exception as e:
+            note_suffix = f"; WARNING: failed to save motion-corrected TIFF ({e})"
+    if arr.shape[0] > max_frames:
+        start, end = contiguous_window(arr.shape[0], max_frames)
+        arr = arr[start:end]
+    return arr, note_suffix
+
+
 def probe_tiff_shape(paths):
     """Peek at TIFF page metadata (no pixel data decoded) to get (Ly, Lx, total_frames).
     Used for the manual-TIFF fallback (no Suite2p output found) so we can show a
@@ -420,7 +459,8 @@ def load_tiffs_direct(paths, max_frames):
                             f"frames [{start}:{end}) read, NOT motion-corrected")
 
 
-def load_registered_movie(plane_dir, ops, max_frames, pw_rigid, progress_cb=None, ask_raw_dir=None):
+def load_registered_movie(plane_dir, ops, max_frames, pw_rigid, progress_cb=None,
+                           ask_raw_dir=None, save_mc=False):
     """Try reg_tif -> raw tiff + NormCorre, in order.
 
     Suite2p's own data.bin is intentionally never used here — it's a
@@ -431,6 +471,10 @@ def load_registered_movie(plane_dir, ops, max_frames, pw_rigid, progress_cb=None
     load_reg_tif raises rather than silently falling through to NormCorre —
     an unexpected empty/misnamed reg_tif folder should surface as an error,
     not a silent multi-minute detour through motion correction.
+
+    If save_mc, a NormCorre result is written back out as reg_tif chunks in
+    plane_dir/reg_tif/, so the next run on this same plane finds it via
+    load_reg_tif and skips motion correction entirely.
     """
     mov = load_reg_tif(plane_dir, max_frames)
     if mov is not None:
@@ -449,12 +493,31 @@ def load_registered_movie(plane_dir, ops, max_frames, pw_rigid, progress_cb=None
             "overwritten by later runs."
         )
 
-    arr = run_normcorre(tiff_paths, pw_rigid, progress_cb=progress_cb)
-    if arr.shape[0] > max_frames:
-        start, end = contiguous_window(arr.shape[0], max_frames)
-        arr = arr[start:end]
+    arr, note_suffix = _normcorre_then_maybe_save(
+        tiff_paths, max_frames, pw_rigid, save_mc, plane_dir, progress_cb=progress_cb)
     return RegisteredMovie(arr, "normcorre",
-                            f"{len(tiff_paths)} raw TIFF(s), {arr.shape[0]} frames after motion correction")
+                            f"{len(tiff_paths)} raw TIFF(s), {arr.shape[0]} frames after "
+                            f"motion correction{note_suffix}")
+
+
+def load_registered_movie_manual(raw_tiffs, max_frames, pw_rigid, skip_mc, save_mc, progress_cb=None):
+    """Manual-TIFF-mode equivalent of load_registered_movie (no Suite2p ops.npy
+    available). Checks for a reg_tif/ folder next to the source TIFFs first —
+    including one saved by an earlier run of this same tool — before running
+    NormCorre."""
+    source_dir = os.path.dirname(raw_tiffs[0])
+    mov = load_reg_tif(source_dir, max_frames)
+    if mov is not None:
+        return mov
+
+    if skip_mc:
+        return load_tiffs_direct(raw_tiffs, max_frames)
+
+    arr, note_suffix = _normcorre_then_maybe_save(
+        raw_tiffs, max_frames, pw_rigid, save_mc, source_dir, progress_cb=progress_cb)
+    return RegisteredMovie(arr, "normcorre",
+                            f"{len(raw_tiffs)} raw TIFF(s), {arr.shape[0]} frames after "
+                            f"motion correction{note_suffix}")
 
 
 def roi_exclusion_mask(stat, Ly, Lx):
@@ -465,6 +528,94 @@ def roi_exclusion_mask(stat, Ly, Lx):
         valid = (yp >= 0) & (yp < Ly) & (xp >= 0) & (xp < Lx)
         mask[yp[valid], xp[valid]] = False
     return mask
+
+
+def footprints_to_raw_traces(movie_arr, A, dims, threshold=0.2, min_pixels=9):
+    """Convert CNMF spatial footprints into raw pixel-sum traces read directly
+    from the movie -- deliberately NOT CNMF's own C trace. CNMF's C is in the
+    factorization's internal scale (A is typically close to unit-norm per
+    component), not raw ADU, so using it directly would silently break the
+    gain/photon-flux conversion, which expects F to be a sum of raw ADU over
+    the ROI mask (matching Suite2p's F.npy convention).
+
+    A is (Ly*Lx, n_components), flattened in Fortran order to match CaImAn's
+    own convention for reshaping (Ly, Lx) footprints into columns.
+
+    Returns (F, npix): F is (n_components_kept, T), npix is (n_components_kept,).
+    Components thresholded down to fewer than min_pixels are dropped.
+    """
+    Ly, Lx = dims
+    A_dense = np.asarray(A.todense()) if hasattr(A, "todense") else np.asarray(A)
+    n_components = A_dense.shape[1]
+    T = movie_arr.shape[0]
+    # Fortran-order per-frame flatten, to match A's column layout
+    flat_movie = movie_arr.transpose(0, 2, 1).reshape(T, Ly * Lx).astype(np.float64)
+
+    F_list, npix_list = [], []
+    for i in range(n_components):
+        comp = A_dense[:, i]
+        peak = comp.max()
+        if peak <= 0:
+            continue
+        mask = comp >= (threshold * peak)
+        n = int(mask.sum())
+        if n < min_pixels:
+            continue
+        F_list.append(flat_movie[:, mask].sum(axis=1))
+        npix_list.append(n)
+
+    if not F_list:
+        return np.zeros((0, T)), np.zeros((0,), dtype=int)
+    return np.array(F_list), np.array(npix_list, dtype=int)
+
+
+def run_cnmf_segmentation(movie_arr, fs, gsig, progress_cb=None):
+    """Run CaImAn's CNMF purely for ROI/footprint detection on an already
+    motion-corrected movie, then re-derive raw pixel-sum traces from those
+    footprints via footprints_to_raw_traces (see its docstring for why).
+
+    NOTE: unlike the rest of this tool's gain-mode pipeline, this specific
+    function has not been exercised against a real CaImAn install (not
+    available in the dev/test environment this tool was built in) -- treat
+    it as a first-pass implementation and sanity-check the extracted traces
+    against your data (e.g. do the footprints look like real cells, not
+    scrambled or off-target) before trusting the resulting photon flux.
+    """
+    try:
+        from caiman.source_extraction.cnmf import CNMF
+        from caiman.source_extraction.cnmf.params import CNMFParams
+    except ImportError as e:
+        raise RuntimeError(
+            "CaImAn is not installed, so CNMF segmentation can't run.\n\n"
+            "  conda install -n base -c conda-forge mamba\n"
+            "  mamba create -n caiman caiman\n"
+            "  conda activate caiman\n\n"
+            f"(underlying error: {e})"
+        )
+
+    if progress_cb:
+        progress_cb("Running CaImAn CNMF segmentation...")
+
+    T, Ly, Lx = movie_arr.shape
+    images = movie_arr.astype(np.float32)
+
+    opts = CNMFParams(params_dict=dict(
+        fr=fs, decay_time=0.4,
+        gSig=[gsig, gsig], p=1, nb=2,
+        merge_thr=0.85,
+        rf=None,  # whole-FOV, no patches -- simpler and adequate for the
+                  # frame-windowed movies this tool works with
+    ))
+    cnm = CNMF(n_processes=1, dview=None, params=opts)
+    cnm = cnm.fit(images)
+
+    n_found = cnm.estimates.A.shape[1]
+    if progress_cb:
+        progress_cb(f"CNMF found {n_found} candidate component(s); extracting raw traces...")
+
+    F, npix = footprints_to_raw_traces(movie_arr, cnm.estimates.A, (Ly, Lx),
+                                        min_pixels=max(4, int(np.pi * (gsig / 2) ** 2 * 0.3)))
+    return F, npix
 
 
 def compute_ptc(movie_arr, spatial_bin=1, exclude_mask=None, n_mean_bins=40, chunk=200):
@@ -550,19 +701,36 @@ def compute_ptc(movie_arr, spatial_bin=1, exclude_mask=None, n_mean_bins=40, chu
 def fit_gain(mu_bin, var_bin, n_bin, fit_pct_lo, fit_pct_hi, enf):
     """Weighted linear fit over the shot-noise-dominated region.
 
+    fit_pct_lo/fit_pct_hi default to 0/98: unlike a camera sensor, a GaAsP
+    PMT has no strong reason to have a read-noise-dominated floor eating
+    into a large fraction of the dynamic range, so by default nothing is
+    excluded except a saturation guard at the very top. Narrowing fit_pct_lo
+    above 0 is only warranted if the plot actually shows a flattening at
+    low mean intensity for your specific setup.
+
     Returns dict with slope (apparent gain), gain_true (ENF-corrected),
-    intercept, r2, and the boolean mask of bins used in the fit.
+    intercept, r2, mask (bins used in the fit), and low_mask/high_mask
+    (bins excluded at the low/high end respectively, tracked separately so
+    a "read-noise floor" can only ever be drawn from genuinely low-end-
+    excluded bins, not conflated with high-end saturation exclusions).
     """
-    if len(mu_bin) < 3:
+    n = len(mu_bin)
+    if n < 3:
+        empty = np.zeros(n, dtype=bool)
         return dict(slope=np.nan, gain_true=np.nan, intercept=np.nan, r2=np.nan,
-                     mask=np.zeros(len(mu_bin), dtype=bool))
+                     mask=empty, low_mask=empty, high_mask=empty)
     lo, hi = np.percentile(mu_bin, [fit_pct_lo, fit_pct_hi])
-    mask = (mu_bin >= lo) & (mu_bin <= hi)
+    low_mask = mu_bin < lo
+    high_mask = mu_bin > hi
+    mask = ~low_mask & ~high_mask
     if mask.sum() < 3:
-        mask = np.ones(len(mu_bin), dtype=bool)
+        mask = np.ones(n, dtype=bool)
+        low_mask = np.zeros(n, dtype=bool)
+        high_mask = np.zeros(n, dtype=bool)
     slope, intercept, r2 = weighted_linfit(mu_bin[mask], var_bin[mask], n_bin[mask])
     gain_true = slope / (enf ** 2) if slope and np.isfinite(slope) else np.nan
-    return dict(slope=slope, gain_true=gain_true, intercept=intercept, r2=r2, mask=mask)
+    return dict(slope=slope, gain_true=gain_true, intercept=intercept, r2=r2,
+                 mask=mask, low_mask=low_mask, high_mask=high_mask)
 
 
 def photon_flux_per_cell(F, gain_true, fs):
@@ -848,7 +1016,7 @@ class KurtosisChecker:
         ent(self.enf_var, 5)
 
         lbl("   |", dim=True); lbl("Fit range (pct of mean):")
-        self.fit_lo_var = tk.DoubleVar(value=40.0)
+        self.fit_lo_var = tk.DoubleVar(value=0.0)
         ent(self.fit_lo_var, 4)
         lbl("–")
         self.fit_hi_var = tk.DoubleVar(value=98.0)
@@ -882,6 +1050,17 @@ class KurtosisChecker:
                         variable=self.skip_mc_var, bg="#141414", fg=TEXT_MAIN,
                         selectcolor="#141414", activebackground="#141414",
                         activeforeground="white", font=("Helvetica", 10)).pack(side=tk.LEFT, padx=(4, 0))
+
+        lbl("   |", dim=True)
+        self.save_mc_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(sf, text="Save motion-corrected TIFF (reg_tif)",
+                        variable=self.save_mc_var, bg="#141414", fg=TEXT_MAIN,
+                        selectcolor="#141414", activebackground="#141414",
+                        activeforeground="white", font=("Helvetica", 10)).pack(side=tk.LEFT, padx=(4, 0))
+
+        lbl("   |", dim=True); lbl("CNMF cell radius (px):")
+        self.cnmf_gsig_var = tk.IntVar(value=6)
+        ent(self.cnmf_gsig_var, 3)
 
     def _toggle_settings(self):
         if self._settings_open:
@@ -1646,26 +1825,35 @@ class KurtosisChecker:
     def _gain_progress(self, msg):
         self.root.after(0, lambda: self.status_var.set(msg))
 
+    def _ask_yesno_blocking(self, title, message):
+        """Show a yes/no dialog from this background worker thread and block
+        until answered. tkinter dialogs must run on the main thread, so this
+        marshals the call via root.after and waits on an Event for the result."""
+        result = {}
+        event = threading.Event()
+        def _ask():
+            result["answer"] = messagebox.askyesno(title, message)
+            event.set()
+        self.root.after(0, _ask)
+        event.wait()
+        return result.get("answer", False)
+
     def _run_gain_worker(self):
         try:
             max_frames = max(50, int(self.max_frames_var.get()))
             pw_rigid = bool(self.pw_rigid_var.get())
+            save_mc = bool(self.save_mc_var.get())
 
             if self.g_plane_dir is not None:
                 movie = load_registered_movie(
                     self.g_plane_dir, self.g_ops, max_frames, pw_rigid,
-                    progress_cb=self._gain_progress, ask_raw_dir=self._ask_raw_dir)
-            elif self.skip_mc_var.get():
-                self._gain_progress("Reading TIFF frames (no motion correction)...")
-                movie = load_tiffs_direct(self.g_raw_tiffs, max_frames)
+                    progress_cb=self._gain_progress, ask_raw_dir=self._ask_raw_dir,
+                    save_mc=save_mc)
             else:
-                arr = run_normcorre(self.g_raw_tiffs, pw_rigid, progress_cb=self._gain_progress)
-                if arr.shape[0] > max_frames:
-                    start, end = contiguous_window(arr.shape[0], max_frames)
-                    arr = arr[start:end]
-                movie = RegisteredMovie(arr, "normcorre",
-                                         f"{len(self.g_raw_tiffs)} raw TIFF(s), "
-                                         f"{arr.shape[0]} frames after motion correction")
+                movie = load_registered_movie_manual(
+                    self.g_raw_tiffs, max_frames, pw_rigid,
+                    skip_mc=bool(self.skip_mc_var.get()), save_mc=save_mc,
+                    progress_cb=self._gain_progress)
 
             self._gain_progress(f"Computing PTC from {movie.source} ({movie.shape[0]} frames)...")
 
@@ -1678,24 +1866,51 @@ class KurtosisChecker:
             mu_flat, var_flat, mu_bin, var_bin, n_bin = compute_ptc(
                 movie.array, spatial_bin=spatial_bin, exclude_mask=exclude_mask)
 
+            fit = fit_gain(mu_bin, var_bin, n_bin,
+                            self.fit_lo_var.get(), self.fit_hi_var.get(), self.enf_var.get())
+
+            # Cell traces: existing Suite2p F.npy, or -- only when motion
+            # correction just genuinely ran and there's no F.npy at all, so the
+            # flux panel would otherwise be empty -- offer CaImAn CNMF.
+            F_for_flux = self.g_F
+            cnmf_used = False
+            if F_for_flux is None and movie.source == "normcorre":
+                want_cnmf = self._ask_yesno_blocking(
+                    "Run cell segmentation?",
+                    "Motion correction just ran and there's no Suite2p F.npy, so the "
+                    "photon-flux panel would otherwise stay empty.\n\n"
+                    "Run CaImAn CNMF on the registered movie to detect cells and "
+                    "extract traces? (First-pass integration — sanity-check the "
+                    "resulting footprints/traces against your data before trusting "
+                    "the photon flux numbers.)")
+                if want_cnmf:
+                    gsig = max(2, int(self.cnmf_gsig_var.get()))
+                    fs_for_cnmf = max(0.1, float(self.fs_var.get()))
+                    F_cnmf, npix_cnmf = run_cnmf_segmentation(
+                        movie.array, fs_for_cnmf, gsig, progress_cb=self._gain_progress)
+                    if F_cnmf.shape[0] > 0:
+                        F_for_flux = F_cnmf
+                        cnmf_used = True
+                    else:
+                        self._gain_progress("CNMF found no usable components — "
+                                             "continuing without a flux panel.")
+
             # capture lightweight metadata, then drop the (possibly huge) movie array
             movie_source, movie_note, movie_shape = movie.source, movie.note, movie.shape
             del movie
             gc.collect()
 
-            fit = fit_gain(mu_bin, var_bin, n_bin,
-                            self.fit_lo_var.get(), self.fit_hi_var.get(), self.enf_var.get())
-
-            has_cells = self.g_F is not None
+            has_cells = F_for_flux is not None and len(F_for_flux) > 0
             if has_cells:
                 fs = max(0.1, float(self.fs_var.get()))
-                flux = photon_flux_per_cell(self.g_F, fit["gain_true"], fs)
+                flux = photon_flux_per_cell(F_for_flux, fit["gain_true"], fs)
                 med, sem = bootstrap_median_sem(flux)
             else:
                 flux, med, sem = None, np.nan, np.nan
 
             self.g_results = dict(movie_source=movie_source, movie_note=movie_note,
                                    movie_shape=movie_shape, has_cells=has_cells,
+                                   cnmf_used=cnmf_used, n_cells=(len(F_for_flux) if has_cells else 0),
                                    mu_flat=mu_flat, var_flat=var_flat,
                                    mu_bin=mu_bin, var_bin=var_bin, n_bin=n_bin,
                                    fit=fit, flux=flux, flux_med=med, flux_sem=sem)
@@ -1740,8 +1955,15 @@ class KurtosisChecker:
             yline = fit["slope"] * xline + fit["intercept"]
             ax_ptc.plot(xline, yline, color=C_FIT, lw=2, zorder=4,
                         label=f"shot-noise fit (slope={fit['slope']:.2f})")
-            floor = np.median(r["var_bin"][~mask]) if (~mask).sum() else fit["intercept"]
-            ax_ptc.axhline(floor, color=C_FLOOR, lw=1.2, ls="--", alpha=0.8, zorder=2, label="read-noise floor")
+            # Only draw a "read-noise floor" line when bins were actually excluded
+            # at the LOW end (fit_pct_lo > 0) -- otherwise there's nothing to draw
+            # a floor from, and conflating it with high-end saturation-excluded
+            # bins would mislabel them.
+            low_mask = fit.get("low_mask")
+            if low_mask is not None and low_mask.sum():
+                floor = np.median(r["var_bin"][low_mask])
+                ax_ptc.axhline(floor, color=C_FLOOR, lw=1.2, ls="--", alpha=0.8,
+                                zorder=2, label="read-noise floor (excluded low bins)")
 
         ax_ptc.set_xlabel("Mean (ADU)", color=TEXT_DIM, fontsize=9)
         ax_ptc.set_ylabel("Variance (ADU²)", color=TEXT_DIM, fontsize=9)
@@ -1768,6 +1990,7 @@ class KurtosisChecker:
                         color=TEXT_DIM, fontsize=9)
         else:
             flux = r["flux"][np.isfinite(r["flux"])]
+            cell_src = "CaImAn CNMF (unverified — sanity-check!)" if r.get("cnmf_used") else "Suite2p F.npy"
             if len(flux):
                 ax_hist.hist(flux, bins=30, color=C_HIST, alpha=0.75)
                 ax_hist.axvline(r["flux_med"], color="white", lw=1.5, ls="--")
@@ -1778,14 +2001,17 @@ class KurtosisChecker:
                             bbox=dict(facecolor=BG_MID, edgecolor="#555", boxstyle="round,pad=0.4"))
             ax_hist.set_xlabel("Photons / cell / s", color=TEXT_DIM, fontsize=9)
             ax_hist.set_ylabel("Cells", color=TEXT_DIM, fontsize=9)
-            ax_hist.set_title("Per-cell photon flux", color=TEXT_BRIGHT, fontsize=10, pad=8)
+            ax_hist.set_title(f"Per-cell photon flux  ·  cells via {cell_src}",
+                               color=(C_HIST if r.get("cnmf_used") else TEXT_BRIGHT), fontsize=10, pad=8)
 
         self.canvas.draw()
 
         if r.get("has_cells", True):
+            cell_src = "CNMF" if r.get("cnmf_used") else "Suite2p"
             self.status_var.set(
                 f"Done  ·  source={r['movie_source']}  ({r['movie_note']})  ·  "
-                f"gain_true={gain_true:.2f} ADU/ph  ·  median flux={r['flux_med']:.1f}±{r['flux_sem']:.1f} ph/cell/s")
+                f"gain_true={gain_true:.2f} ADU/ph  ·  cells via {cell_src}  ·  "
+                f"median flux={r['flux_med']:.1f}±{r['flux_sem']:.1f} ph/cell/s")
         else:
             self.status_var.set(
                 f"Done  ·  source={r['movie_source']}  ({r['movie_note']})  ·  "
