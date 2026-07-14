@@ -1,0 +1,91 @@
+# Kurtosis / Gain Estimation Checker
+
+A desktop tool for two-photon calcium imaging QC, built around Suite2p output. It has two modes, toggled from the top bar:
+
+- **Kurtosis** — sorts and visualizes ROI traces by kurtosis or SNR to spot noisy or non-cell-like extractions.
+- **Gain Estimation** — runs a photon-transfer-curve ("hockey stick") analysis on a Suite2p recording to recover true PMT/camera gain (ADU/photon) and convert each cell's fluorescence to photons/cell/s.
+
+This README focuses on **Gain Estimation** mode, since that's the part with real setup decisions.
+
+## Installation
+
+```
+pip install numpy scipy matplotlib pillow tifffile
+python kurtosis_checker.py
+```
+
+That's everything you need if you already have registered TIFFs saved (see Case 1 below). CaImAn is an optional, heavier dependency only needed if Suite2p's `reg_tif` export is missing (Case 2).
+
+## Gain Estimation: two setup cases
+
+Click **Gain Estimation** in the top bar, then **Load Data** and select any folder at or above your Suite2p output. The tool recursively searches *downstream* of whatever folder you select for a directory containing `ops.npy` — there's no fixed list of expected folder names, so it works whether you're parked at the session folder, a custom intermediate folder (e.g. a `small/` subfolder for a downsampled test run), the `suite2p` folder, or `plane0` itself directly.
+
+If the tree contains **more than one** `ops.npy` — for example an older full-resolution run sitting alongside a newer downsampled one — the search specifically prefers whichever one has a *usable* `reg_tif` export over one that doesn't, rather than just grabbing the first/shallowest match. That matters: picking a plane with cell traces but no registered movie silently sends you down the slow CaImAn path for no reason.
+
+### Case 1 — You have registered TIFFs saved (recommended, no CaImAn needed)
+
+If you ran Suite2p with the `reg_tif` option enabled, your plane folder has a `reg_tif/` subfolder containing the motion-corrected movie as TIFF chunks (e.g. `file000_chan0.tif`, `file001_chan0.tif`, ...). This is the tool's preferred source and requires nothing beyond the core dependencies above.
+
+1. **Load Data** → select the folder. The status bar shows the *full resolved path* plus an honest `reg_tif found (N file(s))` / `no usable reg_tif` hint, computed with the same file-matching logic Run Analysis uses — so this can never claim reg_tif is available and then fall back anyway.
+2. Click **Run Analysis**.
+3. The tool reads only the chunk files it needs for a contiguous window of frames (see *Memory behavior* below), computes the PTC gain fit, and shows:
+   - Left panel: the hockey-stick plot (mean vs. variance, shot-noise fit, read-noise floor)
+   - Right panel: per-cell photon flux histogram (median ± bootstrap SEM)
+
+**Notes:**
+- Suite2p's own `data.bin` binary is deliberately *never* used as a fallback, even if present — it's a scratch/working file Suite2p can overwrite on a later run, so it isn't a trustworthy record of the frames that produced your `F.npy`. If there's no `reg_tif` export, the tool goes straight to Case 2 rather than silently trusting `data.bin`.
+- File matching inside `reg_tif/` is case-insensitive and doesn't require `chan0` in the filename. If a `reg_tif/` folder exists but genuinely has no readable TIFFs inside it, the tool raises an error listing that folder's contents rather than silently falling back to Case 2.
+
+### Case 2 (optional) — You don't have motion-corrected TIFFs saved
+
+If `reg_tif` wasn't exported, the tool falls back to the raw acquisition TIFFs and motion-corrects them on the fly using **NoRMCorre**, via **CaImAn**. This is slower and heavier, so it's opt-in territory rather than the default path.
+
+Install CaImAn (compiled dependencies mean mamba/conda is the supported route — plain `pip install caiman` is not):
+
+```
+conda install -n base -c conda-forge mamba
+mamba create -n caiman caiman
+conda activate caiman
+```
+
+Windows note: if `conda install` fails with `SSL module is not available`, that's a broken/mismatched OpenSSL DLL pairing, not a real certificate problem. Try the [fix-conda-ssl](https://github.com/davidfokkema/fix-conda-ssl) tool, or do a clean Miniforge/Miniconda reinstall if the manual fix doesn't resolve it.
+
+Once CaImAn is installed:
+
+1. **Load Data** → select the folder. The status bar shows `no reg_tif export — will need NormCorre on raw TIFFs`.
+2. Click **Run Analysis**. The tool tries to resolve the raw TIFF paths from `ops.npy` automatically; if those paths don't exist on this machine, it will prompt you to locate the raw TIFF folder manually.
+3. NoRMCorre runs (rigid by default; enable **piecewise-rigid** in Settings for non-rigid correction), then the PTC analysis proceeds as in Case 1.
+
+### No Suite2p output at all
+
+If the selected folder has no `ops.npy` anywhere, the tool offers to run the PTC gain estimate directly on manually-selected TIFF file(s), bypassing Suite2p entirely. Without `F.npy`, only the gain estimate is available — the per-cell photon-flux panel is unavailable in this mode. A **"Skip motion correction"** setting lets you tell it the TIFF is already registered, avoiding an unnecessary NormCorre pass.
+
+## Memory behavior
+
+Gain Estimation mode is deliberately conservative about RAM:
+
+- The registered movie is **only** loaded when you click **Run Analysis** — never on folder load, never on tab switch.
+- Above ~1.5 GB estimated usage, a confirmation dialog shows the estimate before loading anything.
+- For chunked `reg_tif` exports, only the chunk files overlapping the needed frame window are decoded — file headers are probed first (no pixel data) to figure out which chunks are actually needed.
+- Frame subsampling (`Max frames` setting) always picks a **contiguous** window of frames, not evenly-spaced samples — the PTC's frame-differencing noise estimate requires genuinely adjacent frames.
+- `reg_tif`/raw-TIFF arrays are kept in their native dtype (typically int16) rather than eagerly upcast to float32; the PTC computation streams frame-pairs in chunks so peak memory doesn't scale with total recording length.
+- The raw movie array is dropped from memory immediately after the PTC bins are computed.
+
+## Key settings (Gain Estimation)
+
+| Setting | Default | Meaning |
+|---|---|---|
+| ENF | 1.2 | Excess noise factor (GaAsP PMT); `gain_true = slope / ENF²` |
+| Fit range (pct of mean) | 40–98 | Which intensity-percentile bins are used for the shot-noise linear fit |
+| Spatial bin (px) | 1 | Superpixel binning before the PTC fit (summed, not averaged — gain estimate is invariant to this setting) |
+| Max frames | 2000 | Size of the contiguous frame window used for the PTC estimate |
+| Exclude cell ROIs | off | Restrict the PTC fit to background/non-cell pixels only |
+| NormCorre: piecewise-rigid | off | Use non-rigid motion correction instead of rigid (Case 2 only) |
+| Skip motion correction | off | Manual-TIFF mode only — skip NormCorre if the TIFF is already registered |
+
+Photon flux uses **raw F only** — no neuropil subtraction — consistent with the Wilt et al. convention that F0 includes all detected photons (signal + background).
+
+## Repo contents
+
+- `kurtosis_checker.py` — the app (single file, tkinter + matplotlib)
+- `hockey_stick_requirements.txt` — dependency list, including the CaImAn/NormCorre setup notes above
