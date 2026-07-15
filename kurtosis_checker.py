@@ -47,7 +47,7 @@ Optional (only for the raw-TIFF NormCorre fallback in gain mode): caiman
 # Bump this on every change so a running instance's window title can be checked
 # against what's actually in this file -- handy when the app runs on a machine
 # separate from wherever this source file is being edited.
-APP_VERSION = "2026-07-15.3"
+APP_VERSION = "2026-07-15.4"
 
 import os
 import gc
@@ -964,267 +964,150 @@ def photon_flux_per_cell(F, gain_true, fs):
 
 
 # ═════════════════════════════════════════════════════════════════════════
-# Loading-animation artwork: hand-drawn neuron / chameleon / photon,
-# vectorized from Filip's sketches. Used for the Gain Estimation progress
-# indicators -- the busy-state "photon hits neuron" strip, and the bigger
-# motion-correction distortion/reassembly overlay. All coordinates below
-# are in a local unit space (roughly -70..70) that gets scaled/translated
-# at draw time, so the same data works at any on-screen size.
+# Loading-animation artwork: Filip's actual sketches, embedded directly as
+# images (PNG, extracted from the SVG files he uploaded and trimmed to
+# their content bbox) rather than hand-traced vector line art -- hand-
+# tracing kept not looking right across several rounds, so this draws the
+# real drawings themselves. Files live in an "art/" folder next to this
+# script; each is loaded once, cached, then resized/rotated/distorted per
+# frame as needed. Used for the Gain Estimation progress indicators -- the
+# busy-state "photon hits neuron" strip, and the bigger motion-correction
+# distortion/reassembly overlay.
 # ═════════════════════════════════════════════════════════════════════════
 
-_NEURON_BODY = {
-    "triangle": [(0, -75), (45, 0), (-45, 0)],
-    "leg_left": [(-45, 0), (-58, 22), (-66, 45), (-72, 58), (-80, 68),
-                 (-88, 73), (-92, 68), (-86, 62)],
-    "leg_right": [(45, 0), (56, 24), (63, 46), (68, 58), (75, 68),
-                  (83, 74), (88, 68), (81, 62)],
+_ART_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "art")
+
+_ART_FILES = {
+    "neuron_neutral": "neuron_neutral.png",
+    "neuron_annoyed": "neuron_annoyed.png",
+    "neuron_surprised": "neuron_surprised.png",
+    "chameleon": "chameleon.png",
+    "photon": "photon.png",
 }
 
-# Three expressions traced from Filip's actual SVG references (N1/N2/N3,
-# uploaded as real files -- much higher fidelity than the earlier
-# flattened chat pastes this was first guessed from):
-#   N1 = neutral: antenna sweeps up-right to a small chevron tip, calm
-#        round eye with an off-center pupil, flat mouth line.
-#   N2 = annoyed: antenna goes straight up into a fanned rake of ticks,
-#        a furrowed two-stroke eyebrow angled down over the eye, plus a
-#        small separate "mole" dot lower on the face.
-#   N3 = surprised: antenna is a big sweeping arc off to the left with a
-#        small separate tick-rake beside it, and the eye is a large,
-#        almost entirely dark almond (drawn filled, not white+pupil) --
-#        the "wide-eyed shock" look, with a tiny white catch-light
-#        instead of a normal pupil so it doesn't just vanish into black.
-# Swapped on photon impact.
-_NEURON_EXPR = {
-    "neutral": dict(
-        antenna=[(0, -75), (18, -100), (40, -128), (62, -148)],
-        antenna_ticks=[[(50, -140), (62, -152)], [(56, -146), (66, -160)],
-                        [(62, -150), (70, -166)], [(68, -152), (76, -170)]],
-        eyelid=[(-20, -42), (-2, -47), (18, -44)],
-        eye_center=(-2, -35), eye_rx=19, eye_ry=14,
-        eye_fill="white",
-        pupil_center=(3, -32), pupil_r=6, pupil_fill=None,
-        mouth=[(-14, -10), (20, -12)],
-        eyebrow=None,
-        extra_dots=None,
-    ),
-    "surprised": dict(
-        antenna=[(0, -75), (-16, -92), (-30, -104), (-38, -118), (-40, -136)],
-        antenna_ticks=[[(-52, -100), (-64, -104)], [(-54, -110), (-66, -116)],
-                        [(-52, -120), (-64, -124)]],
-        eyelid=None,
-        eye_center=(0, -34), eye_rx=23, eye_ry=19,
-        eye_fill="#161616",
-        pupil_center=(6, -40), pupil_r=3.5, pupil_fill="white",
-        mouth=[(-12, -8), (18, -9)],
-        eyebrow=None,
-        extra_dots=None,
-    ),
-    "annoyed": dict(
-        antenna=[(0, -75), (0, -105), (0, -132), (0, -150)],
-        antenna_ticks=[[(-16, -142), (-24, -152)], [(-8, -146), (-12, -158)],
-                        [(2, -148), (2, -160)], [(12, -146), (18, -157)],
-                        [(20, -142), (28, -150)]],
-        eyelid=None,
-        eye_center=(-2, -33), eye_rx=19, eye_ry=15,
-        eye_fill="white",
-        pupil_center=(4, -37), pupil_r=5, pupil_fill=None,
-        mouth=None,
-        eyebrow=[(-24, -50), (2, -44), (24, -50)],
-        extra_dots=[(26, -8, 4)],
-    ),
-}
+_ART_RAW_CACHE = {}  # name -> PIL.Image (RGBA, loaded once from disk)
+
+
+def _load_art_image(name):
+    """Load (and cache) the source PIL image for one art asset. Raises a
+    clear error if the art/ folder didn't ship alongside the script, rather
+    than a confusing Tk/PIL traceback."""
+    if name in _ART_RAW_CACHE:
+        return _ART_RAW_CACHE[name]
+    fname = _ART_FILES[name]
+    path = os.path.join(_ART_DIR, fname)
+    if not os.path.exists(path):
+        raise RuntimeError(
+            f"Missing art asset '{fname}' -- expected it at {path}. "
+            f"The art/ folder needs to ship alongside kurtosis_checker.py.")
+    im = Image.open(path).convert("RGBA")
+    _ART_RAW_CACHE[name] = im
+    return im
+
+
+def _apply_row_distort(im, distort, phase):
+    """Row-wise horizontal pixel shift (a 'scanline glitch'), vectorized
+    over numpy so it's cheap enough to redo every animation frame. Mirrors
+    the shape of the original hand-drawn jitter formula (two summed sines
+    at different row-frequencies/phase-rates) but applied to pixels instead
+    of vector point coordinates -- used by the motion-correction overlay to
+    visually 'scramble' the neuron and let it resolve back to clean as
+    NormCorre progress comes in."""
+    if distort <= 0.002:
+        return im
+    arr = np.array(im)
+    h, w = arr.shape[0], arr.shape[1]
+    if w == 0 or h == 0:
+        return im
+    max_shift = distort * w * 0.10
+    rows = np.arange(h)
+    shifts = (max_shift * np.sin(rows * 0.15 + phase)
+              + max_shift * 0.4 * np.sin(rows * 0.4 - phase * 1.7))
+    shifts = shifts.astype(np.int64)
+    col_idx = (np.arange(w)[None, :] - shifts[:, None]) % w
+    out = arr[rows[:, None], col_idx]
+    return Image.fromarray(out, mode="RGBA")
+
+
+def _render_art_image(canvas, name, cx, cy, target_h, tag,
+                       rotate_deg=0.0, distort=0.0, phase=0.0):
+    """Load, resize (to target_h px tall, aspect-preserved), optionally
+    rotate and/or scanline-distort, then draw the given art asset centered
+    at (cx, cy) on `canvas` via create_image. Keeps a strong reference to
+    the resulting PhotoImage on the canvas itself (Tk requires this --
+    otherwise it gets garbage-collected and the image silently vanishes).
+    Returns (disp_w, disp_h), the actual on-screen pixel size, so callers
+    can compute anchor points (eye, snout, ...) relative to it.
+    """
+    canvas.delete(tag)
+    im = _load_art_image(name)
+    target_h = max(4, int(target_h))
+    scale = target_h / im.height
+    target_w = max(4, int(im.width * scale))
+    im = im.resize((target_w, target_h), Image.LANCZOS)
+    im = _apply_row_distort(im, distort, phase)
+    if rotate_deg:
+        im = im.rotate(-rotate_deg, expand=True, resample=Image.BICUBIC)
+    photo = ImageTk.PhotoImage(im)
+    if not hasattr(canvas, "_art_photo_refs"):
+        canvas._art_photo_refs = {}
+    canvas._art_photo_refs[tag] = photo  # prevent GC
+    canvas.create_image(cx, cy, image=photo, anchor="center", tags=tag)
+    return im.width, im.height
+
+
+# Fractional anchor offsets (relative to each character's own displayed
+# width/height, measured from its center) used to aim the photon at
+# roughly the right spot -- the neuron's eye, the chameleon's snout tip --
+# rather than just its bounding-box center. Approximate (eyeballed from
+# the source images' own proportions), not pixel-exact.
+NRN_EYE_OFFSET_FRAC = (0.0, -0.22)      # eye sits a bit above center (legs take up the lower half)
+CHAM_SNOUT_OFFSET_FRAC = (-0.46, -0.05)  # snout is at the far-left edge, roughly mid-height
 
 
 def draw_neuron(canvas, cx, cy, scale, expr="neutral", distort=0.0, phase=0.0,
                  tag="neuron", outline="#111111"):
-    """Draw the hand-drawn neuron character at (cx, cy) with the given
-    scale (px per local unit) -- black line art only, no fill, matching
-    Filip's original pen sketches (the colored highlighter wash behind
-    the linework in the sketches was just an annotation, not part of the
-    character). `expr` selects the face. `distort` in [0, 1] applies
-    scanline/phase jitter (bigger = more scrambled) that the motion-
-    correction overlay decays to zero as NormCorre "resolves" the
-    movie -- a visual stand-in for what motion correction does."""
-    canvas.delete(tag)
-    unit = scale / 60.0
-
-    def xf(pts):
-        out = []
-        for (x, y) in pts:
-            jitter = (distort * 14 * math.sin(y * 0.15 + phase)
-                      + distort * 6 * math.sin(y * 0.4 - phase * 1.7))
-            out.append((cx + (x + jitter) * unit, cy + y * unit))
-        return out
-
-    tri = xf(_NEURON_BODY["triangle"])
-    canvas.create_polygon(*[c for p in tri for c in p], fill="",
-                           outline=outline, width=2, tags=tag)
-
-    for leg in ("leg_left", "leg_right"):
-        pts = xf(_NEURON_BODY[leg])
-        canvas.create_line(*[c for p in pts for c in p], fill=outline, width=2.5,
-                            smooth=True, capstyle=tk.ROUND, tags=tag)
-
-    e = _NEURON_EXPR[expr]
-
-    pts = xf(e["antenna"])
-    canvas.create_line(*[c for p in pts for c in p], fill=outline, width=2.5,
-                        smooth=True, capstyle=tk.ROUND, tags=tag)
-    for tick in e["antenna_ticks"]:
-        pts = xf(tick)
-        canvas.create_line(*[c for p in pts for c in p], fill=outline, width=2, tags=tag)
-
-    if e.get("eyebrow"):
-        pts = xf(e["eyebrow"])
-        canvas.create_line(*[c for p in pts for c in p], fill=outline, width=3,
-                            capstyle=tk.ROUND, tags=tag)
-
-    if e.get("eyelid"):
-        pts = xf(e["eyelid"])
-        canvas.create_line(*[c for p in pts for c in p], fill=outline, width=2,
-                            smooth=True, tags=tag)
-
-    (ex, ey), = xf([e["eye_center"]])
-    erx, ery = e["eye_rx"] * unit, e["eye_ry"] * unit
-    canvas.create_oval(ex - erx, ey - ery, ex + erx, ey + ery,
-                        fill=e.get("eye_fill", "white"), outline=outline, width=2, tags=tag)
-
-    (px, py), = xf([e["pupil_center"]])
-    pr = e["pupil_r"] * unit
-    canvas.create_oval(px - pr, py - pr, px + pr, py + pr,
-                        fill=e.get("pupil_fill") or outline, outline="", tags=tag)
-
-    if e.get("mouth"):
-        pts = xf(e["mouth"])
-        canvas.create_line(*[c for p in pts for c in p], fill=outline, width=3,
-                            capstyle=tk.ROUND, tags=tag)
-    elif e.get("mouth_circle"):
-        mcx, mcy, mr = e["mouth_circle"]
-        (mx, my), = xf([(mcx, mcy)])
-        mr_s = mr * unit
-        canvas.create_oval(mx - mr_s, my - mr_s, mx + mr_s, my + mr_s,
-                            outline=outline, width=2.5, tags=tag)
-
-    for dot in (e.get("extra_dots") or []):
-        dcx, dcy, dr = dot
-        (dx, dy), = xf([(dcx, dcy)])
-        dr_s = dr * unit
-        canvas.create_oval(dx - dr_s, dy - dr_s, dx + dr_s, dy + dr_s,
-                            outline=outline, width=1.5, tags=tag)
-
-
-# Traced from Filip's actual Ch.svg reference (a real uploaded file this
-# time, viewed at full resolution -- not eyeballed off a flattened chat
-# paste). Notable corrections from the earlier guess: a scalloped row of
-# small bumps along the top of the head, the eye is a plain circle
-# bisected by a line (not a filled pupil-in-white-oval), a small curled
-# "chin" loop under the jaw in addition to the two leg curls, and one more
-# ridge spike (6 total) than before.
-_CHAMELEON = dict(
-    head_bumps=[(-50, -22), (-44, -26), (-38, -22), (-32, -26), (-26, -22), (-20, -25)],
-    body=[(-55, -5), (-40, -14), (-22, -18), (-2, -20), (18, -18), (34, -10),
-          (46, 2), (54, 14), (58, 26)],
-    belly=[(-50, 4), (-30, 10), (-8, 10), (14, 8), (32, 10), (44, 18), (52, 26)],
-    ridge_ticks=[[(-28, -20), (-24, -31)], [(-18, -19), (-14, -30)], [(-6, -20), (-3, -32)],
-                 [(6, -19), (10, -30)], [(18, -16), (23, -27)], [(30, -11), (36, -21)]],
-    eye_center=(-46, -10), eye_r=7,
-    eye_line=[(-53, -10), (-39, -10)],
-    snout=[(-55, -5), (-66, -2), (-70, 2), (-64, 4), (-55, 2)],
-    chin_curl=[(-58, 4), (-63, 10), (-57, 15), (-50, 11)],
-    leg1=[(-18, 9), (-22, 20), (-16, 26), (-8, 22)],
-    leg2=[(14, 9), (10, 20), (18, 26), (26, 21)],
-)
-
-
-def _spiral_points(cx, cy, r0, turns=1.4, n=20, direction=1):
-    pts = []
-    for i in range(n + 1):
-        t = i / n
-        theta = direction * t * turns * 2 * math.pi
-        r = r0 * (1 - 0.85 * t)
-        pts.append((cx + r * math.cos(theta), cy + r * math.sin(theta)))
-    return pts
+    """Draw Filip's actual neuron sketch (one of 3 expressions) centered at
+    (cx, cy). `scale` sets the display size (kept as the same "px per local
+    60-unit" convention the old vector version used, so callers didn't need
+    to change their numbers -- multiplied by a fixed constant to get a
+    pixel height). `distort` in [0, 1] applies a scanline glitch that the
+    motion-correction overlay decays to zero as NormCorre progresses.
+    Returns (disp_w, disp_h) for anchor-point math."""
+    name = {"neutral": "neuron_neutral", "surprised": "neuron_surprised",
+            "annoyed": "neuron_annoyed"}.get(expr, "neuron_neutral")
+    target_h = scale * 4.2
+    return _render_art_image(canvas, name, cx, cy, target_h, tag,
+                              distort=distort, phase=phase)
 
 
 def draw_chameleon(canvas, cx, cy, scale, tag="chameleon", outline="#111111"):
-    """Draw the hand-drawn chameleon (the 'light source' in the animation)
-    at (cx, cy), facing left, with the given scale (px per local unit) --
-    black line art only, no fill, matching the original sketch's linework."""
-    canvas.delete(tag)
-    unit = scale / 60.0
-
-    def xf(pts):
-        return [(cx + x * unit, cy + y * unit) for (x, y) in pts]
-
-    tail = _spiral_points(58, 26, 16, turns=1.6, n=24, direction=1)
-    pts = xf(tail)
-    canvas.create_line(*[c for p in pts for c in p], fill=outline, width=2.5,
-                        smooth=True, capstyle=tk.ROUND, tags=tag)
-
-    pts = xf(_CHAMELEON["body"])
-    canvas.create_line(*[c for p in pts for c in p], fill=outline, width=2.5,
-                        smooth=True, capstyle=tk.ROUND, tags=tag)
-    pts = xf(_CHAMELEON["belly"])
-    canvas.create_line(*[c for p in pts for c in p], fill=outline, width=2,
-                        smooth=True, tags=tag)
-
-    pts = xf(_CHAMELEON["head_bumps"])
-    canvas.create_line(*[c for p in pts for c in p], fill=outline, width=1.5,
-                        smooth=True, tags=tag)
-
-    for tick in _CHAMELEON["ridge_ticks"]:
-        pts = xf(tick)
-        canvas.create_line(*[c for p in pts for c in p], fill=outline, width=2, tags=tag)
-
-    pts = xf(_CHAMELEON["snout"])
-    canvas.create_line(*[c for p in pts for c in p], fill=outline, width=2,
-                        smooth=True, tags=tag)
-
-    pts = xf(_CHAMELEON["chin_curl"])
-    canvas.create_line(*[c for p in pts for c in p], fill=outline, width=2,
-                        smooth=True, capstyle=tk.ROUND, tags=tag)
-
-    for leg in ("leg1", "leg2"):
-        pts = xf(_CHAMELEON[leg])
-        canvas.create_line(*[c for p in pts for c in p], fill=outline, width=2,
-                            smooth=True, tags=tag)
-
-    # eye: a plain circle bisected by a horizontal line, not a filled
-    # pupil-in-white-oval -- matches the actual sketch (Ch.svg)
-    (ex, ey), = xf([_CHAMELEON["eye_center"]])
-    er = _CHAMELEON["eye_r"] * unit
-    canvas.create_oval(ex - er, ey - er, ex + er, ey + er,
-                        fill="", outline=outline, width=1.5, tags=tag)
-    pts = xf(_CHAMELEON["eye_line"])
-    canvas.create_line(*[c for p in pts for c in p], fill=outline, width=1.5, tags=tag)
+    """Draw Filip's actual chameleon sketch (the animation's 'light
+    source') centered at (cx, cy). Returns (disp_w, disp_h)."""
+    target_h = scale * 3.4
+    return _render_art_image(canvas, "chameleon", cx, cy, target_h, tag)
 
 
 def draw_photon(canvas, cx, cy, length, amplitude, angle_deg, phase, tag="photon",
                  color="#e94560"):
-    """Draw a wavy red 'photon' squiggle centered at (cx, cy), `length` long,
-    oscillating with `amplitude`, rotated to point along its direction of
-    travel (`angle_deg`), animated via `phase`. Single clean line -- no
-    highlighter-style glow underneath -- matching the sketch's linework.
-    Traced from Filip's actual PH.svg reference: 3 full up-humps across the
-    squiggle's length (previously 2, guessed off a flattened chat paste)."""
+    """Draw Filip's actual photon squiggle sketch centered at (cx, cy),
+    sized from `length`, rotated to point along its direction of travel
+    (`angle_deg`). `amplitude`/`phase` no longer reshape the squiggle itself
+    (it's a fixed drawing now) but `phase` still adds a small extra wobble
+    rotation so the in-flight animation keeps some life to it."""
     canvas.delete(tag)
-    n = 24
-    local_pts = []
-    for i in range(n + 1):
-        t = i / n
-        x = (t - 0.5) * length
-        y = amplitude * math.sin(t * 6 * math.pi + phase)
-        local_pts.append((x, y))
-    rad = math.radians(angle_deg)
-    cos_a, sin_a = math.cos(rad), math.sin(rad)
-    pts = []
-    for (x, y) in local_pts:
-        rx = x * cos_a - y * sin_a
-        ry = x * sin_a + y * cos_a
-        pts.append((cx + rx, cy + ry))
-    flat = [c for p in pts for c in p]
-    canvas.create_line(*flat, fill=color, width=2.5, smooth=True,
-                        capstyle=tk.ROUND, tags=tag)
+    im = _load_art_image("photon")
+    target_w = max(4, int(length * 2.0))
+    scale = target_w / im.width
+    target_h = max(4, int(im.height * scale))
+    im = im.resize((target_w, target_h), Image.LANCZOS)
+    wobble = 6.0 * math.sin(phase)
+    im = im.rotate(-(angle_deg + wobble), expand=True, resample=Image.BICUBIC)
+    photo = ImageTk.PhotoImage(im)
+    if not hasattr(canvas, "_art_photo_refs"):
+        canvas._art_photo_refs = {}
+    canvas._art_photo_refs[tag] = photo
+    canvas.create_image(cx, cy, image=photo, anchor="center", tags=tag)
 
 
 def draw_tally(canvas, x, y, count, tag="tally", stroke=2, line_h=16, line_w=6,
@@ -1273,11 +1156,6 @@ class PhotonNeuronBar(tk.Canvas):
     HEIGHT = 190
     NRN_SCALE = 42
     CHAM_SCALE = 46
-    # local-space anchor points used to aim the photon: the chameleon's
-    # snout tip (front of its mouth, per _CHAMELEON["snout"]) and the
-    # neuron's (neutral-expression) eye center.
-    CHAM_SNOUT_LOCAL = (-70, 2)
-    NRN_EYE_LOCAL = (-2, -35)
 
     def __init__(self, parent, **kw):
         super().__init__(parent, height=self.HEIGHT, bg="white", highlightthickness=0, **kw)
@@ -1347,17 +1225,17 @@ class PhotonNeuronBar(tk.Canvas):
         h = self.HEIGHT
         nrn_cx, nrn_cy = w * 0.16, h * 0.68
         cham_cx, cham_cy = w * 0.86, h * 0.46
-        nrn_unit = self.NRN_SCALE / 60.0
-        cham_unit = self.CHAM_SCALE / 60.0
 
-        draw_neuron(self, nrn_cx, nrn_cy, scale=self.NRN_SCALE, expr=self._expr, tag="nrn")
-        draw_chameleon(self, cham_cx, cham_cy, scale=self.CHAM_SCALE, tag="cham")
+        nrn_w, nrn_h = draw_neuron(self, nrn_cx, nrn_cy, scale=self.NRN_SCALE,
+                                    expr=self._expr, tag="nrn")
+        cham_w, cham_h = draw_chameleon(self, cham_cx, cham_cy, scale=self.CHAM_SCALE,
+                                         tag="cham")
 
         if self._flight_frac is not None:
-            x0 = cham_cx + self.CHAM_SNOUT_LOCAL[0] * cham_unit
-            y0 = cham_cy + self.CHAM_SNOUT_LOCAL[1] * cham_unit
-            x1 = nrn_cx + self.NRN_EYE_LOCAL[0] * nrn_unit
-            y1 = nrn_cy + self.NRN_EYE_LOCAL[1] * nrn_unit
+            x0 = cham_cx + CHAM_SNOUT_OFFSET_FRAC[0] * cham_w
+            y0 = cham_cy + CHAM_SNOUT_OFFSET_FRAC[1] * cham_h
+            x1 = nrn_cx + NRN_EYE_OFFSET_FRAC[0] * nrn_w
+            y1 = nrn_cy + NRN_EYE_OFFSET_FRAC[1] * nrn_h
             fx = x0 + (x1 - x0) * self._flight_frac
             fy = y0 + (y1 - y0) * self._flight_frac
             angle = math.degrees(math.atan2(y1 - y0, x1 - x0))
@@ -1390,11 +1268,6 @@ class MotionCorrectionOverlay:
 
     W, H = 600, 620
     NRN_SCALE = 95
-    # local-space bbox of the neuron drawing is roughly x[-92,88] y[-170,74];
-    # visual center is offset from the (0,0) reference (the triangle's base
-    # midpoint) by this much in local units -- used to center the whole
-    # character (antenna tip to leg tip) rather than just its base point.
-    NRN_LOCAL_CENTER_Y = -48
 
     def __init__(self, root):
         self.top = tk.Toplevel(root)
@@ -1459,9 +1332,8 @@ class MotionCorrectionOverlay:
             pass
 
     def _render_art(self):
-        unit = self.NRN_SCALE / 60.0
         cx = self._art_w / 2
-        cy = self._art_h / 2 - self.NRN_LOCAL_CENTER_Y * unit
+        cy = self._art_h / 2
         distort = max(0.0, 1.0 - self._progress)
         draw_neuron(self.art_canvas, cx, cy, scale=self.NRN_SCALE, expr="neutral",
                     distort=distort, phase=self._phase, tag="neuron")
