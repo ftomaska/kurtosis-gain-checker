@@ -47,7 +47,7 @@ Optional (only for the raw-TIFF NormCorre fallback in gain mode): caiman
 # Bump this on every change so a running instance's window title can be checked
 # against what's actually in this file -- handy when the app runs on a machine
 # separate from wherever this source file is being edited.
-APP_VERSION = "2026-07-15.4"
+APP_VERSION = "2026-07-15.5"
 
 import os
 import gc
@@ -1005,6 +1005,25 @@ def _load_art_image(name):
     return im
 
 
+_ART_INVERTED_CACHE = {}  # name -> PIL.Image, RGB channels inverted (black lines -> white)
+
+
+def _load_art_image_inverted(name):
+    """Same artwork as _load_art_image, but with RGB channels inverted
+    (alpha untouched) -- black line art becomes white line art, so it reads
+    against a dark background instead of needing a white canvas behind it.
+    Used for the neuron/chameleon (black-stroke drawings); the photon's red
+    stroke is already visible on dark backgrounds and is left as-is."""
+    if name in _ART_INVERTED_CACHE:
+        return _ART_INVERTED_CACHE[name]
+    im = _load_art_image(name)
+    arr = np.array(im).copy()
+    arr[..., :3] = 255 - arr[..., :3]
+    inv = Image.fromarray(arr, mode="RGBA")
+    _ART_INVERTED_CACHE[name] = inv
+    return inv
+
+
 def _apply_row_distort(im, distort, phase):
     """Row-wise horizontal pixel shift (a 'scanline glitch'), vectorized
     over numpy so it's cheap enough to redo every animation frame. Mirrors
@@ -1030,17 +1049,19 @@ def _apply_row_distort(im, distort, phase):
 
 
 def _render_art_image(canvas, name, cx, cy, target_h, tag,
-                       rotate_deg=0.0, distort=0.0, phase=0.0):
+                       rotate_deg=0.0, distort=0.0, phase=0.0, inverted=False):
     """Load, resize (to target_h px tall, aspect-preserved), optionally
     rotate and/or scanline-distort, then draw the given art asset centered
     at (cx, cy) on `canvas` via create_image. Keeps a strong reference to
     the resulting PhotoImage on the canvas itself (Tk requires this --
     otherwise it gets garbage-collected and the image silently vanishes).
-    Returns (disp_w, disp_h), the actual on-screen pixel size, so callers
-    can compute anchor points (eye, snout, ...) relative to it.
+    `inverted=True` uses the RGB-inverted (white-line-art) version, for
+    display on a dark background. Returns (disp_w, disp_h), the actual
+    on-screen pixel size, so callers can compute anchor points (eye,
+    snout, ...) relative to it.
     """
     canvas.delete(tag)
-    im = _load_art_image(name)
+    im = _load_art_image_inverted(name) if inverted else _load_art_image(name)
     target_h = max(4, int(target_h))
     scale = target_h / im.height
     target_w = max(4, int(im.width * scale))
@@ -1078,14 +1099,14 @@ def draw_neuron(canvas, cx, cy, scale, expr="neutral", distort=0.0, phase=0.0,
             "annoyed": "neuron_annoyed"}.get(expr, "neuron_neutral")
     target_h = scale * 4.2
     return _render_art_image(canvas, name, cx, cy, target_h, tag,
-                              distort=distort, phase=phase)
+                              distort=distort, phase=phase, inverted=True)
 
 
 def draw_chameleon(canvas, cx, cy, scale, tag="chameleon", outline="#111111"):
     """Draw Filip's actual chameleon sketch (the animation's 'light
     source') centered at (cx, cy). Returns (disp_w, disp_h)."""
     target_h = scale * 3.4
-    return _render_art_image(canvas, "chameleon", cx, cy, target_h, tag)
+    return _render_art_image(canvas, "chameleon", cx, cy, target_h, tag, inverted=True)
 
 
 def draw_photon(canvas, cx, cy, length, amplitude, angle_deg, phase, tag="photon",
@@ -1150,15 +1171,16 @@ class PhotonNeuronBar(tk.Canvas):
     doing anything (reg_tif read / PTC compute / CNMF), not tied to a real
     progress metric, since most of those steps don't expose one either.
 
-    White background, neuron on the left, chameleon on the right -- both
-    drawn as plain black line art (no fill), matching the original sketches."""
+    Dark background matching the rest of the app, neuron on the left,
+    chameleon on the right -- both drawn as white-inverted line art (so
+    they read against the dark canvas instead of needing a white one)."""
 
     HEIGHT = 190
     NRN_SCALE = 42
     CHAM_SCALE = 46
 
     def __init__(self, parent, **kw):
-        super().__init__(parent, height=self.HEIGHT, bg="white", highlightthickness=0, **kw)
+        super().__init__(parent, height=self.HEIGHT, bg=BG_DARK, highlightthickness=0, **kw)
         self._width = 400
         self._running = False
         self._job = None
@@ -1167,6 +1189,7 @@ class PhotonNeuronBar(tk.Canvas):
         self._expr_until = 0.0
         self._flight_frac = None
         self._flight_t0 = 0.0
+        self._flight_dir = "out"  # "out" = chameleon->neuron, "back" = neuron->chameleon
         self._next_launch = 0.0
         self._t0 = None
         self.bind("<Configure>", self._on_resize)
@@ -1185,6 +1208,7 @@ class PhotonNeuronBar(tk.Canvas):
         self._t0 = time.monotonic()
         self._next_launch = 0.4
         self._flight_frac = None
+        self._flight_dir = "out"
         self._tick()
 
     def stop(self):
@@ -1204,15 +1228,25 @@ class PhotonNeuronBar(tk.Canvas):
         if self._flight_frac is None and t >= self._next_launch:
             self._flight_frac = 0.0
             self._flight_t0 = t
+            self._flight_dir = "out"
         if self._flight_frac is not None:
             dur = 0.55
             frac = (t - self._flight_t0) / dur
             if frac >= 1.0:
-                self._flight_frac = None
-                self._hits += 1
-                self._expr = random.choice(["surprised", "annoyed"])
-                self._expr_until = t + 0.5
-                self._next_launch = t + random.uniform(0.5, 1.1)
+                if self._flight_dir == "out":
+                    # chameleon's photon just landed -- neuron reacts, then
+                    # immediately fires one back at the chameleon
+                    self._hits += 1
+                    self._expr = random.choice(["surprised", "annoyed"])
+                    self._expr_until = t + 0.5
+                    self._flight_dir = "back"
+                    self._flight_t0 = t
+                    self._flight_frac = 0.0
+                else:
+                    # return shot landed -- volley's done, go idle until the
+                    # next launch
+                    self._flight_frac = None
+                    self._next_launch = t + random.uniform(0.5, 1.1)
             else:
                 self._flight_frac = frac
         if self._expr != "neutral" and t >= self._expr_until:
@@ -1232,10 +1266,14 @@ class PhotonNeuronBar(tk.Canvas):
                                          tag="cham")
 
         if self._flight_frac is not None:
-            x0 = cham_cx + CHAM_SNOUT_OFFSET_FRAC[0] * cham_w
-            y0 = cham_cy + CHAM_SNOUT_OFFSET_FRAC[1] * cham_h
-            x1 = nrn_cx + NRN_EYE_OFFSET_FRAC[0] * nrn_w
-            y1 = nrn_cy + NRN_EYE_OFFSET_FRAC[1] * nrn_h
+            cham_pt = (cham_cx + CHAM_SNOUT_OFFSET_FRAC[0] * cham_w,
+                       cham_cy + CHAM_SNOUT_OFFSET_FRAC[1] * cham_h)
+            nrn_pt = (nrn_cx + NRN_EYE_OFFSET_FRAC[0] * nrn_w,
+                      nrn_cy + NRN_EYE_OFFSET_FRAC[1] * nrn_h)
+            if self._flight_dir == "out":
+                (x0, y0), (x1, y1) = cham_pt, nrn_pt
+            else:
+                (x0, y0), (x1, y1) = nrn_pt, cham_pt
             fx = x0 + (x1 - x0) * self._flight_frac
             fy = y0 + (y1 - y0) * self._flight_frac
             angle = math.degrees(math.atan2(y1 - y0, x1 - x0))
@@ -1246,10 +1284,10 @@ class PhotonNeuronBar(tk.Canvas):
 
         self.delete("counter_label")
         label = self.create_text(14, h - 12, text="photons:", anchor="w",
-                                  fill="#666666", font=("Helvetica", 9), tags="counter_label")
+                                  fill=TEXT_MAIN, font=("Helvetica", 9), tags="counter_label")
         bbox = self.bbox(label)
         tally_x = (bbox[2] + 8) if bbox else 70
-        draw_tally(self, tally_x, h - 12, self._hits, tag="counter_tally", color="#666666")
+        draw_tally(self, tally_x, h - 12, self._hits, tag="counter_tally", color=TEXT_MAIN)
 
 
 class MotionCorrectionOverlay:
@@ -1309,7 +1347,7 @@ class MotionCorrectionOverlay:
         self._art_w = self.W - 40
         self._art_h = self.H - 190
         self.art_canvas = tk.Canvas(self.top, width=self._art_w, height=self._art_h,
-                                     bg="white", highlightthickness=0)
+                                     bg=BG_DARK, highlightthickness=0)
         self.art_canvas.pack()
 
         self._progress = 0.0
