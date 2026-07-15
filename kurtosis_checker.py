@@ -47,7 +47,7 @@ Optional (only for the raw-TIFF NormCorre fallback in gain mode): caiman
 # Bump this on every change so a running instance's window title can be checked
 # against what's actually in this file -- handy when the app runs on a machine
 # separate from wherever this source file is being edited.
-APP_VERSION = "2026-07-15.17"
+APP_VERSION = "2026-07-15.18"
 
 import os
 import gc
@@ -2390,7 +2390,7 @@ class KurtosisChecker:
         content (title + returned body frame) embedded on top via
         create_window; the canvas auto-resizes to fit the content and
         redraws the rounded rect to match on every size change."""
-        canvas = tk.Canvas(self._gain_sidebar, bg=BG_MID, highlightthickness=0, bd=0)
+        canvas = tk.Canvas(self._gain_sidebar_inner, bg=BG_MID, highlightthickness=0, bd=0)
         canvas.pack(fill=tk.X, padx=12, pady=(0, 10))
 
         content = tk.Frame(canvas, bg=CARD_BG)
@@ -2702,7 +2702,9 @@ class KurtosisChecker:
                                        "per recording.")
 
         # ── Run Analysis (primary action, bottom of the sidebar) ────────
-        run_frame = tk.Frame(self._gain_sidebar, bg=BG_MID)
+        # Was silently getting clipped off the bottom of the window before
+        # the sidebar became scrollable -- there was no way to reach it.
+        run_frame = tk.Frame(self._gain_sidebar_inner, bg=BG_MID)
         run_frame.pack(fill=tk.X, padx=12, pady=(4, 14))
         self._lbtn(run_frame, "▶  Run Analysis", self.run_gain_analysis,
                    bg=GREY_BTN_ACTIVE, fg=GREY_BTN_TEXT_ACTIVE, font_size=12,
@@ -2889,9 +2891,58 @@ class KurtosisChecker:
         self._content_row = tk.Frame(self.root, bg=BG_DARK)
         self._content_row.pack(fill=tk.BOTH, expand=True)
 
+        # The sidebar's card stack (LOAD / FIT PARAMETERS / FRAME WINDOW /
+        # CNMF / PHOTON FLUX / MOTION CORRECTION / Run Analysis) is taller
+        # than the window at the default 990px height, which silently
+        # clipped "Run Analysis" off the bottom with no way to reach it --
+        # so the sidebar is a scrollable Canvas+Frame rather than a plain
+        # Frame. self._gain_sidebar is still the thing _switch_tab packs/
+        # unpacks; card-building (_sidebar_card) targets the inner
+        # self._gain_sidebar_inner frame that actually scrolls.
         self._gain_sidebar = tk.Frame(self._content_row, bg=BG_MID, width=260)
         self._gain_sidebar.pack_propagate(False)
         # not packed here -- _switch_tab packs/unpacks it depending on tab
+
+        sidebar_canvas = tk.Canvas(self._gain_sidebar, bg=BG_MID, highlightthickness=0, bd=0)
+        sidebar_scrollbar = tk.Scrollbar(self._gain_sidebar, orient="vertical",
+                                          command=sidebar_canvas.yview)
+        sidebar_canvas.configure(yscrollcommand=sidebar_scrollbar.set)
+        sidebar_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        sidebar_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self._gain_sidebar_inner = tk.Frame(sidebar_canvas, bg=BG_MID)
+        inner_win = sidebar_canvas.create_window((0, 0), window=self._gain_sidebar_inner, anchor="nw")
+
+        def _on_inner_configure(event=None):
+            sidebar_canvas.configure(scrollregion=sidebar_canvas.bbox("all"))
+        self._gain_sidebar_inner.bind("<Configure>", _on_inner_configure)
+
+        def _on_canvas_configure(event):
+            sidebar_canvas.itemconfig(inner_win, width=event.width)
+        sidebar_canvas.bind("<Configure>", _on_canvas_configure)
+
+        # Mouse-wheel scroll, only while the pointer is actually over the
+        # sidebar (bound/unbound on Enter/Leave) so it doesn't hijack
+        # scrolling anywhere else in the app. Covers Windows/macOS
+        # (<MouseWheel>, event.delta) and Linux (<Button-4>/<Button-5>).
+        def _on_mousewheel(event):
+            if getattr(event, "num", None) == 5 or getattr(event, "delta", 0) < 0:
+                sidebar_canvas.yview_scroll(1, "units")
+            elif getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0:
+                sidebar_canvas.yview_scroll(-1, "units")
+
+        def _bind_wheel(event=None):
+            sidebar_canvas.bind_all("<MouseWheel>", _on_mousewheel)
+            sidebar_canvas.bind_all("<Button-4>", _on_mousewheel)
+            sidebar_canvas.bind_all("<Button-5>", _on_mousewheel)
+
+        def _unbind_wheel(event=None):
+            sidebar_canvas.unbind_all("<MouseWheel>")
+            sidebar_canvas.unbind_all("<Button-4>")
+            sidebar_canvas.unbind_all("<Button-5>")
+
+        sidebar_canvas.bind("<Enter>", _bind_wheel)
+        sidebar_canvas.bind("<Leave>", _unbind_wheel)
 
         self._main_area = tk.Frame(self._content_row, bg=BG_DARK)
         self._main_area.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
