@@ -47,7 +47,7 @@ Optional (only for the raw-TIFF NormCorre fallback in gain mode): caiman
 # Bump this on every change so a running instance's window title can be checked
 # against what's actually in this file -- handy when the app runs on a machine
 # separate from wherever this source file is being edited.
-APP_VERSION = "2026-07-15.13"
+APP_VERSION = "2026-07-15.15"
 
 import os
 import gc
@@ -72,7 +72,7 @@ from matplotlib.figure import Figure
 from matplotlib.gridspec import GridSpec
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from scipy import stats
-from scipy.ndimage import uniform_filter1d
+from scipy.ndimage import uniform_filter1d, binary_dilation
 import scipy.io
 
 # ── palette ───────────────────────────────────────────────────────────────────
@@ -1267,40 +1267,58 @@ def _load_art_image(name):
     return im
 
 
-_ART_INVERTED_CACHE = {}  # name -> PIL.Image, RGB channels inverted (black lines -> white)
+_ART_OUTLINED_CACHE = {}  # name -> PIL.Image, with a white silhouette stroke added
 
 
-def _selective_invert_lines(im):
-    """Invert only the near-black, low-saturation ink strokes to white --
-    leaves colored fill (the green highlighter tint on the neuron/
-    chameleon, the red on the photon) untouched. A blind full-RGB invert
-    turns the green tint into magenta/purple, which isn't what was wanted;
-    this only flips pixels that are dark AND close to gray (true black
-    line art), since colored fill pixels have real channel separation
-    (green: G >> R,B; red: R >> G,B) that a grayscale ink stroke doesn't."""
-    arr = np.array(im).astype(np.int16)
-    r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
-    maxc = np.maximum(np.maximum(r, g), b)
-    minc = np.minimum(np.minimum(r, g), b)
-    sat = maxc - minc
-    is_black_ink = (maxc < 110) & (sat < 45)
-    out = arr.copy()
-    for ch in range(3):
-        out[..., ch] = np.where(is_black_ink, 255 - arr[..., ch], arr[..., ch])
-    return Image.fromarray(out.astype(np.uint8), mode="RGBA")
+def _add_white_outline(im, thickness=3):
+    """Trace a solid white stroke `thickness` px wide around the *outer*
+    silhouette of `im` (an RGBA PIL image) -- the whole character's alpha
+    boundary, not each individual ink line inside it. The artwork's own
+    pixels (black ink strokes, green/red fill) are left completely
+    untouched; the ring only ever occupies pixels that were fully
+    transparent in the source, so there's no risk of it bleeding into or
+    covering any linework. This replaces the old approach of inverting the
+    black ink to white -- Filip wanted the ink to stay black and instead
+    have an outline carry the contrast against the dark background.
+
+    The canvas is padded by `thickness` (+2px slack for anti-aliasing) on
+    every side so the outline never gets clipped; callers that rely on
+    fractional anchor offsets (eye/snout position) are unaffected in
+    practice since the padding is small and symmetric."""
+    arr = np.array(im)
+    mask = arr[..., 3] > 16
+    pad = thickness + 2
+    h, w = mask.shape
+    padded_mask = np.zeros((h + 2 * pad, w + 2 * pad), dtype=bool)
+    padded_mask[pad:pad + h, pad:pad + w] = mask
+    dilated = binary_dilation(padded_mask, structure=np.ones((3, 3), dtype=bool),
+                               iterations=thickness)
+    ring = dilated & ~padded_mask
+
+    # Build directly with numpy rather than PIL's paste()/alpha_composite()
+    # -- paste(im, box, im) blends partially-transparent (anti-aliased edge)
+    # source pixels against whatever's already there, which very slightly
+    # changes their RGB/alpha values. A raw masked array copy instead
+    # guarantees the artwork's own pixels come out byte-identical.
+    out = np.zeros((h + 2 * pad, w + 2 * pad, 4), dtype=np.uint8)
+    out[ring] = (255, 255, 255, 255)
+    dest = out[pad:pad + h, pad:pad + w]
+    dest[mask] = arr[mask]
+    return Image.fromarray(out, mode="RGBA")
 
 
-def _load_art_image_inverted(name):
-    """Same artwork as _load_art_image, but with just the black ink lines
-    flipped to white (see _selective_invert_lines) -- reads against a dark
-    background instead of needing a white canvas behind it, while keeping
-    the original green/red fill colors intact."""
-    if name in _ART_INVERTED_CACHE:
-        return _ART_INVERTED_CACHE[name]
+def _load_art_image_outlined(name, thickness=3):
+    """Same artwork as _load_art_image, but with a white silhouette
+    outline added around it (see _add_white_outline) -- reads clearly
+    against a dark background while the ink/fill colors themselves stay
+    exactly as drawn."""
+    cache_key = (name, thickness)
+    if cache_key in _ART_OUTLINED_CACHE:
+        return _ART_OUTLINED_CACHE[cache_key]
     im = _load_art_image(name)
-    inv = _selective_invert_lines(im)
-    _ART_INVERTED_CACHE[name] = inv
-    return inv
+    out = _add_white_outline(im, thickness=thickness)
+    _ART_OUTLINED_CACHE[cache_key] = out
+    return out
 
 
 def _apply_row_distort(im, distort, phase):
@@ -1328,19 +1346,20 @@ def _apply_row_distort(im, distort, phase):
 
 
 def _render_art_image(canvas, name, cx, cy, target_h, tag,
-                       rotate_deg=0.0, distort=0.0, phase=0.0, inverted=False):
+                       rotate_deg=0.0, distort=0.0, phase=0.0, outlined=False):
     """Load, resize (to target_h px tall, aspect-preserved), optionally
     rotate and/or scanline-distort, then draw the given art asset centered
     at (cx, cy) on `canvas` via create_image. Keeps a strong reference to
     the resulting PhotoImage on the canvas itself (Tk requires this --
     otherwise it gets garbage-collected and the image silently vanishes).
-    `inverted=True` uses the selectively-line-inverted (white ink strokes,
-    original fill colors kept) version, for display on a dark background.
-    Returns (disp_w, disp_h), the actual on-screen pixel size, so callers
-    can compute anchor points (eye, snout, ...) relative to it.
+    `outlined=True` uses the white-silhouette-outlined version (ink/fill
+    colors unchanged, just a white stroke traced around the outer edge),
+    for display on a dark background. Returns (disp_w, disp_h), the actual
+    on-screen pixel size, so callers can compute anchor points (eye,
+    snout, ...) relative to it.
     """
     canvas.delete(tag)
-    im = _load_art_image_inverted(name) if inverted else _load_art_image(name)
+    im = _load_art_image_outlined(name) if outlined else _load_art_image(name)
     target_h = max(4, int(target_h))
     scale = target_h / im.height
     target_w = max(4, int(im.width * scale))
@@ -1380,27 +1399,27 @@ def draw_neuron(canvas, cx, cy, scale, expr="neutral", distort=0.0, phase=0.0,
             "annoyed": "neuron_annoyed", "sleepy": "neuron_sleepy"}.get(expr, "neuron_neutral")
     target_h = scale * 4.2
     return _render_art_image(canvas, name, cx, cy, target_h, tag,
-                              distort=distort, phase=phase, inverted=True)
+                              distort=distort, phase=phase, outlined=True)
 
 
 def draw_chameleon(canvas, cx, cy, scale, tag="chameleon", outline="#111111"):
     """Draw Filip's actual chameleon sketch (the animation's 'light
     source') centered at (cx, cy). Returns (disp_w, disp_h)."""
     target_h = scale * 3.4
-    return _render_art_image(canvas, "chameleon", cx, cy, target_h, tag, inverted=True)
+    return _render_art_image(canvas, "chameleon", cx, cy, target_h, tag, outlined=True)
 
 
 def _load_photon_variant(tint="red"):
     """The photon squiggle art for a given leg of the volley: 'red' is the
     chameleon's outbound shot, 'green' is the neuron's return shot. Each is
     real, independently hand-drawn artwork (photon_red.png / photon_green.png)
-    with its own black ink wave, selectively line-inverted like the other
-    assets (black -> white, red/green fill untouched). Previously the green
-    variant was synthesized by swapping the red art's R/G channels; Filip
-    has since supplied a real green-inked squiggle, so that synthesis is
-    no longer needed."""
+    with its own black ink wave, with a white silhouette outline added like
+    the other assets (ink/fill colors untouched, just outlined). Previously
+    the green variant was synthesized by swapping the red art's R/G
+    channels; Filip has since supplied a real green-inked squiggle, so that
+    synthesis is no longer needed."""
     name = "photon_green" if tint == "green" else "photon_red"
-    return _load_art_image_inverted(name)
+    return _load_art_image_outlined(name)
 
 
 def draw_photon(canvas, cx, cy, length, amplitude, angle_deg, phase, tag="photon",
@@ -1468,8 +1487,10 @@ class PhotonNeuronBar(tk.Canvas):
     progress metric, since most of those steps don't expose one either.
 
     Dark background matching the rest of the app, neuron on the left,
-    chameleon on the right -- both drawn as white-inverted line art (so
-    they read against the dark canvas instead of needing a white one)."""
+    chameleon on the right -- both drawn with their original black ink
+    strokes/colored fill untouched, plus a white silhouette outline traced
+    around the outside so they read against the dark canvas instead of
+    needing a white one."""
 
     # Sized for display in the main output area (replacing the plot canvas
     # while Run Analysis works) rather than the old slim strip under the
@@ -1478,6 +1499,15 @@ class PhotonNeuronBar(tk.Canvas):
     HEIGHT = 300
     NRN_SCALE = 66
     CHAM_SCALE = 72
+
+    # Each volley: the chameleon fires two red photons in quick succession
+    # (STAGGER seconds apart, both genuinely in flight together for most of
+    # the trip -- a "burst" rather than one-at-a-time), then once both have
+    # landed, the neuron fires exactly one green photon back. Flight A
+    # ("_flight_frac"/"_flight_dir") carries the first outbound leg and
+    # later the single return leg; flight B ("_flight2_frac", always
+    # outbound) only ever carries the second, closely-following shot.
+    VOLLEY_STAGGER = 0.15
 
     def __init__(self, parent, **kw):
         super().__init__(parent, height=self.HEIGHT, bg=BG_DARK, highlightthickness=0, **kw)
@@ -1490,6 +1520,11 @@ class PhotonNeuronBar(tk.Canvas):
         self._flight_frac = None
         self._flight_t0 = 0.0
         self._flight_dir = "out"  # "out" = chameleon->neuron, "back" = neuron->chameleon
+        self._flight2_frac = None   # the 2nd, closely-following outbound shot
+        self._flight2_t0 = 0.0
+        self._next_second_launch = None
+        self._out_landed = None     # outbound shots landed so far this volley (0/1/2), None = idle
+        self._return_pending = False
         self._next_launch = 0.0
         self._t0 = None
         self.bind("<Configure>", self._on_resize)
@@ -1509,6 +1544,10 @@ class PhotonNeuronBar(tk.Canvas):
         self._next_launch = 0.4
         self._flight_frac = None
         self._flight_dir = "out"
+        self._flight2_frac = None
+        self._next_second_launch = None
+        self._out_landed = None
+        self._return_pending = False
         self._tick()
 
     def stop(self):
@@ -1525,34 +1564,68 @@ class PhotonNeuronBar(tk.Canvas):
         if not self._running:
             return
         t = time.monotonic() - self._t0
-        if self._flight_frac is None and t >= self._next_launch:
+        dur = 0.55
+
+        # -- launch shot A: the first outbound photon of a new volley --
+        if (self._flight_frac is None and self._flight2_frac is None
+                and not self._return_pending and t >= self._next_launch):
             self._flight_frac = 0.0
             self._flight_t0 = t
             self._flight_dir = "out"
+            self._out_landed = 0
+            self._next_second_launch = t + self.VOLLEY_STAGGER
+
+        # -- launch shot B shortly after shot A ("right after each other"),
+        #    while shot A is typically still mid-flight --
+        if (self._flight2_frac is None and self._flight_dir == "out"
+                and self._next_second_launch is not None
+                and t >= self._next_second_launch):
+            self._flight2_frac = 0.0
+            self._flight2_t0 = t
+            self._next_second_launch = None
+
+        # -- advance shot A (outbound leg, or later the single return leg) --
         if self._flight_frac is not None:
-            dur = 0.55
             frac = (t - self._flight_t0) / dur
             if frac >= 1.0:
                 if self._flight_dir == "out":
-                    # chameleon's photon just landed -- neuron reacts, and
-                    # only fires one back every 2nd hit it takes
                     self._hits += 1
+                    self._out_landed += 1
                     self._expr = random.choice(["surprised", "annoyed", "sleepy"])
                     self._expr_until = t + 0.5
-                    if self._hits % 2 == 0:
-                        self._flight_dir = "back"
-                        self._flight_t0 = t
-                        self._flight_frac = 0.0
-                    else:
-                        self._flight_frac = None
-                        self._next_launch = t + random.uniform(0.5, 1.1)
-                else:
-                    # return shot landed -- volley's done, go idle until the
-                    # next launch
                     self._flight_frac = None
+                else:
+                    # the single return shot landed -- volley's fully done
+                    self._flight_frac = None
+                    self._flight_dir = "out"
+                    self._return_pending = False
+                    self._out_landed = None
                     self._next_launch = t + random.uniform(0.5, 1.1)
             else:
                 self._flight_frac = frac
+
+        # -- advance shot B (always outbound) --
+        if self._flight2_frac is not None:
+            frac2 = (t - self._flight2_t0) / dur
+            if frac2 >= 1.0:
+                self._hits += 1
+                self._out_landed += 1
+                self._expr = random.choice(["surprised", "annoyed", "sleepy"])
+                self._expr_until = t + 0.5
+                self._flight2_frac = None
+            else:
+                self._flight2_frac = frac2
+
+        # -- once both outbound shots have landed, the neuron fires its one
+        #    return shot back (reusing flight A's slot) --
+        if (self._out_landed is not None and self._out_landed >= 2
+                and self._flight_frac is None and self._flight2_frac is None
+                and not self._return_pending):
+            self._return_pending = True
+            self._flight_dir = "back"
+            self._flight_frac = 0.0
+            self._flight_t0 = t
+
         if self._expr != "neutral" and t >= self._expr_until:
             self._expr = "neutral"
         try:
@@ -1578,11 +1651,12 @@ class PhotonNeuronBar(tk.Canvas):
         cham_w, cham_h = draw_chameleon(self, cham_cx, cham_cy, scale=self.CHAM_SCALE,
                                          tag="cham")
 
+        cham_pt = (cham_cx + CHAM_SNOUT_OFFSET_FRAC[0] * cham_w,
+                   cham_cy + CHAM_SNOUT_OFFSET_FRAC[1] * cham_h)
+        nrn_pt = (nrn_cx + NRN_EYE_OFFSET_FRAC[0] * nrn_w,
+                  nrn_cy + NRN_EYE_OFFSET_FRAC[1] * nrn_h)
+
         if self._flight_frac is not None:
-            cham_pt = (cham_cx + CHAM_SNOUT_OFFSET_FRAC[0] * cham_w,
-                       cham_cy + CHAM_SNOUT_OFFSET_FRAC[1] * cham_h)
-            nrn_pt = (nrn_cx + NRN_EYE_OFFSET_FRAC[0] * nrn_w,
-                      nrn_cy + NRN_EYE_OFFSET_FRAC[1] * nrn_h)
             if self._flight_dir == "out":
                 (x0, y0), (x1, y1) = cham_pt, nrn_pt
                 tint = "red"
@@ -1596,6 +1670,20 @@ class PhotonNeuronBar(tk.Canvas):
                         angle_deg=angle, phase=t * 14, tag="photon", tint=tint)
         else:
             self.delete("photon")
+
+        # shot B -- the 2nd, closely-following outbound photon of the
+        # burst -- is always red/outbound, drawn under its own tag so it
+        # doesn't get clobbered by draw_photon's internal delete(tag) call
+        # for shot A above.
+        if self._flight2_frac is not None:
+            (x0, y0), (x1, y1) = cham_pt, nrn_pt
+            fx = x0 + (x1 - x0) * self._flight2_frac
+            fy = y0 + (y1 - y0) * self._flight2_frac
+            angle = math.degrees(math.atan2(y1 - y0, x1 - x0))
+            draw_photon(self, fx, fy, length=30, amplitude=8,
+                        angle_deg=angle, phase=t * 14 + 2.5, tag="photon2", tint="red")
+        else:
+            self.delete("photon2")
 
         self.delete("counter_label")
         label = self.create_text(14, h - 12, text="photons:", anchor="w",
@@ -2265,11 +2353,56 @@ class KurtosisChecker:
         body.pack(fill=tk.X, padx=10, pady=(2, 10))
         return body
 
-    def _sidebar_row(self, parent, label_text, var, width=7, suffix=None):
+    def _make_tooltip(self, widget, text):
+        """Attach a hover tooltip to `widget` -- a small floating borderless
+        window with `text`, appearing just below the widget on <Enter> and
+        disappearing on <Leave>. Backs the "?" help icons next to sidebar
+        parameters (Filip asked for inline explanations of what each
+        setting does, rather than having to go check the README)."""
+        state = {"win": None}
+
+        def _show(event=None):
+            if state["win"] is not None:
+                return
+            win = tk.Toplevel(widget)
+            win.wm_overrideredirect(True)
+            try:
+                win.wm_attributes("-topmost", True)
+            except Exception:
+                pass
+            x = widget.winfo_rootx() - 6
+            y = widget.winfo_rooty() + widget.winfo_height() + 4
+            win.wm_geometry(f"+{x}+{y}")
+            tk.Label(win, text=text, bg="#1c1c1c", fg=TEXT_BRIGHT,
+                     font=("Helvetica", 9), justify="left", wraplength=260,
+                     padx=8, pady=6, bd=1, relief=tk.SOLID).pack()
+            state["win"] = win
+
+        def _hide(event=None):
+            if state["win"] is not None:
+                state["win"].destroy()
+                state["win"] = None
+
+        widget.bind("<Enter>", _show)
+        widget.bind("<Leave>", _hide)
+        return state
+
+    def _help_icon(self, parent, text):
+        """A small circular "?" that shows `text` in a hover tooltip."""
+        icon = tk.Label(parent, text="?", bg=CARD_BG, fg=TEXT_DIM,
+                         font=("Helvetica", 8, "bold"), width=2,
+                         relief=tk.RIDGE, bd=1, cursor="question_arrow")
+        icon.pack(side=tk.LEFT, padx=(4, 0))
+        self._make_tooltip(icon, text)
+        return icon
+
+    def _sidebar_row(self, parent, label_text, var, width=7, suffix=None, help_text=None):
         row = tk.Frame(parent, bg=CARD_BG)
         row.pack(fill=tk.X, pady=2)
         tk.Label(row, text=label_text, bg=CARD_BG, fg=TEXT_MAIN,
                  font=("Helvetica", 10)).pack(side=tk.LEFT)
+        if help_text:
+            self._help_icon(row, help_text)
         if suffix:
             tk.Label(row, text=suffix, bg=CARD_BG, fg=TEXT_DIM,
                      font=("Helvetica", 9)).pack(side=tk.RIGHT)
@@ -2278,11 +2411,15 @@ class KurtosisChecker:
                  font=("Helvetica", 10), justify="right").pack(side=tk.RIGHT, padx=(0, 6))
         return row
 
-    def _sidebar_check(self, parent, text, var):
-        tk.Checkbutton(parent, text=text, variable=var, bg=CARD_BG, fg=TEXT_MAIN,
+    def _sidebar_check(self, parent, text, var, help_text=None):
+        row = tk.Frame(parent, bg=CARD_BG)
+        row.pack(fill=tk.X, pady=3, anchor="w")
+        tk.Checkbutton(row, text=text, variable=var, bg=CARD_BG, fg=TEXT_MAIN,
                        selectcolor=CARD_BG, activebackground=CARD_BG,
                        activeforeground=TEXT_BRIGHT, font=("Helvetica", 10),
-                       anchor="w", justify="left", wraplength=210).pack(fill=tk.X, pady=3, anchor="w")
+                       anchor="w", justify="left", wraplength=190).pack(side=tk.LEFT, fill=tk.X)
+        if help_text:
+            self._help_icon(row, help_text)
 
     def _build_gain_sidebar(self):
         # Tk variables the old row-based _build_settings_gain used to create
@@ -2292,7 +2429,11 @@ class KurtosisChecker:
         self.fit_lo_var = tk.DoubleVar(value=0.0)
         self.fit_hi_var = tk.DoubleVar(value=50.0)
         self.spatial_bin_var = tk.IntVar(value=1)
-        self.margin_var = tk.IntVar(value=0)
+        # 4px matches the Lees et al. 2025 reference script's own default
+        # (see PTC method notes in README) -- a contaminated edge left
+        # uncropped can visibly bias the fitted slope, so cropping a small
+        # margin by default is the safer out-of-the-box choice than 0.
+        self.margin_var = tk.IntVar(value=4)
         self.max_frames_var = tk.IntVar(value=2000)
         self.frame_start_var = tk.StringVar(value="")
         self.cnmf_gsig_var = tk.IntVar(value=6)
@@ -2312,12 +2453,28 @@ class KurtosisChecker:
 
         # ── Frame rate + fit parameters ──────────────────────────────
         fit_body = self._sidebar_card("FIT PARAMETERS")
-        self._sidebar_row(fit_body, "Frame rate fs", self.fs_var, suffix="Hz")
-        self._sidebar_row(fit_body, "ENF", self.enf_var)
+        self._sidebar_row(fit_body, "Frame rate fs", self.fs_var, suffix="Hz",
+                           help_text="Acquisition frame rate in Hz. Used to convert "
+                                     "photons/frame into photons/cell/s for the flux "
+                                     "panel, and read automatically from ops.npy/the "
+                                     ".mat file when available.")
+        self._sidebar_row(fit_body, "ENF", self.enf_var,
+                           help_text="Excess noise factor for a GaAsP PMT (default "
+                                     "1.2). gain_true = fitted slope / ENF². Only "
+                                     "matters for photon-detector setups with excess "
+                                     "multiplicative noise; leave at 1.0 for a plain "
+                                     "shot-noise-limited camera.")
         fitrange_row = tk.Frame(fit_body, bg=CARD_BG)
         fitrange_row.pack(fill=tk.X, pady=2)
         tk.Label(fitrange_row, text="Fit range (% of mean)", bg=CARD_BG, fg=TEXT_MAIN,
-                 font=("Helvetica", 10)).pack(anchor="w")
+                 font=("Helvetica", 10)).pack(side=tk.LEFT)
+        self._help_icon(fitrange_row,
+                         "Which intensity-percentile bins go into the shot-noise "
+                         "linear fit (0-50 by default, matching the Lees et al. "
+                         "2025 reference protocol). Raise the high end toward 98 "
+                         "to use almost the full intensity range instead -- a PMT "
+                         "has no strong inherent need for a read-noise floor "
+                         "exclusion the way a camera sensor does.")
         fitrange_entries = tk.Frame(fit_body, bg=CARD_BG)
         fitrange_entries.pack(fill=tk.X, pady=(0, 2))
         tk.Entry(fitrange_entries, textvariable=self.fit_lo_var, width=5, bg=BG_PANEL, fg="white",
@@ -2327,8 +2484,22 @@ class KurtosisChecker:
         tk.Entry(fitrange_entries, textvariable=self.fit_hi_var, width=5, bg=BG_PANEL, fg="white",
                  insertbackground="white", relief=tk.FLAT, font=("Helvetica", 10),
                  justify="center").pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(3, 0))
-        self._sidebar_row(fit_body, "Spatial bin", self.spatial_bin_var, suffix="px")
-        self._sidebar_row(fit_body, "Edge margin", self.margin_var, suffix="px")
+        self._sidebar_row(fit_body, "Spatial bin", self.spatial_bin_var, suffix="px",
+                           help_text="Superpixel binning applied before the PTC fit "
+                                     "(pixels are summed, not averaged, so the "
+                                     "recovered gain estimate is invariant to this "
+                                     "setting). Raising it trades spatial resolution "
+                                     "for fewer, less noisy bins. 1 = no binning.")
+        self._sidebar_row(fit_body, "Edge margin", self.margin_var, suffix="px",
+                           help_text="Crops this many pixels off every edge of each "
+                                     "frame before computing anything, to exclude "
+                                     "blanking/vignetting artifacts near the frame "
+                                     "border that resonant-scan systems often have. "
+                                     "A contaminated edge left uncropped can visibly "
+                                     "bias the fitted slope. Default 4px matches the "
+                                     "reference protocol; set to 0 to disable, or "
+                                     "raise it if your system's blanking band is "
+                                     "wider.")
         # Fit range / ENF / fs only feed the linear regression over bins
         # that a full run has already computed -- so once Run Analysis has
         # happened once, tweaking these and clicking here re-fits instantly
@@ -2340,19 +2511,61 @@ class KurtosisChecker:
 
         # ── Frame window ──────────────────────────────────────────────
         win_body = self._sidebar_card("FRAME WINDOW")
-        self._sidebar_row(win_body, "Max frames", self.max_frames_var)
-        self._sidebar_row(win_body, "Start frame", self.frame_start_var, suffix="blank=auto")
+        self._sidebar_row(win_body, "Max frames", self.max_frames_var,
+                           help_text="Size of the contiguous frame window used for "
+                                     "the PTC estimate. The window must be "
+                                     "contiguous (not evenly-spaced samples) because "
+                                     "the frame-differencing noise estimate needs "
+                                     "genuinely adjacent frames. Larger = more "
+                                     "stable estimate, more memory/time.")
+        self._sidebar_row(win_body, "Start frame", self.frame_start_var, suffix="blank=auto",
+                           help_text="Explicit starting frame index for the analysis "
+                                     "window. Leave blank to auto-center the window "
+                                     "on the recording (the default). Set it to skip "
+                                     "a noisy start-of-session period, or to target "
+                                     "a specific known-bad stretch. Invalid/"
+                                     "out-of-range values fall back to auto.")
 
         # ── CNMF ──────────────────────────────────────────────────────
         cnmf_body = self._sidebar_card("CNMF")
-        self._sidebar_row(cnmf_body, "Cell radius", self.cnmf_gsig_var, suffix="px")
-        self._sidebar_check(cnmf_body, "Exclude cell ROIs", self.exclude_roi_var)
+        self._sidebar_row(cnmf_body, "Cell radius", self.cnmf_gsig_var, suffix="px",
+                           help_text="Expected cell radius (gSig) passed to CaImAn "
+                                     "CNMF, used only when CNMF is offered to fill "
+                                     "an empty photon-flux panel (no Suite2p F.npy "
+                                     "available). The mean-projection viewer shown "
+                                     "right before that prompt lets you measure a "
+                                     "cell's diameter directly and auto-fills this.")
+        self._sidebar_check(cnmf_body, "Exclude cell ROIs", self.exclude_roi_var,
+                             help_text="Restrict the PTC fit to background/non-cell "
+                                       "pixels only, using Suite2p's stat.npy masks. "
+                                       "Useful if cell bodies show extra variance "
+                                       "(e.g. residual motion) that biases the gain "
+                                       "estimate away from pure background shot "
+                                       "noise.")
 
         # ── Motion correction ────────────────────────────────────────
         mc_body = self._sidebar_card("MOTION CORRECTION")
-        self._sidebar_check(mc_body, "Piecewise-rigid (NormCorre)", self.pw_rigid_var)
-        self._sidebar_check(mc_body, "Skip motion correction\n(manual TIFF already registered)", self.skip_mc_var)
-        self._sidebar_check(mc_body, "Save motion-corrected TIFF\n(reg_tif)", self.save_mc_var)
+        self._sidebar_check(mc_body, "Piecewise-rigid (NormCorre)", self.pw_rigid_var,
+                             help_text="Use non-rigid (piecewise-rigid) motion "
+                                       "correction instead of rigid. Only applies "
+                                       "when NormCorre actually needs to run (no "
+                                       "usable reg_tif export found). Slower, but "
+                                       "corrects local/non-uniform drift that a "
+                                       "single rigid shift can't.")
+        self._sidebar_check(mc_body, "Skip motion correction\n(manual TIFF already registered)", self.skip_mc_var,
+                             help_text="Manual-TIFF mode only (no Suite2p ops.npy "
+                                       "found at all). Check this if the TIFF you "
+                                       "point the tool at is already motion-"
+                                       "corrected, to skip an unnecessary NormCorre "
+                                       "pass.")
+        self._sidebar_check(mc_body, "Save motion-corrected TIFF\n(reg_tif)", self.save_mc_var,
+                             help_text="After NormCorre runs, save the result as "
+                                       "reg_tif/ chunks next to the source data, "
+                                       "matching Suite2p's own naming convention. "
+                                       "Next time you load the same folder the tool "
+                                       "finds this export and skips NormCorre "
+                                       "entirely -- it only ever needs to run once "
+                                       "per recording.")
 
         # ── Run Analysis (primary action, bottom of the sidebar) ────────
         run_frame = tk.Frame(self._gain_sidebar, bg=BG_MID)
