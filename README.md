@@ -14,7 +14,7 @@ pip install numpy scipy matplotlib pillow tifffile
 python kurtosis_checker.py
 ```
 
-That's everything you need if you already have registered TIFFs saved (see Case 1 below). CaImAn is an optional, heavier dependency only needed if Suite2p's `reg_tif` export is missing (Case 2).
+That's everything you need if you already have registered TIFFs saved (see Case 1 below). CaImAn is an optional, heavier dependency only needed if Suite2p's `reg_tif` export is missing (Case 2). `h5py` is an optional extra only needed if you're loading a pre-motion-corrected `.mat` movie saved in MATLAB's v7.3/HDF5 format (Case 3).
 
 ## Gain Estimation: two setup cases
 
@@ -70,11 +70,21 @@ Right after CNMF finishes, a **footprint sanity-check popup** shows the mean pro
 
 **Progress feedback (Gain Estimation tab only — not shown in Kurtosis mode):** below the status line, a chameleon (the light source) lobs photon squiggles at a cartoon neuron for the whole duration of Run Analysis — each impact ticks a counter (drawn as classic tally/gate marks — four verticals plus a diagonal fifth stroke per group of five) and swaps the neuron's expression, purely decorative so the app never looks frozen during reg_tif reads, PTC computation, or CNMF.
 
-The artwork is Filip's own hand-drawn sketches, embedded directly as PNG images (extracted from his uploaded SVG files) rather than redrawn — an `art/` folder ships alongside `kurtosis_checker.py` and must stay next to it for the images to load. Both bars use a dark background (matching the rest of the app) with the neuron/chameleon drawn RGB-inverted (white line art) so they read against it without needing a white patch; the photon's red squiggle is left uninverted since red already reads fine on dark. During NormCorre motion correction, the neuron image gets a scanline "glitch" effect (a pixel-shift, not a redraw) that fades out as progress comes in, keeping the original resolving-into-focus metaphor.
+The artwork is Filip's own hand-drawn sketches, embedded directly as PNG images (extracted from his uploaded SVG files) rather than redrawn — an `art/` folder ships alongside `kurtosis_checker.py` and **must be copied next to it** on whatever machine actually runs the app, or the animation raises `RuntimeError: Missing art asset '...'` (silently killing the busy animation's redraw loop if that error isn't visible) instead of loading. Copying only `kurtosis_checker.py` without its `art/` subfolder is a real, seen-in-the-wild way to break this. Both bars use a dark background (matching the rest of the app), with **only the black ink line art selectively inverted to white** — the neuron/chameleon's green highlighter tint and the photon's red squiggle keep their original colors, since a blind full-RGB invert would turn that green/red into magenta/cyan instead. During NormCorre motion correction, the neuron image gets a scanline "glitch" effect (a pixel-shift, not a redraw) that fades out as progress comes in, keeping the original resolving-into-focus metaphor.
 
-Each photon impact is a full volley, not a one-way hit: the chameleon's shot lands on the neuron (counter ticks, expression swaps), and the neuron immediately fires one back at the chameleon before the animation goes idle again.
+The neuron doesn't fire back on every hit — only every **2nd** photon it takes triggers an immediate return volley, tinted green (an exact red/green channel swap of the same photon art) rather than the chameleon's red, so the two directions are visually distinct at a glance.
 
 The animation runs on Tk's main-thread event loop (`~30fps`) while the actual PTC/CNMF computation runs in a separate background thread, so the animation doesn't block or meaningfully slow down analysis — resizing a couple of small PNGs per frame is cheap relative to the 33ms budget, and NumPy/CaImAn's heavy lifting mostly happens at the C level, which releases Python's GIL anyway. During NormCorre specifically, a separate big centered popup takes over: a progress bar plus the neuron redrawn with a scanline "distortion" that resolves into the clean drawing as CaImAn's own log output comes in. That bar is a step-count heuristic, not a true percentage — CaImAn's `motion_correct()` is one blocking call with no frame-level progress exposed, so each distinct log line nudges the bar forward (capped short of 100% until the call actually returns).
+
+### Case 3 (optional) — Load an already motion-corrected movie from a .mat file
+
+If motion correction was already done somewhere else (e.g. in MATLAB), or NormCorre keeps failing with `OSError: [Errno 28] No space left on device`, skip NormCorre entirely with the **"🎬 Load .mat Movie"** button (Gain Estimation tab only, next to Settings).
+
+That disk-space error specifically comes from `motion_correction_piecewise`'s `np.memmap(..., mode='w+')` call — NormCorre writes its intermediate registered frames to a multi-GB scratch file on disk before joining them, so the error means the disk that scratch directory lives on is full, not that anything is wrong with your movie or settings. Freeing space (or pointing CaImAn's temp/cache dir at a drive with more room) fixes it the normal way; loading a pre-registered `.mat` movie instead sidesteps NormCorre's disk write altogether.
+
+Pick a `.mat` file containing a 3D numeric matrix shaped **(x, y, time)** — MATLAB's own `size(mov)` convention. Both classic (pre-v7.3) and v7.3/HDF5 `.mat` files are supported (the latter needs `pip install h5py`); if the file has more than one 3D array in it, the largest one is picked automatically. A confirmation dialog shows the detected variable name and the frame count / pixel dimensions it inferred before committing, so a swapped-axis file is caught before it silently produces garbage.
+
+This mode has no Suite2p `F.npy`, so — like the manual-TIFF fallback below — only the gain estimate is available by default; the per-cell photon-flux panel needs the CNMF fallback (see above) to get cell traces.
 
 ### No Suite2p output at all
 

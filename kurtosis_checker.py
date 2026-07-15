@@ -47,7 +47,7 @@ Optional (only for the raw-TIFF NormCorre fallback in gain mode): caiman
 # Bump this on every change so a running instance's window title can be checked
 # against what's actually in this file -- handy when the app runs on a machine
 # separate from wherever this source file is being edited.
-APP_VERSION = "2026-07-15.5"
+APP_VERSION = "2026-07-15.8"
 
 import os
 import gc
@@ -612,6 +612,62 @@ def load_registered_movie_manual(raw_tiffs, max_frames, pw_rigid, skip_mc, save_
                             f"motion correction{note_suffix}")
 
 
+def _load_mat_movie_array(path):
+    """Load a 3D numeric movie array out of a .mat file, for the "load an
+    already motion-corrected movie" bypass (skips NormCorre entirely).
+    Handles both classic (pre-v7.3) .mat files via scipy.io.loadmat and
+    v7.3/HDF5 .mat files via h5py -- MATLAB switches a variable to v7.3
+    format once it exceeds the classic format's 2GB limit, which a
+    multi-thousand-frame movie routinely does.
+
+    Picks the largest 3D numeric array in the file as "the movie" rather
+    than requiring an exact variable name, since different pipelines save
+    it under different names (mov, Y, data, Ym, registered, ...).
+
+    Axis order: MATLAB's own convention for a movie is (x, y, time)
+    (`size(mov)` -> [Nx Ny Nt]). scipy.io.loadmat preserves that shape
+    as-is in the returned numpy array, so it needs an explicit transpose
+    to (time, y, x). h5py reading a v7.3/HDF5 .mat file already reports
+    the shape reversed relative to MATLAB's own dimension order (an HDF5
+    storage-order quirk from MATLAB writing column-major data into a
+    row-major container) -- so an h5py-loaded array comes back as
+    (time, y, x) already, with no transpose needed. Returns
+    (array_as_T_Y_X, variable_name)."""
+    try:
+        mat = scipy.io.loadmat(path)
+        candidates = {k: v for k, v in mat.items()
+                      if not str(k).startswith("__")
+                      and isinstance(v, np.ndarray) and v.ndim == 3
+                      and np.issubdtype(v.dtype, np.number)}
+        if not candidates:
+            raise RuntimeError(
+                f"No 3D numeric array found in {os.path.basename(path)} -- expected "
+                f"a motion-corrected movie matrix (x, y, time). Variables found: "
+                f"{[k for k in mat if not str(k).startswith('__')]}")
+        varname = max(candidates, key=lambda k: candidates[k].size)
+        arr = np.transpose(candidates[varname], (2, 1, 0))  # (x,y,t) -> (t,y,x)
+        return arr, varname
+    except NotImplementedError:
+        # scipy.io.loadmat can't read v7.3 (HDF5-backed) .mat files
+        import h5py
+        candidates = {}
+
+        def _visit(name, obj):
+            if (isinstance(obj, h5py.Dataset) and obj.ndim == 3
+                    and np.issubdtype(obj.dtype, np.number)):
+                candidates[name] = obj
+
+        with h5py.File(path, "r") as f:
+            f.visititems(_visit)
+            if not candidates:
+                raise RuntimeError(
+                    f"No 3D numeric dataset found in {os.path.basename(path)} -- "
+                    f"expected a motion-corrected movie matrix (x, y, time).")
+            varname = max(candidates, key=lambda k: candidates[k].size)
+            arr = np.asarray(candidates[varname])  # already (t,y,x) -- see docstring
+        return arr, varname.rsplit("/", 1)[-1]
+
+
 def roi_exclusion_mask(stat, Ly, Lx):
     """Boolean mask, True = background/non-cell pixel."""
     mask = np.ones((Ly, Lx), dtype=bool)
@@ -1008,18 +1064,35 @@ def _load_art_image(name):
 _ART_INVERTED_CACHE = {}  # name -> PIL.Image, RGB channels inverted (black lines -> white)
 
 
+def _selective_invert_lines(im):
+    """Invert only the near-black, low-saturation ink strokes to white --
+    leaves colored fill (the green highlighter tint on the neuron/
+    chameleon, the red on the photon) untouched. A blind full-RGB invert
+    turns the green tint into magenta/purple, which isn't what was wanted;
+    this only flips pixels that are dark AND close to gray (true black
+    line art), since colored fill pixels have real channel separation
+    (green: G >> R,B; red: R >> G,B) that a grayscale ink stroke doesn't."""
+    arr = np.array(im).astype(np.int16)
+    r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
+    maxc = np.maximum(np.maximum(r, g), b)
+    minc = np.minimum(np.minimum(r, g), b)
+    sat = maxc - minc
+    is_black_ink = (maxc < 110) & (sat < 45)
+    out = arr.copy()
+    for ch in range(3):
+        out[..., ch] = np.where(is_black_ink, 255 - arr[..., ch], arr[..., ch])
+    return Image.fromarray(out.astype(np.uint8), mode="RGBA")
+
+
 def _load_art_image_inverted(name):
-    """Same artwork as _load_art_image, but with RGB channels inverted
-    (alpha untouched) -- black line art becomes white line art, so it reads
-    against a dark background instead of needing a white canvas behind it.
-    Used for the neuron/chameleon (black-stroke drawings); the photon's red
-    stroke is already visible on dark backgrounds and is left as-is."""
+    """Same artwork as _load_art_image, but with just the black ink lines
+    flipped to white (see _selective_invert_lines) -- reads against a dark
+    background instead of needing a white canvas behind it, while keeping
+    the original green/red fill colors intact."""
     if name in _ART_INVERTED_CACHE:
         return _ART_INVERTED_CACHE[name]
     im = _load_art_image(name)
-    arr = np.array(im).copy()
-    arr[..., :3] = 255 - arr[..., :3]
-    inv = Image.fromarray(arr, mode="RGBA")
+    inv = _selective_invert_lines(im)
     _ART_INVERTED_CACHE[name] = inv
     return inv
 
@@ -1055,10 +1128,10 @@ def _render_art_image(canvas, name, cx, cy, target_h, tag,
     at (cx, cy) on `canvas` via create_image. Keeps a strong reference to
     the resulting PhotoImage on the canvas itself (Tk requires this --
     otherwise it gets garbage-collected and the image silently vanishes).
-    `inverted=True` uses the RGB-inverted (white-line-art) version, for
-    display on a dark background. Returns (disp_w, disp_h), the actual
-    on-screen pixel size, so callers can compute anchor points (eye,
-    snout, ...) relative to it.
+    `inverted=True` uses the selectively-line-inverted (white ink strokes,
+    original fill colors kept) version, for display on a dark background.
+    Returns (disp_w, disp_h), the actual on-screen pixel size, so callers
+    can compute anchor points (eye, snout, ...) relative to it.
     """
     canvas.delete(tag)
     im = _load_art_image_inverted(name) if inverted else _load_art_image(name)
@@ -1083,7 +1156,9 @@ def _render_art_image(canvas, name, cx, cy, target_h, tag,
 # rather than just its bounding-box center. Approximate (eyeballed from
 # the source images' own proportions), not pixel-exact.
 NRN_EYE_OFFSET_FRAC = (0.0, -0.22)      # eye sits a bit above center (legs take up the lower half)
-CHAM_SNOUT_OFFSET_FRAC = (-0.46, -0.05)  # snout is at the far-left edge, roughly mid-height
+CHAM_SNOUT_OFFSET_FRAC = (-0.48, -0.22)  # snout is at the far-left edge, upper third (measured
+                                          # directly off chameleon.png's alpha bbox: leftmost
+                                          # content column sits at y-fraction -0.217 of height)
 
 
 def draw_neuron(canvas, cx, cy, scale, expr="neutral", distort=0.0, phase=0.0,
@@ -1109,15 +1184,36 @@ def draw_chameleon(canvas, cx, cy, scale, tag="chameleon", outline="#111111"):
     return _render_art_image(canvas, "chameleon", cx, cy, target_h, tag, inverted=True)
 
 
+def _load_photon_variant(tint="red"):
+    """The photon squiggle, black ink lines flipped to white (like the
+    other art assets) and, for the 'green' variant, its red stroke/wash
+    recolored to green by swapping the R and G channels -- a cheap, exact
+    hue swap since the source art is a pure red-on-white sketch (no other
+    color mixed in to distort). Used for the neuron's return volleys, to
+    visually distinguish them from the chameleon's outbound red shots."""
+    cache_key = f"photon_{tint}"
+    if cache_key in _ART_INVERTED_CACHE:
+        return _ART_INVERTED_CACHE[cache_key]
+    im = _load_art_image_inverted("photon")  # black ink -> white, red stroke untouched
+    if tint == "green":
+        arr = np.array(im).copy()
+        arr[..., [0, 1]] = arr[..., [1, 0]]  # swap R/G: red stroke -> green
+        im = Image.fromarray(arr, mode="RGBA")
+    _ART_INVERTED_CACHE[cache_key] = im
+    return im
+
+
 def draw_photon(canvas, cx, cy, length, amplitude, angle_deg, phase, tag="photon",
-                 color="#e94560"):
+                 tint="red"):
     """Draw Filip's actual photon squiggle sketch centered at (cx, cy),
     sized from `length`, rotated to point along its direction of travel
     (`angle_deg`). `amplitude`/`phase` no longer reshape the squiggle itself
     (it's a fixed drawing now) but `phase` still adds a small extra wobble
-    rotation so the in-flight animation keeps some life to it."""
+    rotation so the in-flight animation keeps some life to it. `tint`
+    selects "red" (the chameleon's outbound shot) or "green" (the neuron's
+    return volley)."""
     canvas.delete(tag)
-    im = _load_art_image("photon")
+    im = _load_photon_variant(tint)
     target_w = max(4, int(length * 2.0))
     scale = target_w / im.width
     target_h = max(4, int(im.height * scale))
@@ -1234,14 +1330,18 @@ class PhotonNeuronBar(tk.Canvas):
             frac = (t - self._flight_t0) / dur
             if frac >= 1.0:
                 if self._flight_dir == "out":
-                    # chameleon's photon just landed -- neuron reacts, then
-                    # immediately fires one back at the chameleon
+                    # chameleon's photon just landed -- neuron reacts, and
+                    # only fires one back every 2nd hit it takes
                     self._hits += 1
                     self._expr = random.choice(["surprised", "annoyed"])
                     self._expr_until = t + 0.5
-                    self._flight_dir = "back"
-                    self._flight_t0 = t
-                    self._flight_frac = 0.0
+                    if self._hits % 2 == 0:
+                        self._flight_dir = "back"
+                        self._flight_t0 = t
+                        self._flight_frac = 0.0
+                    else:
+                        self._flight_frac = None
+                        self._next_launch = t + random.uniform(0.5, 1.1)
                 else:
                     # return shot landed -- volley's done, go idle until the
                     # next launch
@@ -1251,7 +1351,16 @@ class PhotonNeuronBar(tk.Canvas):
                 self._flight_frac = frac
         if self._expr != "neutral" and t >= self._expr_until:
             self._expr = "neutral"
-        self._render(t)
+        try:
+            self._render(t)
+        except Exception:
+            # Never let a rendering hiccup (e.g. a missing art/ asset) kill
+            # the recurring .after() schedule -- that would silently stop
+            # the whole loader with no visible error. Log once via the
+            # canvas's own error flag instead of spamming every 33ms.
+            if not getattr(self, "_render_error_shown", False):
+                self._render_error_shown = True
+                traceback.print_exc()
         self._job = self.after(33, self._tick)
 
     def _render(self, t):
@@ -1272,13 +1381,15 @@ class PhotonNeuronBar(tk.Canvas):
                       nrn_cy + NRN_EYE_OFFSET_FRAC[1] * nrn_h)
             if self._flight_dir == "out":
                 (x0, y0), (x1, y1) = cham_pt, nrn_pt
+                tint = "red"
             else:
                 (x0, y0), (x1, y1) = nrn_pt, cham_pt
+                tint = "green"
             fx = x0 + (x1 - x0) * self._flight_frac
             fy = y0 + (y1 - y0) * self._flight_frac
             angle = math.degrees(math.atan2(y1 - y0, x1 - x0))
             draw_photon(self, fx, fy, length=30, amplitude=8,
-                        angle_deg=angle, phase=t * 14, tag="photon")
+                        angle_deg=angle, phase=t * 14, tag="photon", tint=tint)
         else:
             self.delete("photon")
 
@@ -1373,8 +1484,16 @@ class MotionCorrectionOverlay:
         cx = self._art_w / 2
         cy = self._art_h / 2
         distort = max(0.0, 1.0 - self._progress)
-        draw_neuron(self.art_canvas, cx, cy, scale=self.NRN_SCALE, expr="neutral",
-                    distort=distort, phase=self._phase, tag="neuron")
+        try:
+            draw_neuron(self.art_canvas, cx, cy, scale=self.NRN_SCALE, expr="neutral",
+                        distort=distort, phase=self._phase, tag="neuron")
+        except Exception:
+            # A missing/broken art asset shouldn't take down the progress
+            # bar itself -- that's the one part of this popup that's not
+            # just decorative.
+            if not getattr(self, "_render_error_shown", False):
+                self._render_error_shown = True
+                traceback.print_exc()
 
     def tick(self, msg=None):
         """Called (via the app's progress_cb channel) each time a new
@@ -1639,6 +1758,13 @@ class KurtosisChecker:
         self.g_raw_tiffs = None       # list of paths, or None if using Suite2p
         self.g_raw_shape = None       # (Ly, Lx, total_frames) probed at load time
 
+        # gain-mode state: pre-motion-corrected movie loaded directly from a
+        # .mat file (bypasses NormCorre entirely -- e.g. when motion
+        # correction was already done in MATLAB, or when NormCorre's memmap
+        # write keeps failing with "No space left on device")
+        self.g_mat_movie = None       # (T, Ly, Lx) array, or None
+        self.g_mat_movie_note = ""
+
         # big centered popup shown only while NormCorre is genuinely running
         self._motion_overlay = None
 
@@ -1778,6 +1904,14 @@ class KurtosisChecker:
 
         self._settings_open = False
         self._settings_btn = _lbtn(left, "⚙  Settings", self._toggle_settings, bg="#3a3a3a", bold=False)
+
+        # gain-tab-only: load an already motion-corrected movie straight from
+        # a .mat file, skipping NormCorre entirely (e.g. when it was already
+        # motion-corrected in MATLAB, or NormCorre's memmap write keeps
+        # hitting "No space left on device")
+        self._mat_movie_btn = _lbtn(left, "🎬  Load .mat Movie", self._load_gain_mat_movie,
+                                     bg="#8e44ad", bold=False)
+        self._mat_movie_btn.pack_forget()  # hidden until the Gain Estimation tab is active
 
         # ── center tab toggle ────────────────────────────────────────────
         self._tab_kurtosis_btn = _lbtn(center, "Kurtosis", lambda: self._switch_tab("kurtosis"),
@@ -1992,12 +2126,14 @@ class KurtosisChecker:
             self._action_btn.config(text="▶  Plot")
             self._sort_frame.pack(side=tk.LEFT, padx=(16, 0))
             self._progress_row.pack_forget()
+            self._mat_movie_btn.pack_forget()
         else:
             self._tab_kurtosis_btn.config(bg=TAB_INACTIVE_BG)
             self._tab_gain_btn.config(bg=TAB_ACTIVE_BG)
             self._action_btn.config(text="▶  Run Analysis")
             self._sort_frame.pack_forget()
             self._progress_row.pack(fill=tk.X)
+            self._mat_movie_btn.pack(side=tk.LEFT, padx=6, after=self._settings_btn)
 
         if self._settings_open:
             self._settings_kurtosis.pack_forget()
@@ -2019,7 +2155,7 @@ class KurtosisChecker:
                 self._render_gain_results()
             else:
                 self._draw_gain_splash()
-            if self.g_plane_dir is None and not self.g_raw_tiffs:
+            if self.g_plane_dir is None and not self.g_raw_tiffs and self.g_mat_movie is None:
                 self.status_var.set("No data loaded — Gain Estimation mode "
                                      "(registered movie is only loaded when you click Run Analysis)")
 
@@ -2643,6 +2779,7 @@ class KurtosisChecker:
             plane_dir, ops, F, Fneu, stat
         self.g_raw_tiffs = None   # clear any previous manual-TIFF selection
         self.g_raw_shape = None
+        self.g_mat_movie = None  # clear any previous .mat-movie selection
         self.g_results = None
         fs = ops.get("fs")
         if fs:
@@ -2686,9 +2823,61 @@ class KurtosisChecker:
         self.g_plane_dir, self.g_ops, self.g_F, self.g_Fneu, self.g_stat = None, None, None, None, None
         self.g_raw_tiffs = list(paths)
         self.g_raw_shape = (Ly, Lx, total_frames)
+        self.g_mat_movie = None  # clear any previous .mat-movie selection
         self.g_results = None
         self.status_var.set(
             f"Loaded {len(paths)} TIFF(s)  ·  {Ly}x{Lx} px  ·  {total_frames} frames  ·  "
+            f"no Suite2p F.npy — gain estimate only  ·  verify fs in Settings  ·  click Run Analysis")
+        self._draw_gain_splash()
+
+    def _load_gain_mat_movie(self):
+        """Load an already motion-corrected movie straight from a .mat file,
+        bypassing NormCorre entirely. For when motion correction was already
+        done elsewhere (e.g. MATLAB), or when NormCorre's own memmap write
+        keeps failing (e.g. 'OSError: No space left on device' -- that error
+        comes from np.memmap() writing a multi-GB scratch file to disk during
+        motion_correction_piecewise, so it means the disk NormCorre's scratch
+        dir lives on is full, not that anything is wrong with the movie).
+
+        Expects a 3D numeric array shaped (x, y, time); axis-order handling
+        for scipy (classic .mat) vs h5py (v7.3/HDF5 .mat) is in
+        _load_mat_movie_array."""
+        path = filedialog.askopenfilename(
+            title="Select a motion-corrected movie (.mat, matrix x/y/time)",
+            filetypes=[("MATLAB", "*.mat"), ("All", "*.*")])
+        if not path:
+            return
+        try:
+            arr, varname = _load_mat_movie_array(path)
+        except ImportError:
+            messagebox.showerror(
+                "Missing package",
+                "This .mat file needs h5py to read (MATLAB v7.3 / HDF5 format):\n"
+                "  pip install h5py")
+            return
+        except Exception as e:
+            messagebox.showerror("Error", str(e)); return
+
+        T, Ly, Lx = arr.shape
+        proceed = messagebox.askyesno(
+            "Confirm movie shape",
+            f"Loaded variable '{varname}' from {os.path.basename(path)}.\n\n"
+            f"Interpreted as {T} frames of {Lx}x{Ly} px (x, y, time order).\n\n"
+            f"If that looks wrong (e.g. frame count and pixel dimensions "
+            f"look swapped), cancel and double check the axis order the "
+            f"movie was saved with.\n\nProceed?")
+        if not proceed:
+            return
+
+        self.g_plane_dir, self.g_ops, self.g_F, self.g_Fneu, self.g_stat = None, None, None, None, None
+        self.g_raw_tiffs = None
+        self.g_raw_shape = None
+        self.g_mat_movie = arr
+        self.g_mat_movie_note = f"{os.path.basename(path)} (var '{varname}')"
+        self.g_results = None
+        self.status_var.set(
+            f"Loaded motion-corrected movie from .mat  ·  {T} frames  ·  {Lx}x{Ly} px  ·  "
+            f"{os.path.basename(path)}  ·  NormCorre will be skipped  ·  "
             f"no Suite2p F.npy — gain estimate only  ·  verify fs in Settings  ·  click Run Analysis")
         self._draw_gain_splash()
 
@@ -2699,15 +2888,17 @@ class KurtosisChecker:
     # ── gain-mode: analysis (threaded; this is the only place the movie loads) ──
 
     def run_gain_analysis(self):
-        if self.g_plane_dir is None and not self.g_raw_tiffs:
-            messagebox.showwarning("No data", "Load a Suite2p folder (or select TIFFs) first.")
+        if self.g_plane_dir is None and not self.g_raw_tiffs and self.g_mat_movie is None:
+            messagebox.showwarning("No data", "Load a Suite2p folder, select TIFFs, or load a .mat movie first.")
             return
 
         max_frames = max(50, int(self.max_frames_var.get()))
         if self.g_plane_dir is not None:
             Ly, Lx = self.g_ops.get("Ly"), self.g_ops.get("Lx")
-        else:
+        elif self.g_raw_tiffs:
             Ly, Lx, _ = self.g_raw_shape
+        else:
+            _, Ly, Lx = self.g_mat_movie.shape
         frame_bytes = Ly * Lx * 4  # worst case: float32
         est_gb = (frame_bytes * max_frames) / 1e9
         if est_gb > 1.5:
@@ -2843,7 +3034,22 @@ class KurtosisChecker:
             save_mc = bool(self.save_mc_var.get())
             frame_start = self._parse_frame_start()
 
-            if self.g_plane_dir is not None:
+            mat_movie = getattr(self, "g_mat_movie", None)
+            if mat_movie is not None:
+                # Already motion-corrected -- NormCorre is skipped entirely,
+                # so this never touches disk the way run_normcorre's memmap
+                # write does.
+                total = mat_movie.shape[0]
+                start, end = contiguous_window(total, max_frames, start=frame_start)
+                mat_note = getattr(self, "g_mat_movie_note", "")
+                self._gain_progress(
+                    f"Using pre-loaded .mat movie ({mat_note}), "
+                    f"frames [{start}:{end}) of {total} -- NormCorre skipped")
+                movie = RegisteredMovie(
+                    mat_movie[start:end], "mat_file",
+                    f"{mat_note}, frames [{start}:{end}) of {total}, "
+                    f"already motion-corrected (NormCorre skipped)")
+            elif self.g_plane_dir is not None:
                 movie = load_registered_movie(
                     self.g_plane_dir, self.g_ops, max_frames, pw_rigid,
                     progress_cb=self._gain_progress, ask_raw_dir=self._ask_raw_dir,
