@@ -7,6 +7,8 @@ A desktop tool for two-photon calcium imaging QC, built around Suite2p output. I
 
 This README focuses on **Gain Estimation** mode, since that's the part with real setup decisions.
 
+**Layout:** the Gain Estimation tab has an always-visible left sidebar (Load buttons, then fit/CNMF/motion-correction settings grouped into cards, then Run Analysis) so every option is visible before you run anything — no toggle needed. The Kurtosis tab keeps the old top-bar Load Data + collapsible Settings, since it has far fewer options. The busy animation (chameleon lobbing photons at the neuron) takes over the main output area — where the plot normally is — while an analysis runs, and swaps back to the plot when it's done. GUI chrome (buttons, sidebar cards) uses a flat greyscale palette; plot colors (fit line, histogram, exclusion masks) are unchanged.
+
 ## Installation
 
 ```
@@ -18,7 +20,7 @@ That's everything you need if you already have registered TIFFs saved (see Case 
 
 ## Gain Estimation: two setup cases
 
-Click **Gain Estimation** in the top bar, then **Load Data** and select any folder at or above your Suite2p output. The tool recursively searches *downstream* of whatever folder you select for a directory containing `ops.npy` — there's no fixed list of expected folder names, so it works whether you're parked at the session folder, a custom intermediate folder (e.g. a `small/` subfolder for a downsampled test run), the `suite2p` folder, or `plane0` itself directly.
+Click **Gain Estimation** in the top bar, then in the left sidebar's **LOAD** card click **📁 Suite2p Folder** and select any folder at or above your Suite2p output. The tool recursively searches *downstream* of whatever folder you select for a directory containing `ops.npy` — there's no fixed list of expected folder names, so it works whether you're parked at the session folder, a custom intermediate folder (e.g. a `small/` subfolder for a downsampled test run), the `suite2p` folder, or `plane0` itself directly.
 
 If the tree contains **more than one** `ops.npy` — for example an older full-resolution run sitting alongside a newer downsampled one — the search specifically prefers whichever one has a *usable* `reg_tif` export over one that doesn't, rather than just grabbing the first/shallowest match. That matters: picking a plane with cell traces but no registered movie silently sends you down the slow CaImAn path for no reason.
 
@@ -26,8 +28,8 @@ If the tree contains **more than one** `ops.npy` — for example an older full-r
 
 If you ran Suite2p with the `reg_tif` option enabled, your plane folder has a `reg_tif/` subfolder containing the motion-corrected movie as TIFF chunks (e.g. `file000_chan0.tif`, `file001_chan0.tif`, ...). This is the tool's preferred source and requires nothing beyond the core dependencies above.
 
-1. **Load Data** → select the folder. The status bar shows the *full resolved path* plus an honest `reg_tif found (N file(s))` / `no usable reg_tif` hint, computed with the same file-matching logic Run Analysis uses — so this can never claim reg_tif is available and then fall back anyway.
-2. Click **Run Analysis**.
+1. **Suite2p Folder** → select the folder. The status bar shows the *full resolved path* plus an honest `reg_tif found (N file(s))` / `no usable reg_tif` hint, computed with the same file-matching logic Run Analysis uses — so this can never claim reg_tif is available and then fall back anyway.
+2. Click **Run Analysis** (bottom of the sidebar).
 3. The tool reads only the chunk files it needs for a contiguous window of frames (see *Memory behavior* below), computes the PTC gain fit, and shows:
    - Left panel: the hockey-stick plot (mean vs. variance, shot-noise fit, read-noise floor)
    - Right panel: per-cell photon flux histogram (median ± bootstrap SEM)
@@ -52,9 +54,9 @@ Windows note: if `conda install` fails with `SSL module is not available`, that'
 
 Once CaImAn is installed:
 
-1. **Load Data** → select the folder. The status bar shows `no reg_tif export — will need NormCorre on raw TIFFs`.
+1. **Suite2p Folder** → select the folder. The status bar shows `no reg_tif export — will need NormCorre on raw TIFFs`.
 2. Click **Run Analysis**. The tool tries to resolve the raw TIFF paths from `ops.npy` automatically; if those paths don't exist on this machine, it will prompt you to locate the raw TIFF folder manually.
-3. NoRMCorre runs (rigid by default; enable **piecewise-rigid** in Settings for non-rigid correction), then the PTC analysis proceeds as in Case 1.
+3. NoRMCorre runs (rigid by default; enable **piecewise-rigid** in the sidebar's MOTION CORRECTION card for non-rigid correction), then the PTC analysis proceeds as in Case 1.
 
 **Saving the motion-corrected movie:** the **"Save motion-corrected TIFF (reg_tif)"** setting (checked by default) writes the NormCorre output as `reg_tif/file000_chan0.tif`-style chunks next to the source data, matching Suite2p's own naming convention. Next time you load the same folder, the tool finds this `reg_tif/` export and uses it directly — NormCorre only ever needs to run once per recording.
 
@@ -68,7 +70,7 @@ CNMF's `fit()` call has been observed to return `None` on some CaImAn versions/i
 
 Right after CNMF finishes, a **footprint sanity-check popup** shows the mean projection with the surviving masks outlined in green and the quality-filtered-out ones in red, so you can actually look at whether the green outlines look like real cells before trusting the flux numbers — instead of just trusting a histogram. It's non-blocking (doesn't hold up the rest of the analysis) and has the same zoom/pan toolbar as the mean-projection viewer.
 
-**Progress feedback (Gain Estimation tab only — not shown in Kurtosis mode):** below the status line, a chameleon (the light source) lobs photon squiggles at a cartoon neuron for the whole duration of Run Analysis — each impact ticks a counter (drawn as classic tally/gate marks — four verticals plus a diagonal fifth stroke per group of five) and swaps the neuron's expression (randomly one of **annoyed**, **surprised**, or **sleepy**), purely decorative so the app never looks frozen during reg_tif reads, PTC computation, or CNMF.
+**Progress feedback (Gain Estimation tab only — not shown in Kurtosis mode):** in the main output area (replacing the plot for the duration of the run), a chameleon (the light source) lobs photon squiggles at a cartoon neuron for the whole duration of Run Analysis — each impact ticks a counter (drawn as classic tally/gate marks — four verticals plus a diagonal fifth stroke per group of five) and swaps the neuron's expression (randomly one of **annoyed**, **surprised**, or **sleepy**), purely decorative so the app never looks frozen during reg_tif reads, PTC computation, or CNMF.
 
 The artwork is Filip's own hand-drawn sketches, sourced from his uploaded true-vector SVG files (the chameleon, the four neuron expressions, and the red/green photon squiggles are each real Illustrator vector art, rasterized once at build time rather than hand-traced) and **embedded directly in `kurtosis_checker.py` as base64-encoded PNG bytes** — there used to be a separate `art/` folder that had to be copied alongside the script, but that step kept getting missed in practice (copying just the `.py` file to a new machine), which raised `RuntimeError: Missing art asset '...'` and silently killed the busy animation's redraw loop. The script is now fully self-contained: a single `kurtosis_checker.py` file is everything you need, nothing else to ship or forget. The neuron's source sketch sheet had no color baked in (pure black outline), so its green body fill is added programmatically at build time (flood-filling the closed triangle interior, matching the chameleon's own green) rather than being part of the original art. Both bars use a dark background (matching the rest of the app), with **only the black ink line art selectively inverted to white** — the neuron/chameleon's green tint and the photon's red/green squiggles keep their original colors, since a blind full-RGB invert would turn that green/red into magenta/cyan instead. During NormCorre motion correction, the neuron image gets a scanline "glitch" effect (a pixel-shift, not a redraw) that fades out as progress comes in, keeping the original resolving-into-focus metaphor.
 
@@ -78,7 +80,7 @@ The animation runs on Tk's main-thread event loop (`~30fps`) while the actual PT
 
 ### Case 3 (optional) — Load an already motion-corrected movie from a .mat file
 
-If motion correction was already done somewhere else (e.g. in MATLAB), or NormCorre keeps failing with `OSError: [Errno 28] No space left on device`, skip NormCorre entirely with the **"🎬 Load .mat Movie"** button (Gain Estimation tab only, next to Settings).
+If motion correction was already done somewhere else (e.g. in MATLAB), or NormCorre keeps failing with `OSError: [Errno 28] No space left on device`, skip NormCorre entirely with the **"🎬 Load .mat Movie"** button (in the sidebar's LOAD card, next to Suite2p Folder).
 
 That disk-space error specifically comes from `motion_correction_piecewise`'s `np.memmap(..., mode='w+')` call — NormCorre writes its intermediate registered frames to a multi-GB scratch file on disk before joining them, so the error means the disk that scratch directory lives on is full, not that anything is wrong with your movie or settings. Freeing space (or pointing CaImAn's temp/cache dir at a drive with more room) fixes it the normal way; loading a pre-registered `.mat` movie instead sidesteps NormCorre's disk write altogether.
 
@@ -119,6 +121,8 @@ Gain Estimation mode is deliberately conservative about RAM:
 
 Photon flux uses **raw F only** — no neuropil subtraction — consistent with the Wilt et al. convention that F0 includes all detected photons (signal + background).
 
+**Re-fit without a full re-run:** after Run Analysis has completed once, the **↻ Re-fit** button (under Fit range/ENF in the sidebar) redoes just the linear PTC fit — and, if there's a flux panel, rescales it — using the mean/variance bins already computed. It's instant (no thread, no movie re-read) because Fit range and ENF only affect the regression over bins that already exist. Frame rate `fs` is also picked up live by Re-fit. Spatial bin, Edge margin, Exclude cell ROIs, and anything CNMF/motion-correction related bake into the bins themselves during the raw-pixel pass, so changing those still needs a full Run Analysis.
+
 ## PTC method notes (vs. the Lees et al. 2025 reference protocol)
 
 Checked against a MATLAB reference implementation of the Lees et al. 2025 (*Nature Protocols*, Procedure 7 / Box 7-8) method. The core statistics already match exactly: adjacent-frame mean `M = 0.5*(X + X')`, adjacent-frame variance `D = 0.5*(X - X')²` (averaged per-pixel over all frame pairs, so slow structural signal cancels and only shot noise survives), and the `gain_true = slope / ENF²` correction are identical formulas in both.
@@ -131,6 +135,6 @@ Two places the tools genuinely differed, one now fixed and one left as an open c
 
 ## Repo contents
 
-- `kurtosis_checker.py` — the app (single file, tkinter + matplotlib). Fully self-contained: the Gain Estimation progress animation's artwork is embedded directly in this file as base64 PNG data, so there's nothing else to copy alongside it.
-- `art/` — the source PNGs the embedded art data was generated from (Filip's own sketches). Not needed to run the app; keep around only if the art ever needs regenerating.
+- `kurtosis_checker.py` — the app (single file, tkinter + matplotlib). Fully self-contained: the Gain Estimation progress animation's artwork and the slab wordmark logo are embedded directly in this file as base64 PNG data, so there's nothing else to copy alongside it.
+- `art/` — the source PNGs the embedded art data was generated from (Filip's own sketches, plus the slab wordmark logo). Not needed to run the app; keep around only if the art ever needs regenerating.
 - `hockey_stick_requirements.txt` — dependency list, including the CaImAn/NormCorre setup notes above
