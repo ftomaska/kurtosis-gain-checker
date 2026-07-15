@@ -47,7 +47,7 @@ Optional (only for the raw-TIFF NormCorre fallback in gain mode): caiman
 # Bump this on every change so a running instance's window title can be checked
 # against what's actually in this file -- handy when the app runs on a machine
 # separate from wherever this source file is being edited.
-APP_VERSION = "2026-07-15.19"
+APP_VERSION = "2026-07-15.20"
 
 import os
 import gc
@@ -6832,6 +6832,12 @@ class PhotonNeuronBar(tk.Canvas):
             self._flight_dir = "back"
             self._flight_frac = 0.0
             self._flight_t0 = t
+            # start the hand reaching from frac=0 right at launch, rather
+            # than waiting for the "advance shot A" block's next tick --
+            # otherwise the hand lags one tick behind the photon it's
+            # supposed to be tracking.
+            self._hand_phase = "reaching"
+            self._hand_frac = 0.0
 
         if self._expr != "neutral" and t >= self._expr_until:
             self._expr = "neutral"
