@@ -47,7 +47,7 @@ Optional (only for the raw-TIFF NormCorre fallback in gain mode): caiman
 # Bump this on every change so a running instance's window title can be checked
 # against what's actually in this file -- handy when the app runs on a machine
 # separate from wherever this source file is being edited.
-APP_VERSION = "2026-07-15.15"
+APP_VERSION = "2026-07-15.17"
 
 import os
 import gc
@@ -119,9 +119,7 @@ GREY_BORDER     = "#333333"
 CARD_BG         = "#161616"   # grouped-settings card background (vs BG_MID chrome)
 CARD_BORDER     = "#2a2a2a"
 
-# TODO(Filip): fill in the real lab URL -- the slab logo currently links here
-# as a placeholder. Tell me the URL and I'll swap it in.
-SLAB_LAB_URL = "https://example.com/slab-lab-placeholder"
+SLAB_LAB_URL = "https://slslab.org"
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -1028,14 +1026,31 @@ def fit_gain(mu_bin, var_bin, n_bin, fit_pct_lo, fit_pct_hi, enf):
                  mask=mask, low_mask=low_mask, high_mask=high_mask)
 
 
-def photon_flux_per_cell(F, gain_true, fs):
-    """Photons/cell/s from raw F only — no neuropil/background subtraction.
-    Matches the Wilt convention: F0 is defined to include all detected
-    photons (signal + background), so subtracting Fneu here would be
-    inconsistent with that definition."""
+def photon_flux_per_cell(F, gain_true, fs, baseline_pct=None):
+    """Photons/cell/s from raw F -- no neuropil/background subtraction by
+    default. Matches the Wilt convention: F0 is defined to include all
+    detected photons (signal + background *light*), so subtracting Fneu
+    here would be inconsistent with that definition.
+
+    `baseline_pct`, if given, is a DIFFERENT correction from Fneu
+    subtraction: the low-percentile value of each cell's own raw trace,
+    subtracted before the photon conversion. This targets the digitizer's
+    constant black-level/dark offset (present even with zero real photons
+    -- visible as the nonzero floor on the PTC plot's Mean-ADU axis), not
+    optical background light. Left uncorrected, that offset gets
+    miscounted as detected photons, and since F is a per-ROI pixel SUM
+    (matching Suite2p's own convention, see footprints_to_raw_traces), the
+    offset's contribution scales with ROI size (offset_ADU * n_pixels) --
+    exactly the kind of thing that produces implausibly large flux numbers
+    for bigger cells/masks. None (the default) keeps the original raw-F
+    behavior for backward compatibility."""
     if not np.isfinite(gain_true) or gain_true <= 0:
         return np.full(F.shape[0], np.nan)
-    photons_per_frame = F.astype(float).mean(axis=1) / gain_true
+    Fc = F.astype(float)
+    if baseline_pct is not None:
+        f0 = np.percentile(Fc, baseline_pct, axis=1, keepdims=True)
+        Fc = Fc - f0
+    photons_per_frame = Fc.mean(axis=1) / gain_true
     return photons_per_frame * fs
 
 
@@ -1476,6 +1491,30 @@ def draw_tally(canvas, x, y, count, tag="tally", stroke=2, line_h=16, line_w=6,
         lx = cx + i * line_w
         canvas.create_line(lx, y, lx, y + line_h, fill=color, width=stroke, tags=tag)
     return cx + remainder * line_w
+
+
+def _rounded_rect_points(x1, y1, x2, y2, radius):
+    """Point list for a rounded rectangle, meant to be drawn via
+    canvas.create_polygon(points, smooth=True, ...) -- the standard
+    tkinter recipe for smooth corners (Tk's Canvas has no native
+    rounded-rectangle primitive). `radius` is clamped so it never exceeds
+    half the shorter side, which would otherwise self-intersect on very
+    small/thin cards."""
+    radius = max(0, min(radius, (x2 - x1) / 2, (y2 - y1) / 2))
+    return [
+        x1 + radius, y1,
+        x2 - radius, y1,
+        x2, y1,
+        x2, y1 + radius,
+        x2, y2 - radius,
+        x2, y2,
+        x2 - radius, y2,
+        x1 + radius, y2,
+        x1, y2,
+        x1, y2 - radius,
+        x1, y1 + radius,
+        x1, y1,
+    ]
 
 
 class PhotonNeuronBar(tk.Canvas):
@@ -2340,38 +2379,74 @@ class KurtosisChecker:
     # self._gain_sidebar, created there) once self.fs_var etc. already
     # exist from _build_settings_shared.
 
+    CARD_RADIUS = 10  # corner radius for the rounded sidebar cards, in px
+
     def _sidebar_card(self, title=None):
-        """A bordered, padded group -- the "areas" the settings/buttons are
-        grouped into, echoing the boxed-panel look Filip pointed to."""
-        outer = tk.Frame(self._gain_sidebar, bg=CARD_BG, highlightbackground=CARD_BORDER,
-                          highlightthickness=1, bd=0)
-        outer.pack(fill=tk.X, padx=12, pady=(0, 10))
+        """A rounded-corner, padded group -- the "areas" the settings/
+        buttons are grouped into, echoing the boxed-panel look Filip
+        pointed to (rounded per his "smoother angles" follow-up). Plain
+        tk.Frame has no rounded-corner support, so the card background is
+        a rounded-rectangle drawn on a backing Canvas, with the actual
+        content (title + returned body frame) embedded on top via
+        create_window; the canvas auto-resizes to fit the content and
+        redraws the rounded rect to match on every size change."""
+        canvas = tk.Canvas(self._gain_sidebar, bg=BG_MID, highlightthickness=0, bd=0)
+        canvas.pack(fill=tk.X, padx=12, pady=(0, 10))
+
+        content = tk.Frame(canvas, bg=CARD_BG)
+        win_id = canvas.create_window(0, 0, window=content, anchor="nw")
+        state = {"bg_item": None}
+
+        def _redraw(event=None):
+            w = max(content.winfo_reqwidth(), 20)
+            h = max(content.winfo_reqheight(), 20)
+            canvas.config(width=w, height=h)
+            canvas.itemconfig(win_id, width=w)
+            pts = _rounded_rect_points(1, 1, w - 1, h - 1, self.CARD_RADIUS)
+            if state["bg_item"] is None:
+                state["bg_item"] = canvas.create_polygon(
+                    pts, smooth=True, fill=CARD_BG, outline=CARD_BORDER, width=1)
+                canvas.tag_lower(state["bg_item"])  # keep it behind the content window
+            else:
+                canvas.coords(state["bg_item"], *pts)
+
+        content.bind("<Configure>", _redraw)
+
         if title:
-            tk.Label(outer, text=title, bg=CARD_BG, fg=TEXT_DIM,
+            tk.Label(content, text=title, bg=CARD_BG, fg=TEXT_DIM,
                      font=("Helvetica", 9, "bold")).pack(anchor="w", padx=10, pady=(8, 2))
-        body = tk.Frame(outer, bg=CARD_BG)
+        body = tk.Frame(content, bg=CARD_BG)
         body.pack(fill=tk.X, padx=10, pady=(2, 10))
         return body
 
-    def _make_tooltip(self, widget, text):
-        """Attach a hover tooltip to `widget` -- a small floating borderless
-        window with `text`, appearing just below the widget on <Enter> and
-        disappearing on <Leave>. Backs the "?" help icons next to sidebar
-        parameters (Filip asked for inline explanations of what each
-        setting does, rather than having to go check the README)."""
-        state = {"win": None}
+    def _make_tooltip(self, widgets, text):
+        """Attach a shared hover tooltip to one or more widgets -- a small
+        floating borderless window with `text`, appearing just below the
+        first widget on <Enter> (of ANY of them) and disappearing once the
+        pointer has left ALL of them. Bound to every widget in a
+        parameter row (label, entry, suffix, "?" glyph) rather than just
+        the tiny "?" icon, per Filip's "only show descriptions when
+        someone hovers over the parameter" -- a bare Enter/Leave on the
+        row's own Frame doesn't fire reliably once child widgets cover its
+        whole area, so each child gets its own binding into this shared
+        state instead."""
+        if not isinstance(widgets, (list, tuple)):
+            widgets = [widgets]
+        state = {"win": None, "hover_count": 0}
+        anchor = widgets[0]
 
         def _show(event=None):
+            state["hover_count"] += 1
             if state["win"] is not None:
                 return
-            win = tk.Toplevel(widget)
+            win = tk.Toplevel(anchor)
             win.wm_overrideredirect(True)
             try:
                 win.wm_attributes("-topmost", True)
             except Exception:
                 pass
-            x = widget.winfo_rootx() - 6
-            y = widget.winfo_rooty() + widget.winfo_height() + 4
+            x = anchor.winfo_rootx() - 6
+            y = anchor.winfo_rooty() + anchor.winfo_height() + 4
             win.wm_geometry(f"+{x}+{y}")
             tk.Label(win, text=text, bg="#1c1c1c", fg=TEXT_BRIGHT,
                      font=("Helvetica", 9), justify="left", wraplength=260,
@@ -2379,47 +2454,66 @@ class KurtosisChecker:
             state["win"] = win
 
         def _hide(event=None):
-            if state["win"] is not None:
+            state["hover_count"] = max(0, state["hover_count"] - 1)
+            if state["hover_count"] == 0 and state["win"] is not None:
                 state["win"].destroy()
                 state["win"] = None
 
-        widget.bind("<Enter>", _show)
-        widget.bind("<Leave>", _hide)
+        for w in widgets:
+            w.bind("<Enter>", _show)
+            w.bind("<Leave>", _hide)
         return state
 
-    def _help_icon(self, parent, text):
-        """A small circular "?" that shows `text` in a hover tooltip."""
+    def _help_icon(self, parent, help_text=None):
+        """A small "?" glyph -- purely a visual cue now (shrunk down per
+        Filip's "make the ? icons smaller" feedback); the actual hover
+        trigger is the whole parameter row, wired up by the caller via
+        _make_tooltip(list_of_row_widgets, ...) rather than this icon
+        alone, so `help_text` here is optional/for simple standalone
+        call sites only."""
         icon = tk.Label(parent, text="?", bg=CARD_BG, fg=TEXT_DIM,
-                         font=("Helvetica", 8, "bold"), width=2,
+                         font=("Helvetica", 6, "bold"), width=1,
                          relief=tk.RIDGE, bd=1, cursor="question_arrow")
-        icon.pack(side=tk.LEFT, padx=(4, 0))
-        self._make_tooltip(icon, text)
+        icon.pack(side=tk.LEFT, padx=(3, 0))
+        if help_text:
+            self._make_tooltip(icon, help_text)
         return icon
 
     def _sidebar_row(self, parent, label_text, var, width=7, suffix=None, help_text=None):
         row = tk.Frame(parent, bg=CARD_BG)
         row.pack(fill=tk.X, pady=2)
-        tk.Label(row, text=label_text, bg=CARD_BG, fg=TEXT_MAIN,
-                 font=("Helvetica", 10)).pack(side=tk.LEFT)
+        lbl = tk.Label(row, text=label_text, bg=CARD_BG, fg=TEXT_MAIN,
+                        font=("Helvetica", 10))
+        lbl.pack(side=tk.LEFT)
+        hover_widgets = [row, lbl]
         if help_text:
-            self._help_icon(row, help_text)
+            hover_widgets.append(self._help_icon(row))
         if suffix:
-            tk.Label(row, text=suffix, bg=CARD_BG, fg=TEXT_DIM,
-                     font=("Helvetica", 9)).pack(side=tk.RIGHT)
-        tk.Entry(row, textvariable=var, width=width, bg=BG_PANEL, fg="white",
-                 insertbackground="white", relief=tk.FLAT,
-                 font=("Helvetica", 10), justify="right").pack(side=tk.RIGHT, padx=(0, 6))
+            suf = tk.Label(row, text=suffix, bg=CARD_BG, fg=TEXT_DIM,
+                            font=("Helvetica", 9))
+            suf.pack(side=tk.RIGHT)
+            hover_widgets.append(suf)
+        entry = tk.Entry(row, textvariable=var, width=width, bg=BG_PANEL, fg="white",
+                          insertbackground="white", relief=tk.FLAT,
+                          font=("Helvetica", 10), justify="right")
+        entry.pack(side=tk.RIGHT, padx=(0, 6))
+        hover_widgets.append(entry)
+        if help_text:
+            self._make_tooltip(hover_widgets, help_text)
         return row
 
     def _sidebar_check(self, parent, text, var, help_text=None):
         row = tk.Frame(parent, bg=CARD_BG)
         row.pack(fill=tk.X, pady=3, anchor="w")
-        tk.Checkbutton(row, text=text, variable=var, bg=CARD_BG, fg=TEXT_MAIN,
+        chk = tk.Checkbutton(row, text=text, variable=var, bg=CARD_BG, fg=TEXT_MAIN,
                        selectcolor=CARD_BG, activebackground=CARD_BG,
                        activeforeground=TEXT_BRIGHT, font=("Helvetica", 10),
-                       anchor="w", justify="left", wraplength=190).pack(side=tk.LEFT, fill=tk.X)
+                       anchor="w", justify="left", wraplength=190)
+        chk.pack(side=tk.LEFT, fill=tk.X)
+        hover_widgets = [row, chk]
         if help_text:
-            self._help_icon(row, help_text)
+            hover_widgets.append(self._help_icon(row))
+            self._make_tooltip(hover_widgets, help_text)
 
     def _build_gain_sidebar(self):
         # Tk variables the old row-based _build_settings_gain used to create
@@ -2438,6 +2532,13 @@ class KurtosisChecker:
         self.frame_start_var = tk.StringVar(value="")
         self.cnmf_gsig_var = tk.IntVar(value=6)
         self.exclude_roi_var = tk.BooleanVar(value=False)
+        # Default ON + 30th pctile: raw F (Suite2p or CNMF, both a per-ROI
+        # pixel SUM) includes the digitizer's black-level offset, which
+        # otherwise gets miscounted as photons and scales with ROI size --
+        # see photon_flux_per_cell's docstring. On by default since the
+        # un-subtracted numbers are the ones that looked implausibly huge.
+        self.subtract_baseline_var = tk.BooleanVar(value=True)
+        self.flux_baseline_pct_var = tk.DoubleVar(value=30.0)
         self.pw_rigid_var = tk.BooleanVar(value=False)
         self.skip_mc_var = tk.BooleanVar(value=False)
         self.save_mc_var = tk.BooleanVar(value=True)
@@ -2464,26 +2565,32 @@ class KurtosisChecker:
                                      "matters for photon-detector setups with excess "
                                      "multiplicative noise; leave at 1.0 for a plain "
                                      "shot-noise-limited camera.")
+        fitrange_help = ("Which intensity-percentile bins go into the shot-noise "
+                          "linear fit (0-50 by default, matching the Lees et al. "
+                          "2025 reference protocol). Raise the high end toward 98 "
+                          "to use almost the full intensity range instead -- a PMT "
+                          "has no strong inherent need for a read-noise floor "
+                          "exclusion the way a camera sensor does.")
         fitrange_row = tk.Frame(fit_body, bg=CARD_BG)
         fitrange_row.pack(fill=tk.X, pady=2)
-        tk.Label(fitrange_row, text="Fit range (% of mean)", bg=CARD_BG, fg=TEXT_MAIN,
-                 font=("Helvetica", 10)).pack(side=tk.LEFT)
-        self._help_icon(fitrange_row,
-                         "Which intensity-percentile bins go into the shot-noise "
-                         "linear fit (0-50 by default, matching the Lees et al. "
-                         "2025 reference protocol). Raise the high end toward 98 "
-                         "to use almost the full intensity range instead -- a PMT "
-                         "has no strong inherent need for a read-noise floor "
-                         "exclusion the way a camera sensor does.")
+        fitrange_lbl = tk.Label(fitrange_row, text="Fit range (% of mean)", bg=CARD_BG,
+                                 fg=TEXT_MAIN, font=("Helvetica", 10))
+        fitrange_lbl.pack(side=tk.LEFT)
+        fitrange_icon = self._help_icon(fitrange_row)
         fitrange_entries = tk.Frame(fit_body, bg=CARD_BG)
         fitrange_entries.pack(fill=tk.X, pady=(0, 2))
-        tk.Entry(fitrange_entries, textvariable=self.fit_lo_var, width=5, bg=BG_PANEL, fg="white",
+        fitrange_lo = tk.Entry(fitrange_entries, textvariable=self.fit_lo_var, width=5, bg=BG_PANEL, fg="white",
                  insertbackground="white", relief=tk.FLAT, font=("Helvetica", 10),
-                 justify="center").pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 3))
-        tk.Label(fitrange_entries, text="–", bg=CARD_BG, fg=TEXT_DIM).pack(side=tk.LEFT)
-        tk.Entry(fitrange_entries, textvariable=self.fit_hi_var, width=5, bg=BG_PANEL, fg="white",
+                 justify="center")
+        fitrange_lo.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 3))
+        fitrange_dash = tk.Label(fitrange_entries, text="–", bg=CARD_BG, fg=TEXT_DIM)
+        fitrange_dash.pack(side=tk.LEFT)
+        fitrange_hi = tk.Entry(fitrange_entries, textvariable=self.fit_hi_var, width=5, bg=BG_PANEL, fg="white",
                  insertbackground="white", relief=tk.FLAT, font=("Helvetica", 10),
-                 justify="center").pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(3, 0))
+                 justify="center")
+        fitrange_hi.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(3, 0))
+        self._make_tooltip([fitrange_row, fitrange_lbl, fitrange_icon, fitrange_entries,
+                             fitrange_lo, fitrange_dash, fitrange_hi], fitrange_help)
         self._sidebar_row(fit_body, "Spatial bin", self.spatial_bin_var, suffix="px",
                            help_text="Superpixel binning applied before the PTC fit "
                                      "(pixels are summed, not averaged, so the "
@@ -2542,6 +2649,33 @@ class KurtosisChecker:
                                        "(e.g. residual motion) that biases the gain "
                                        "estimate away from pure background shot "
                                        "noise.")
+
+        # ── Photon flux ──────────────────────────────────────────────
+        flux_body = self._sidebar_card("PHOTON FLUX")
+        self._sidebar_check(flux_body, "Subtract baseline (F0)", self.subtract_baseline_var,
+                             help_text="F (Suite2p or CNMF) is a raw per-ROI pixel SUM "
+                                       "that includes the digitizer's constant black-"
+                                       "level/dark offset -- present even with zero "
+                                       "real photons (visible as the nonzero floor on "
+                                       "the PTC plot's Mean-ADU axis). Left in, that "
+                                       "offset gets miscounted as detected photons and "
+                                       "scales with ROI size, which is the usual cause "
+                                       "of implausibly large flux numbers. When "
+                                       "checked, each cell's own baseline (see "
+                                       "'Baseline pctile' below) is subtracted before "
+                                       "the photon conversion. Doesn't affect the gain "
+                                       "fit itself -- only the flux panel.")
+        self._sidebar_row(flux_body, "Baseline pctile", self.flux_baseline_pct_var, suffix="%",
+                           help_text="Which percentile of each cell's own raw trace "
+                                     "is treated as its baseline (F0) and subtracted "
+                                     "when 'Subtract baseline' is checked. Lower = "
+                                     "closer to the trace's true minimum (more "
+                                     "aggressive); higher = closer to the median. 30 "
+                                     "is a reasonable default for calcium traces that "
+                                     "spend most of their time near baseline.")
+        # Same story as ENF/fit range above: this only affects the flux
+        # panel's conversion of already-cached F_for_flux, not the PTC fit
+        # itself, so Re-fit picks it up instantly too.
 
         # ── Motion correction ────────────────────────────────────────
         mc_body = self._sidebar_card("MOTION CORRECTION")
@@ -3629,7 +3763,18 @@ class KurtosisChecker:
             has_cells = F_for_flux is not None and len(F_for_flux) > 0
             if has_cells:
                 fs = max(0.1, float(self.fs_var.get()))
-                flux = photon_flux_per_cell(F_for_flux, fit["gain_true"], fs)
+                # Inlined rather than calling self._flux_baseline_pct(): a
+                # few tests bind just this method onto a lightweight fake
+                # app object via types.MethodType, which doesn't have
+                # _flux_baseline_pct available as a *callable* attribute
+                # (only whatever was explicitly bound) -- getattr on the
+                # *variable* here degrades gracefully instead.
+                subtract_var = getattr(self, "subtract_baseline_var", None)
+                baseline_pct = (float(self.flux_baseline_pct_var.get())
+                                 if subtract_var is not None and subtract_var.get()
+                                 else None)
+                flux = photon_flux_per_cell(F_for_flux, fit["gain_true"], fs,
+                                             baseline_pct=baseline_pct)
                 med, sem = bootstrap_median_sem(flux)
             else:
                 flux, med, sem = None, np.nan, np.nan
@@ -3658,20 +3803,40 @@ class KurtosisChecker:
             self.root.after(0, lambda: messagebox.showerror("Analysis failed", msg))
             self.root.after(0, lambda: self.status_var.set("Analysis failed — see error dialog"))
 
+    def _flux_baseline_pct(self):
+        """The percentile-baseline to subtract from raw F before the
+        photon-flux conversion, or None if 'Subtract baseline (F0)' is
+        unchecked (keeps raw, un-subtracted F -- see photon_flux_per_cell's
+        docstring for why raw F alone tends to read implausibly high).
+
+        Uses getattr rather than a direct attribute access because several
+        tests build a lightweight fake app (types.SimpleNamespace, not a
+        real KurtosisChecker) and bind just _run_gain_worker/_refit_gain
+        onto it without setting every sidebar var -- falling back to None
+        (the original raw-F behavior) keeps those tests focused on what
+        they're actually exercising instead of forcing every one of them
+        to also stub out this unrelated setting."""
+        var = getattr(self, "subtract_baseline_var", None)
+        if var is not None and var.get():
+            return float(self.flux_baseline_pct_var.get())
+        return None
+
     def _refit_gain(self):
         """Re-run just the cheap part of the analysis -- the linear PTC fit
         and (if there are cell traces) the photon-flux conversion -- using
-        whatever Fit range / ENF / frame rate are currently in the sidebar,
-        against the mean/variance bins + F_for_flux already cached in
-        g_results from the last full Run Analysis.
+        whatever Fit range / ENF / frame rate / baseline settings are
+        currently in the sidebar, against the mean/variance bins +
+        F_for_flux already cached in g_results from the last full Run
+        Analysis.
 
         Deliberately does NOT touch the movie, motion correction, or CNMF --
         those bins are a function of the raw pixel data (spatial bin, edge
         margin, exclude-ROI mask, frame window all bake into them at
         compute_ptc() time), so changing *those* settings still requires a
-        full Run Analysis. Fit range and ENF, by contrast, only affect
-        fit_gain()'s linear regression over bins that already exist -- this
-        is instant and needs no thread."""
+        full Run Analysis. Fit range, ENF, and the baseline-subtraction
+        settings, by contrast, only rework numbers that already exist (the
+        cached bins, and the cached raw F_for_flux respectively) -- this is
+        instant and needs no thread."""
         r = self.g_results
         if r is None:
             self.status_var.set("Nothing to re-fit yet — click Run Analysis first")
@@ -3683,7 +3848,8 @@ class KurtosisChecker:
 
         if r["has_cells"] and r.get("F_for_flux") is not None:
             fs = max(0.1, float(self.fs_var.get()))
-            flux = photon_flux_per_cell(r["F_for_flux"], fit["gain_true"], fs)
+            flux = photon_flux_per_cell(r["F_for_flux"], fit["gain_true"], fs,
+                                         baseline_pct=self._flux_baseline_pct())
             med, sem = bootstrap_median_sem(flux)
             r["flux"], r["flux_med"], r["flux_sem"] = flux, med, sem
 
