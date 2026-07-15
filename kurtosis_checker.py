@@ -47,11 +47,13 @@ Optional (only for the raw-TIFF NormCorre fallback in gain mode): caiman
 # Bump this on every change so a running instance's window title can be checked
 # against what's actually in this file -- handy when the app runs on a machine
 # separate from wherever this source file is being edited.
-APP_VERSION = "2026-07-15.20"
+APP_VERSION = "2026-07-15.22"
 
 import os
 import gc
 import base64
+import csv
+import datetime
 import io
 import webbrowser
 import glob
@@ -1063,6 +1065,105 @@ def photon_flux_per_cell(F, gain_true, fs, baseline_pct=None):
     else:
         photons_per_frame = Fc.mean(axis=1) / gain_true
     return photons_per_frame * fs
+
+
+# Column order for gain_results_summary.csv -- fixed so every appended row
+# (potentially from many separate app sessions, across days/machines) lines
+# up under the same headers, ready to load straight into pandas/Excel/
+# MATLAB and plot one metric against another across conditions.
+GAIN_SUMMARY_FIELDS = [
+    "timestamp", "label", "source", "n_cells", "cnmf_used",
+    "fs_hz", "enf", "fit_lo_pct", "fit_hi_pct", "spatial_bin_px",
+    "edge_margin_px", "gain_true", "slope", "intercept", "r2",
+    "flux_med_photons_per_s", "flux_sem_photons_per_s",
+    "use_baseline_for_flux", "baseline_pctile",
+    "ptc_bins_file", "flux_percell_file",
+]
+
+
+def write_gain_export(g_results, settings, folder, label):
+    """Write one Gain Estimation run's results to `folder`, so results from
+    different conditions/runs can be collected and plotted against each
+    other outside the app. Writes three things:
+
+      1. `gain_results_summary.csv` in `folder` -- one row per export,
+         APPENDED across calls (so exporting several conditions into the
+         same folder builds up a single table: one row per condition,
+         columns for gain, flux, fit quality, and the settings used).
+      2. `{label}_{timestamp}_ptc_bins.csv` -- the PTC's mean/variance
+         bins for this run (mu_bin, var_bin, n_bin, whether each bin was
+         used in the fit), enough to redraw the hockey-stick plot exactly.
+      3. `{label}_{timestamp}_flux_percell.csv` -- one row per cell's
+         photon flux, if this run had a flux panel at all (has_cells).
+
+    `g_results` is the app's own `self.g_results` dict (mu_bin/var_bin/
+    n_bin/fit/flux/... -- see _run_gain_worker). `settings` is a plain
+    dict of the sidebar values that affected this run: fs, enf, fit_lo,
+    fit_hi, spatial_bin, edge_margin, use_baseline, baseline_pctile.
+    `label` is a short user-supplied name for this condition/run (used in
+    both the filenames and the summary row, so the two can be matched
+    back up later).
+
+    Returns (summary_path, bins_path, flux_path_or_None).
+    """
+    r = g_results
+    fit = r.get("fit") or {}
+    safe_label = "".join(c if (c.isalnum() or c in "-_") else "_"
+                          for c in label.strip()) or "condition"
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    stem = f"{safe_label}_{timestamp}"
+
+    mu_bin, var_bin, n_bin = r["mu_bin"], r["var_bin"], r["n_bin"]
+    mask = fit.get("mask")
+    bins_path = os.path.join(folder, f"{stem}_ptc_bins.csv")
+    with open(bins_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["mu_bin", "var_bin", "n_bin", "in_fit"])
+        for i in range(len(mu_bin)):
+            in_fit = bool(mask[i]) if mask is not None else ""
+            w.writerow([mu_bin[i], var_bin[i], n_bin[i], in_fit])
+
+    flux_path = None
+    if r.get("has_cells") and r.get("flux") is not None:
+        flux_path = os.path.join(folder, f"{stem}_flux_percell.csv")
+        with open(flux_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["cell_index", "photon_flux_per_s"])
+            for i, v in enumerate(r["flux"]):
+                w.writerow([i, v])
+
+    row = {
+        "timestamp": timestamp,
+        "label": label.strip(),
+        "source": r.get("movie_source", ""),
+        "n_cells": r.get("n_cells", 0),
+        "cnmf_used": r.get("cnmf_used", False),
+        "fs_hz": settings.get("fs"),
+        "enf": settings.get("enf"),
+        "fit_lo_pct": settings.get("fit_lo"),
+        "fit_hi_pct": settings.get("fit_hi"),
+        "spatial_bin_px": settings.get("spatial_bin"),
+        "edge_margin_px": settings.get("edge_margin"),
+        "gain_true": fit.get("gain_true"),
+        "slope": fit.get("slope"),
+        "intercept": fit.get("intercept"),
+        "r2": fit.get("r2"),
+        "flux_med_photons_per_s": r.get("flux_med"),
+        "flux_sem_photons_per_s": r.get("flux_sem"),
+        "use_baseline_for_flux": settings.get("use_baseline"),
+        "baseline_pctile": settings.get("baseline_pctile"),
+        "ptc_bins_file": os.path.basename(bins_path),
+        "flux_percell_file": os.path.basename(flux_path) if flux_path else "",
+    }
+    summary_path = os.path.join(folder, "gain_results_summary.csv")
+    write_header = not os.path.exists(summary_path)
+    with open(summary_path, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=GAIN_SUMMARY_FIELDS)
+        if write_header:
+            w.writeheader()
+        w.writerow(row)
+
+    return summary_path, bins_path, flux_path
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -7920,6 +8021,17 @@ class KurtosisChecker:
                                        "entirely -- it only ever needs to run once "
                                        "per recording.")
 
+        # ── Export ────────────────────────────────────────────────────
+        export_body = self._sidebar_card("EXPORT")
+        self._lbtn(export_body, "💾  Export Results…", self._export_gain_results,
+                   bg=GREY_BTN, font_size=10, bold=False, side=tk.TOP, padx=0, fill=tk.X)
+        tk.Label(export_body, text="Saves this run's gain/flux numbers to a "
+                 "CSV table that accumulates across runs, so different "
+                 "conditions can be compared and plotted outside the app.\n"
+                 "Needs Run Analysis to have finished at least once.",
+                 bg=CARD_BG, fg=TEXT_DIM, font=("Helvetica", 8),
+                 wraplength=210, justify="left").pack(anchor="w", pady=(6, 0))
+
         # ── Run Analysis (primary action, bottom of the sidebar) ────────
         # Was silently getting clipped off the bottom of the window before
         # the sidebar became scrollable -- there was no way to reach it.
@@ -9145,6 +9257,80 @@ class KurtosisChecker:
             f"Re-fit with ENF={self.enf_var.get():.2f}, fit range "
             f"{self.fit_lo_var.get():.0f}–{self.fit_hi_var.get():.0f}% -- "
             f"gain_true={fit['gain_true']:.2f} ADU/photon")
+
+    def _prompt_text(self, title, prompt, default=""):
+        """Small blocking text-entry dialog -- same Toplevel + wait_window
+        pattern as _pick_variable/_ask_yesno_blocking elsewhere in this
+        file. Returns the entered string, or None if cancelled/closed."""
+        win = tk.Toplevel(self.root)
+        win.title(title); win.configure(bg=BG_DARK); win.grab_set()
+        tk.Label(win, text=prompt, bg=BG_DARK, fg=TEXT_BRIGHT, padx=16,
+                 pady=10, wraplength=280, justify="left").pack()
+        var = tk.StringVar(value=default)
+        entry = tk.Entry(win, textvariable=var, width=30)
+        entry.pack(padx=16, pady=(0, 10))
+        entry.focus_set()
+        entry.select_range(0, tk.END)
+        result = [None]
+        def ok(event=None):
+            result[0] = var.get()
+            win.destroy()
+        def cancel(event=None):
+            result[0] = None
+            win.destroy()
+        entry.bind("<Return>", ok)
+        win.protocol("WM_DELETE_WINDOW", cancel)
+        btn_row = tk.Frame(win, bg=BG_DARK)
+        btn_row.pack(pady=(0, 12))
+        tk.Button(btn_row, text="OK", command=ok, bg=BG_PANEL, fg="white",
+                  relief=tk.FLAT, padx=14, pady=5).pack(side=tk.LEFT, padx=6)
+        tk.Button(btn_row, text="Cancel", command=cancel, bg=BG_PANEL, fg="white",
+                  relief=tk.FLAT, padx=14, pady=5).pack(side=tk.LEFT, padx=6)
+        self.root.wait_window(win)
+        return result[0]
+
+    def _export_gain_results(self):
+        """GUI wrapper around write_gain_export -- gathers a condition
+        label and a destination folder, then hands off to the pure
+        (GUI-free, directly testable) export function. Filip's ask: an
+        option to output results so different conditions/runs can be
+        plotted against each other outside the app."""
+        r = self.g_results
+        if r is None:
+            self.status_var.set("Nothing to export yet — click Run Analysis first")
+            return
+
+        label = self._prompt_text(
+            "Export Results",
+            "Short label for this condition/run (used in filenames and "
+            "the summary row -- e.g. the animal/session/condition name):",
+            default="condition")
+        if label is None:
+            return  # cancelled
+
+        folder = filedialog.askdirectory(title="Select folder to save exported results")
+        if not folder:
+            return
+
+        subtract_var = getattr(self, "subtract_baseline_var", None)
+        baseline_pct_var = getattr(self, "flux_baseline_pct_var", None)
+        settings = dict(
+            fs=self.fs_var.get(), enf=self.enf_var.get(),
+            fit_lo=self.fit_lo_var.get(), fit_hi=self.fit_hi_var.get(),
+            spatial_bin=self.spatial_bin_var.get(), edge_margin=self.margin_var.get(),
+            use_baseline=(subtract_var.get() if subtract_var is not None else ""),
+            baseline_pctile=(baseline_pct_var.get() if baseline_pct_var is not None else ""),
+        )
+        try:
+            summary_path, bins_path, flux_path = write_gain_export(r, settings, folder, label)
+        except OSError as e:
+            messagebox.showerror("Export failed", str(e))
+            return
+
+        extra = f" + {os.path.basename(flux_path)}" if flux_path else ""
+        self.status_var.set(
+            f"Exported '{label}' -> {os.path.basename(summary_path)} "
+            f"(+ {os.path.basename(bins_path)}{extra})")
 
     # ── gain-mode: plotting ──────────────────────────────────────────────
 

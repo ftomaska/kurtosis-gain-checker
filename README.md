@@ -127,6 +127,16 @@ Both Suite2p's `F.npy` and CaImAn CNMF traces are put on a comparable per-cell-t
 
 **Re-fit without a full re-run:** after Run Analysis has completed once, the **↻ Re-fit** button (under Fit range/ENF in the sidebar) redoes just the linear PTC fit — and, if there's a flux panel, rescales it — using the mean/variance bins already computed. It's instant (no thread, no movie re-read) because Fit range, ENF, and the baseline settings only rework numbers that already exist (the cached bins, and the cached raw per-cell F respectively). Frame rate `fs` is also picked up live by Re-fit. Spatial bin, Edge margin, Exclude cell ROIs, and anything CNMF/motion-correction related bake into the bins themselves during the raw-pixel pass, so changing those still needs a full Run Analysis.
 
+## Exporting results for cross-condition comparison
+
+Once Run Analysis has completed, the **💾 Export Results…** button (EXPORT card in the sidebar, just above Run Analysis) writes the current run's numbers to disk so results from different conditions/sessions/animals can be loaded into one table and plotted against each other outside the app. Clicking it asks for a short label for this run (used in filenames and the summary row — e.g. an animal/session/condition name) and a destination folder, then writes:
+
+- **`gain_results_summary.csv`** — one row per export, **appended** across calls, so exporting several conditions into the same folder builds up a single growing table: timestamp, label, source, cell count, `gain_true`/slope/intercept/r², flux median ± SEM, and every sidebar setting that affected the run (fs, ENF, fit range, spatial bin, edge margin, baseline settings). This is the file to load into pandas/Excel/MATLAB for plotting one metric against another across conditions.
+- **`{label}_{timestamp}_ptc_bins.csv`** — that run's PTC mean/variance bins (`mu_bin`, `var_bin`, `n_bin`, and whether each bin was used in the fit), enough to redraw the hockey-stick plot exactly.
+- **`{label}_{timestamp}_flux_percell.csv`** — one row per cell's photon flux, only written if that run had a flux panel at all.
+
+The summary row records each detail file's name, so a given condition's summary row can always be matched back to its own bins/flux files. Exporting doesn't change anything on screen or require a specific settings state — it's a pure read of whatever `g_results` Run Analysis (or a subsequent Re-fit) last produced.
+
 ## PTC method notes (vs. the Lees et al. 2025 reference protocol)
 
 Checked against a MATLAB reference implementation of the Lees et al. 2025 (*Nature Protocols*, Procedure 7 / Box 7-8) method. The core statistics already match exactly: adjacent-frame mean `M = 0.5*(X + X')`, adjacent-frame variance `D = 0.5*(X - X')²` (averaged per-pixel over all frame pairs, so slow structural signal cancels and only shot noise survives), and the `gain_true = slope / ENF²` correction are identical formulas in both.
