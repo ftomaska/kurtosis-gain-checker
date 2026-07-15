@@ -47,7 +47,7 @@ Optional (only for the raw-TIFF NormCorre fallback in gain mode): caiman
 # Bump this on every change so a running instance's window title can be checked
 # against what's actually in this file -- handy when the app runs on a machine
 # separate from wherever this source file is being edited.
-APP_VERSION = "2026-07-15.8"
+APP_VERSION = "2026-07-15.10"
 
 import os
 import gc
@@ -1037,8 +1037,14 @@ _ART_FILES = {
     "neuron_neutral": "neuron_neutral.png",
     "neuron_annoyed": "neuron_annoyed.png",
     "neuron_surprised": "neuron_surprised.png",
+    "neuron_sleepy": "neuron_sleepy.png",
     "chameleon": "chameleon.png",
-    "photon": "photon.png",
+    "photon_red": "photon_red.png",     # chameleon's outbound shot
+    "photon_green": "photon_green.png",  # neuron's return volley -- real
+                                          # green-inked art now (was a
+                                          # programmatic R/G channel swap
+                                          # of the red squiggle before
+                                          # Filip supplied the real thing)
 }
 
 _ART_RAW_CACHE = {}  # name -> PIL.Image (RGBA, loaded once from disk)
@@ -1163,7 +1169,7 @@ CHAM_SNOUT_OFFSET_FRAC = (-0.48, -0.22)  # snout is at the far-left edge, upper 
 
 def draw_neuron(canvas, cx, cy, scale, expr="neutral", distort=0.0, phase=0.0,
                  tag="neuron", outline="#111111"):
-    """Draw Filip's actual neuron sketch (one of 3 expressions) centered at
+    """Draw Filip's actual neuron sketch (one of 4 expressions) centered at
     (cx, cy). `scale` sets the display size (kept as the same "px per local
     60-unit" convention the old vector version used, so callers didn't need
     to change their numbers -- multiplied by a fixed constant to get a
@@ -1171,7 +1177,7 @@ def draw_neuron(canvas, cx, cy, scale, expr="neutral", distort=0.0, phase=0.0,
     motion-correction overlay decays to zero as NormCorre progresses.
     Returns (disp_w, disp_h) for anchor-point math."""
     name = {"neutral": "neuron_neutral", "surprised": "neuron_surprised",
-            "annoyed": "neuron_annoyed"}.get(expr, "neuron_neutral")
+            "annoyed": "neuron_annoyed", "sleepy": "neuron_sleepy"}.get(expr, "neuron_neutral")
     target_h = scale * 4.2
     return _render_art_image(canvas, name, cx, cy, target_h, tag,
                               distort=distort, phase=phase, inverted=True)
@@ -1185,22 +1191,16 @@ def draw_chameleon(canvas, cx, cy, scale, tag="chameleon", outline="#111111"):
 
 
 def _load_photon_variant(tint="red"):
-    """The photon squiggle, black ink lines flipped to white (like the
-    other art assets) and, for the 'green' variant, its red stroke/wash
-    recolored to green by swapping the R and G channels -- a cheap, exact
-    hue swap since the source art is a pure red-on-white sketch (no other
-    color mixed in to distort). Used for the neuron's return volleys, to
-    visually distinguish them from the chameleon's outbound red shots."""
-    cache_key = f"photon_{tint}"
-    if cache_key in _ART_INVERTED_CACHE:
-        return _ART_INVERTED_CACHE[cache_key]
-    im = _load_art_image_inverted("photon")  # black ink -> white, red stroke untouched
-    if tint == "green":
-        arr = np.array(im).copy()
-        arr[..., [0, 1]] = arr[..., [1, 0]]  # swap R/G: red stroke -> green
-        im = Image.fromarray(arr, mode="RGBA")
-    _ART_INVERTED_CACHE[cache_key] = im
-    return im
+    """The photon squiggle art for a given leg of the volley: 'red' is the
+    chameleon's outbound shot, 'green' is the neuron's return shot. Each is
+    real, independently hand-drawn artwork (photon_red.png / photon_green.png)
+    with its own black ink wave, selectively line-inverted like the other
+    assets (black -> white, red/green fill untouched). Previously the green
+    variant was synthesized by swapping the red art's R/G channels; Filip
+    has since supplied a real green-inked squiggle, so that synthesis is
+    no longer needed."""
+    name = "photon_green" if tint == "green" else "photon_red"
+    return _load_art_image_inverted(name)
 
 
 def draw_photon(canvas, cx, cy, length, amplitude, angle_deg, phase, tag="photon",
@@ -1333,7 +1333,7 @@ class PhotonNeuronBar(tk.Canvas):
                     # chameleon's photon just landed -- neuron reacts, and
                     # only fires one back every 2nd hit it takes
                     self._hits += 1
-                    self._expr = random.choice(["surprised", "annoyed"])
+                    self._expr = random.choice(["surprised", "annoyed", "sleepy"])
                     self._expr_until = t + 0.5
                     if self._hits % 2 == 0:
                         self._flight_dir = "back"
