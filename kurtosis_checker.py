@@ -626,7 +626,8 @@ def load_tiffs_direct(paths, max_frames, frame_start=None):
 
 def load_registered_movie(plane_dir, ops, max_frames, pw_rigid, progress_cb=None,
                            ask_raw_dir=None, save_mc=False,
-                           on_normcorre_start=None, on_normcorre_done=None, frame_start=None):
+                           on_normcorre_start=None, on_normcorre_done=None, frame_start=None,
+                           scratch_dir=None):
     """Try reg_tif -> raw tiff + NormCorre, in order.
 
     Suite2p's own data.bin is intentionally never used here — it's a
@@ -645,6 +646,8 @@ def load_registered_movie(plane_dir, ops, max_frames, pw_rigid, progress_cb=None
     frame_start (optional): explicit starting frame index for the analysis
     window, from the user's "Start frame" setting; None (default) keeps
     the original auto-centered window.
+    scratch_dir (optional): passed straight through to run_normcorre (via
+    _normcorre_then_maybe_save) -- see its docstring.
     """
     mov = load_reg_tif(plane_dir, max_frames, frame_start=frame_start)
     if mov is not None:
@@ -666,19 +669,20 @@ def load_registered_movie(plane_dir, ops, max_frames, pw_rigid, progress_cb=None
     arr, note_suffix = _normcorre_then_maybe_save(
         tiff_paths, max_frames, pw_rigid, save_mc, plane_dir, progress_cb=progress_cb,
         on_normcorre_start=on_normcorre_start, on_normcorre_done=on_normcorre_done,
-        frame_start=frame_start)
+        frame_start=frame_start, scratch_dir=scratch_dir)
     return RegisteredMovie(arr, "normcorre",
                             f"{len(tiff_paths)} raw TIFF(s), {arr.shape[0]} frames after "
                             f"motion correction{note_suffix}")
 
 
 def load_registered_movie_manual(raw_tiffs, max_frames, pw_rigid, skip_mc, save_mc, progress_cb=None,
-                                  on_normcorre_start=None, on_normcorre_done=None, frame_start=None):
+                                  on_normcorre_start=None, on_normcorre_done=None, frame_start=None,
+                                  scratch_dir=None):
     """Manual-TIFF-mode equivalent of load_registered_movie (no Suite2p ops.npy
     available). Checks for a reg_tif/ folder next to the source TIFFs first —
     including one saved by an earlier run of this same tool — before running
     NormCorre. frame_start (optional): explicit starting frame index; None
-    means auto-centered (default)."""
+    means auto-centered (default). scratch_dir (optional): see run_normcorre."""
     source_dir = os.path.dirname(raw_tiffs[0])
     mov = load_reg_tif(source_dir, max_frames, frame_start=frame_start)
     if mov is not None:
@@ -690,7 +694,7 @@ def load_registered_movie_manual(raw_tiffs, max_frames, pw_rigid, skip_mc, save_
     arr, note_suffix = _normcorre_then_maybe_save(
         raw_tiffs, max_frames, pw_rigid, save_mc, source_dir, progress_cb=progress_cb,
         on_normcorre_start=on_normcorre_start, on_normcorre_done=on_normcorre_done,
-        frame_start=frame_start)
+        frame_start=frame_start, scratch_dir=scratch_dir)
     return RegisteredMovie(arr, "normcorre",
                             f"{len(raw_tiffs)} raw TIFF(s), {arr.shape[0]} frames after "
                             f"motion correction{note_suffix}")
@@ -5316,8 +5320,17 @@ class PhotonNeuronBar(tk.Canvas):
         dur = 0.55
 
         # -- launch shot A: the first outbound photon of a new volley --
+        # `_out_landed is None` guards against the window that now exists
+        # between "both outbound shots landed" and "the return shot
+        # actually fires" (the neuron holds its hit pose for a beat
+        # first -- see the combined revert+return block below): during
+        # that hold, flight_frac/flight2_frac/return_pending all look
+        # exactly like full idle, but _out_landed is still 2, not None.
+        # Without this check a new volley could spuriously launch on top
+        # of a volley that's still mid-hold, orphaning the pending return.
         if (self._flight_frac is None and self._flight2_frac is None
-                and not self._return_pending and t >= self._next_launch):
+                and not self._return_pending and self._out_landed is None
+                and t >= self._next_launch):
             self._flight_frac = 0.0
             self._flight_t0 = t
             self._flight_dir = "out"
@@ -6445,6 +6458,9 @@ class KurtosisChecker:
         self.pw_rigid_var = tk.BooleanVar(value=False)
         self.skip_mc_var = tk.BooleanVar(value=False)
         self.save_mc_var = tk.BooleanVar(value=True)
+        # Blank = CaImAn's own default scratch location; see
+        # run_normcorre's docstring and _scratch_dir_or_none.
+        self.scratch_dir_var = tk.StringVar(value="")
 
         # ── Load ──────────────────────────────────────────────────────
         load_body = self._sidebar_card("LOAD")
@@ -6600,6 +6616,37 @@ class KurtosisChecker:
                                        "entirely -- it only ever needs to run once "
                                        "per recording.")
 
+        scratch_row = tk.Frame(mc_body, bg=CARD_BG)
+        scratch_row.pack(fill=tk.X, pady=(6, 2), anchor="w")
+        tk.Label(scratch_row, text="Scratch folder", bg=CARD_BG, fg=TEXT_MAIN,
+                 font=(FONT_FAMILY, 10)).pack(side=tk.LEFT)
+        self._help_icon(scratch_row,
+                         "Where CaImAn writes its temporary motion-correction "
+                         "memmap files -- these can be as large as (or larger "
+                         "than) the raw movie itself. Left blank, CaImAn uses "
+                         "its own default location (usually ~/caiman_data/"
+                         "temp), which is exactly what runs out of room and "
+                         "produces \"OSError: No space left on device\" "
+                         "during NormCorre. Point this at a folder on a drive "
+                         "with plenty of free space instead -- it's created "
+                         "automatically if it doesn't exist yet.")
+        # Plain text= updates (not textvariable=) so a blank scratch_dir_var
+        # can show an explicit "(default location)" placeholder instead of
+        # an empty-looking label.
+        self._scratch_dir_label = tk.Label(
+            mc_body, text="(default location)", bg=CARD_BG, fg=TEXT_DIM,
+            font=(FONT_FAMILY, 8), wraplength=210, justify="left", anchor="w")
+        self.scratch_dir_var.trace_add(
+            "write", lambda *a: self._scratch_dir_label.config(
+                text=self.scratch_dir_var.get() or "(default location)"))
+        self._scratch_dir_label.pack(fill=tk.X, anchor="w", pady=(0, 4))
+        scratch_btns = tk.Frame(mc_body, bg=CARD_BG)
+        scratch_btns.pack(fill=tk.X, pady=(0, 2))
+        self._lbtn(scratch_btns, "📁 Choose…", self._choose_scratch_dir,
+                   bg=GREY_BTN, font_size=9, bold=False, side=tk.LEFT, padx=(0, 4))
+        self._lbtn(scratch_btns, "Reset", self._clear_scratch_dir,
+                   bg=GREY_BTN, font_size=9, bold=False, side=tk.LEFT, padx=0)
+
         # ── Export ────────────────────────────────────────────────────
         export_body = self._sidebar_card("EXPORT")
         self._lbtn(export_body, "💾  Export Results…", self._export_gain_results,
@@ -6619,6 +6666,18 @@ class KurtosisChecker:
         self._lbtn(run_frame, "▶  Run Analysis", self.run_gain_analysis,
                    bg=GREY_BTN_ACTIVE, fg=GREY_BTN_TEXT_ACTIVE, font_size=12,
                    side=tk.TOP, padx=0, fill=tk.X)
+
+    def _choose_scratch_dir(self):
+        """MOTION CORRECTION card's "Scratch folder" -- lets NormCorre's
+        memmap scratch files go to a different drive than CaImAn's own
+        default, to fix "No space left on device" errors during
+        NormCorre. See run_normcorre's docstring for the mechanism."""
+        d = filedialog.askdirectory(title="Select a scratch/temp folder for NormCorre")
+        if d:
+            self.scratch_dir_var.set(d)
+
+    def _clear_scratch_dir(self):
+        self.scratch_dir_var.set("")
 
     def _build_neuropil_sidebar(self):
         """Third tab: sweeps the neuropil-subtraction coefficient alpha in
@@ -7827,6 +7886,13 @@ class KurtosisChecker:
             return None
         return v if v >= 0 else None
 
+    def _scratch_dir_or_none(self):
+        """Blank scratch_dir_var -> None (CaImAn's own default location),
+        otherwise the chosen folder -- see run_normcorre's docstring for
+        what this actually controls."""
+        raw = self.scratch_dir_var.get().strip()
+        return raw or None
+
     def _run_gain_worker(self):
         try:
             max_frames = max(50, int(self.max_frames_var.get()))
@@ -7856,7 +7922,7 @@ class KurtosisChecker:
                     save_mc=save_mc,
                     on_normcorre_start=self._motion_overlay_start,
                     on_normcorre_done=self._motion_overlay_stop,
-                    frame_start=frame_start)
+                    frame_start=frame_start, scratch_dir=self._scratch_dir_or_none())
             else:
                 movie = load_registered_movie_manual(
                     self.g_raw_tiffs, max_frames, pw_rigid,
@@ -7864,7 +7930,7 @@ class KurtosisChecker:
                     progress_cb=self._gain_progress,
                     on_normcorre_start=self._motion_overlay_start,
                     on_normcorre_done=self._motion_overlay_stop,
-                    frame_start=frame_start)
+                    frame_start=frame_start, scratch_dir=self._scratch_dir_or_none())
 
             self._gain_progress(f"Computing PTC from {movie.source} ({movie.shape[0]} frames)...")
 
