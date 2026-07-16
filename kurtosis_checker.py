@@ -2,7 +2,7 @@
 """
 Kurtosis / Gain Estimation Checker
 ===================================
-Two modes, toggled from the top bar:
+Three modes, toggled from the top bar:
 
   Kurtosis  — three-panel layout (unchanged from the original tool):
               Left   — traces sorted by kurtosis (max 400), best at top
@@ -36,6 +36,24 @@ Two modes, toggled from the top bar:
               first, and PTC computation streams frame-pairs in chunks so
               peak memory stays bounded regardless of movie length.
 
+  Neuropil Sweep — Suite2p only (F.npy/Fneu.npy/stat.npy/iscell.npy; no
+              registered movie ever loaded). Sweeps the neuropil-
+              subtraction coefficient alpha in Fcorr = rawF - alpha*Fneu
+              across a configurable range (default 0-2), and at each
+              alpha computes the mean +/- SEM of the off-diagonal
+              pairwise Pearson correlation between cells (iscell==1
+              only). Cell pairs whose ROI masks come within an "exclusion"
+              distance of each other (default 4px, measured as the
+              nearest-pixel edge-to-edge gap between stat.npy masks, not
+              centroid distance) are dropped from every alpha's average,
+              since closely adjacent/overlapping ROIs can share optical
+              bleed-through independent of alpha. An optional "Filter by
+              kurtosis" checkbox restricts the sweep to cells with Pearson
+              kurtosis (same convention as the Kurtosis tab) above a
+              threshold (default 5), to focus on clearly active cells.
+              See neuropil_alpha_sweep/build_exclusion_mask/
+              roi_pair_min_distance for the implementation.
+
 Fall.mat: reads F, Fneu, ops.fs automatically (kurtosis mode).
 
 Dependencies: numpy, scipy, matplotlib, pillow, tifffile
@@ -47,7 +65,7 @@ Optional (only for the raw-TIFF NormCorre fallback in gain mode): caiman
 # Bump this on every change so a running instance's window title can be checked
 # against what's actually in this file -- handy when the app runs on a machine
 # separate from wherever this source file is being edited.
-APP_VERSION = "2026-07-15.27"
+APP_VERSION = "2026-07-16.1"
 
 import os
 import gc
@@ -76,6 +94,7 @@ from matplotlib.gridspec import GridSpec
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from scipy import stats
 from scipy.ndimage import uniform_filter1d, binary_dilation
+from scipy.spatial import cKDTree
 import scipy.io
 
 # ── fonts ─────────────────────────────────────────────────────────────────────
@@ -409,8 +428,22 @@ class _ProgressLogHandler(logging.Handler):
             self.progress_cb(f"NormCorre: {msg}")
 
 
-def run_normcorre(tiff_paths, pw_rigid, progress_cb=None):
-    """Priority 3 (last resort): motion-correct raw TIFFs with CaImAn's NoRMCorre."""
+def run_normcorre(tiff_paths, pw_rigid, progress_cb=None, scratch_dir=None):
+    """Priority 3 (last resort): motion-correct raw TIFFs with CaImAn's NoRMCorre.
+
+    scratch_dir (optional): if given, CaImAn's intermediate per-file
+    registered memmaps AND the final joined memmap are written there
+    instead of CaImAn's own default location. Wired via the CAIMAN_TEMP
+    environment variable -- caiman.paths.get_tempdir() reads it live on
+    every call (see caiman/paths.py), so setting it right before calling
+    into CaImAn works without touching CaImAn's internals directly. If
+    unset, CaImAn defaults to ~/caiman_data/temp (or wherever CAIMAN_TEMP
+    already points outside this app), and "OSError: [Errno 28] No space
+    left on device" during NormCorre almost always means that drive is
+    full -- this setting is the fix, confirmed against CaImAn's own
+    source and multiple upstream bug reports of the same error. The
+    previous CAIMAN_TEMP value (if any) is restored afterward either way,
+    so this never leaks into anything else running in this process."""
     try:
         import caiman as cm
         from caiman.motion_correction import MotionCorrect
@@ -439,35 +472,49 @@ def run_normcorre(tiff_paths, pw_rigid, progress_cb=None):
         caiman_logger.addHandler(log_handler)
         caiman_logger.setLevel(logging.INFO)
 
-    try:
-        mc = MotionCorrect(
-            tiff_paths, dview=None,
-            max_shifts=(6, 6), niter_rig=1,
-            strides=(48, 48), overlaps=(24, 24),
-            max_deviation_rigid=3, shifts_opencv=True,
-            nonneg_movie=True, border_nan="copy",
-            pw_rigid=pw_rigid,
-        )
-        mc.motion_correct(save_movie=True)
-    finally:
-        if log_handler is not None:
-            caiman_logger.removeHandler(log_handler)
-            caiman_logger.setLevel(prev_level)
+    prev_caiman_temp = os.environ.get("CAIMAN_TEMP")
+    if scratch_dir:
+        os.makedirs(scratch_dir, exist_ok=True)
+        os.environ["CAIMAN_TEMP"] = scratch_dir
+        if progress_cb:
+            progress_cb(f"NormCorre scratch files -> {scratch_dir}")
 
-    # mc.fname_tot_rig / mc.fname_tot_els point at CaImAn's per-tiff-file
-    # mmaps from the motion-correction step, not a single joined array --
-    # loading those directly with cm.load() is what produces CaImAn's
-    # "The file is in F order, it should be in C order (see save_memmap
-    # function)" error. The fix is the same explicit re-join CaImAn's own
-    # demo pipelines use: cm.save_memmap(..., order='C') merges them into
-    # one guaranteed C-order file before loading.
-    fname_mc = mc.fname_tot_els if pw_rigid else mc.fname_tot_rig
-    if progress_cb:
-        progress_cb("NormCorre: joining motion-corrected chunks into one file...")
-    fname_joined = cm.save_memmap(fname_mc, base_name="memmap_gain_", order="C")
-    m = cm.load(fname_joined)
-    arr = np.asarray(m).astype(np.float32)
-    return arr
+    try:
+        try:
+            mc = MotionCorrect(
+                tiff_paths, dview=None,
+                max_shifts=(6, 6), niter_rig=1,
+                strides=(48, 48), overlaps=(24, 24),
+                max_deviation_rigid=3, shifts_opencv=True,
+                nonneg_movie=True, border_nan="copy",
+                pw_rigid=pw_rigid,
+            )
+            mc.motion_correct(save_movie=True)
+        finally:
+            if log_handler is not None:
+                caiman_logger.removeHandler(log_handler)
+                caiman_logger.setLevel(prev_level)
+
+        # mc.fname_tot_rig / mc.fname_tot_els point at CaImAn's per-tiff-file
+        # mmaps from the motion-correction step, not a single joined array --
+        # loading those directly with cm.load() is what produces CaImAn's
+        # "The file is in F order, it should be in C order (see save_memmap
+        # function)" error. The fix is the same explicit re-join CaImAn's own
+        # demo pipelines use: cm.save_memmap(..., order='C') merges them into
+        # one guaranteed C-order file before loading.
+        fname_mc = mc.fname_tot_els if pw_rigid else mc.fname_tot_rig
+        if progress_cb:
+            progress_cb("NormCorre: joining motion-corrected chunks into one file...")
+        fname_joined = cm.save_memmap(fname_mc, base_name="memmap_gain_", order="C")
+        m = cm.load(fname_joined)
+        arr = np.asarray(m).astype(np.float32)
+        return arr
+    finally:
+        if scratch_dir:
+            if prev_caiman_temp is None:
+                os.environ.pop("CAIMAN_TEMP", None)
+            else:
+                os.environ["CAIMAN_TEMP"] = prev_caiman_temp
 
 
 def save_reg_tif_chunks(arr, reg_dir, chunk_size=500, progress_cb=None):
@@ -490,7 +537,8 @@ def save_reg_tif_chunks(arr, reg_dir, chunk_size=500, progress_cb=None):
 
 
 def _normcorre_then_maybe_save(tiff_paths, max_frames, pw_rigid, save_mc, save_dir, progress_cb=None,
-                                on_normcorre_start=None, on_normcorre_done=None, frame_start=None):
+                                on_normcorre_start=None, on_normcorre_done=None, frame_start=None,
+                                scratch_dir=None):
     """Run NormCorre, optionally save the full result as reg_tif chunks
     (saved BEFORE the max_frames window is applied, so the complete
     registered movie is preserved for next time even if this run only
@@ -503,11 +551,13 @@ def _normcorre_then_maybe_save(tiff_paths, max_frames, pw_rigid, save_mc, save_d
     the overlay never gets stuck open.
 
     frame_start (optional): explicit starting frame index for the trim
-    step, from the user's "Start frame" setting; None means auto-centered."""
+    step, from the user's "Start frame" setting; None means auto-centered.
+    scratch_dir (optional): passed straight through to run_normcorre --
+    see its docstring."""
     if on_normcorre_start:
         on_normcorre_start()
     try:
-        arr = run_normcorre(tiff_paths, pw_rigid, progress_cb=progress_cb)
+        arr = run_normcorre(tiff_paths, pw_rigid, progress_cb=progress_cb, scratch_dir=scratch_dir)
         note_suffix = ""
         if save_mc:
             try:
@@ -5346,11 +5396,21 @@ class PhotonNeuronBar(tk.Canvas):
             else:
                 self._flight2_frac = frac2
 
-        # -- once both outbound shots have landed, the neuron fires its one
-        #    return shot back (reusing flight A's slot) --
-        if (self._out_landed is not None and self._out_landed >= 2
+        # -- once both outbound shots have landed AND the smashed-pose
+        #    hold has run its course, the neuron fires its one return shot
+        #    back (reusing flight A's slot), timed to leave as it's
+        #    visibly reverting out of the 'hit' stance into a random idle
+        #    pose -- rather than the instant it gets hit, while still
+        #    mid-flinch, which is what this did before. Checking against
+        #    NEURON_SMASHED_EXPR specifically (not "not neutral") means
+        #    this whole block only fires once per hit: after it picks a
+        #    random idle pose, _expr no longer equals NEURON_SMASHED_EXPR,
+        #    so it won't re-trigger on every subsequent tick.
+        if (self._expr == NEURON_SMASHED_EXPR and t >= self._expr_until
+                and self._out_landed is not None and self._out_landed >= 2
                 and self._flight_frac is None and self._flight2_frac is None
                 and not self._return_pending):
+            self._expr = random.choice(NEURON_IDLE_REACTION_EXPRS)
             self._return_pending = True
             self._flight_dir = "back"
             self._flight_frac = 0.0
@@ -5358,15 +5418,6 @@ class PhotonNeuronBar(tk.Canvas):
             # the hand stays hidden through the whole return flight -- it
             # only pops in once the photon actually reaches the midpoint
             # (see the "advance shot A" landing branch above)
-
-        # Once the smashed-pose hold expires, regress to a random *other*
-        # pose rather than snapping back to the plain neutral face --
-        # checking against NEURON_SMASHED_EXPR specifically (not "not
-        # neutral") means this only fires once per hit: after it picks a
-        # random idle pose, _expr no longer equals NEURON_SMASHED_EXPR, so
-        # it won't get re-randomized again on every subsequent tick.
-        if self._expr == NEURON_SMASHED_EXPR and t >= self._expr_until:
-            self._expr = random.choice(NEURON_IDLE_REACTION_EXPRS)
         try:
             self._render(t)
         except Exception:
@@ -5769,6 +5820,160 @@ class CNMFMaskViewer:
 
 
 # ═════════════════════════════════════════════════════════════════════════
+# Neuropil sweep (mode 3, Suite2p only) -- sweeps alpha in
+# Fcorr = rawF - alpha*Fneu and plots the mean pairwise cell-cell
+# correlation (off-diagonal, excluding closely-adjacent ROI pairs) at
+# each alpha. The idea: two cells with no genuine shared activity should
+# have ~zero correlation once neuropil contamination is properly removed;
+# systematically positive correlation across many pairs at a given alpha
+# suggests under-subtraction (shared neuropil signal still bleeding into
+# both traces), while systematically negative correlation suggests
+# over-subtraction. See _render_neuropil_results for how the sweep curve
+# is plotted.
+# ═════════════════════════════════════════════════════════════════════════
+
+def roi_pair_min_distance(ypix1, xpix1, ypix2, xpix2):
+    """Exact nearest-pixel (edge-to-edge) distance between two Suite2p ROI
+    masks, given as parallel pixel-coordinate arrays (stat.npy's own
+    'ypix'/'xpix' per ROI). Builds a KD-tree over the larger point set and
+    queries the smaller one against it, so this stays cheap even for
+    sizeable ROIs."""
+    pts1 = np.column_stack([ypix1, xpix1]).astype(float)
+    pts2 = np.column_stack([ypix2, xpix2]).astype(float)
+    if len(pts1) > len(pts2):
+        pts1, pts2 = pts2, pts1
+    tree = cKDTree(pts2)
+    d, _ = tree.query(pts1, k=1)
+    return float(np.min(d))
+
+
+def build_exclusion_mask(stat, exclude_px):
+    """Boolean (n, n) matrix: True where a pair of ROIs' nearest pixels
+    are within `exclude_px` of each other, meaning that pair should be
+    dropped from the pairwise-correlation pool the neuropil sweep
+    averages over -- closely adjacent or overlapping ROIs can share
+    optical bleed-through independent of the neuropil coefficient being
+    tested, which would bias the sweep at every alpha the same way.
+
+    `stat` is a sequence of Suite2p stat.npy-style dicts (only 'ypix'/
+    'xpix' are used), already filtered/ordered to match the F/Fneu rows
+    the caller is using.
+
+    A cheap centroid + equivalent-radius prefilter skips the expensive
+    exact nearest-pixel check for pairs that are obviously far apart: if
+    the distance between two ROIs' centroids already exceeds the sum of
+    their equivalent radii (sqrt(npix/pi), i.e. the radius of a circle
+    with the same pixel count) plus exclude_px, no pixel pair between
+    them could possibly be within exclude_px, so the exact O(npix_i *
+    npix_j) check is skipped entirely for that pair. This keeps the
+    function tractable for typical Suite2p cell counts (100s-1000s)."""
+    n = len(stat)
+    centroids = np.zeros((n, 2))
+    radii = np.zeros(n)
+    pix = []
+    for i, s in enumerate(stat):
+        yp = np.asarray(s["ypix"], dtype=float)
+        xp = np.asarray(s["xpix"], dtype=float)
+        centroids[i] = [yp.mean(), xp.mean()]
+        radii[i] = math.sqrt(max(1, len(yp)) / math.pi)
+        pix.append((yp, xp))
+
+    excl = np.zeros((n, n), dtype=bool)
+    diff = centroids[:, None, :] - centroids[None, :, :]
+    cdist = np.sqrt((diff ** 2).sum(axis=2))
+    radius_sum = radii[:, None] + radii[None, :]
+    candidate = np.triu(cdist <= (radius_sum + exclude_px), k=1)
+
+    for i, j in zip(*np.where(candidate)):
+        yp1, xp1 = pix[i]
+        yp2, xp2 = pix[j]
+        if roi_pair_min_distance(yp1, xp1, yp2, xp2) <= exclude_px:
+            excl[i, j] = True
+            excl[j, i] = True
+    return excl
+
+
+def neuropil_alpha_sweep(F, Fneu, stat, alphas, exclude_px,
+                          kurtosis_thresh=None, progress_cb=None):
+    """Core computation for the Neuropil Sweep tab.
+
+    For each alpha in `alphas`, computes Fcorr = F - alpha*Fneu, then the
+    mean +/- SEM of the off-diagonal pairwise Pearson correlation between
+    cells, excluding pairs whose ROIs are within exclude_px of each other
+    (see build_exclusion_mask) -- that exclusion set is computed once, up
+    front, since it doesn't depend on alpha.
+
+    F, Fneu: (n_cells, T) arrays, already restricted to iscell==1.
+    stat: sequence of per-cell Suite2p stat.npy dicts, same filtering and
+          row order as F/Fneu -- only 'ypix'/'xpix' are used.
+    kurtosis_thresh: if given, cells are further restricted up front to
+        Pearson kurtosis(F, fisher=False) > kurtosis_thresh (computed on
+        the raw, un-subtracted F -- same convention as the Kurtosis tab's
+        own metric) before anything else runs.
+
+    Returns a dict: alphas, mean_corr, sem_corr (all length len(alphas)),
+    n_cells and n_pairs actually used (constant across alpha, since the
+    exclusion mask and any kurtosis filtering don't depend on alpha).
+    """
+    F = np.asarray(F, dtype=float)
+    Fneu = np.asarray(Fneu, dtype=float)
+    stat = list(stat)
+
+    if kurtosis_thresh is not None:
+        kurt = stats.kurtosis(F, axis=1, fisher=False)
+        keep = kurt > kurtosis_thresh
+        F = F[keep]
+        Fneu = Fneu[keep]
+        stat = [s for s, k in zip(stat, keep) if k]
+
+    n_cells = F.shape[0]
+    if n_cells < 2:
+        raise RuntimeError(
+            f"Only {n_cells} cell(s) left after filtering -- need at "
+            "least 2 to compute pairwise correlations. Lower the "
+            "kurtosis threshold, or check the loaded data.")
+
+    if progress_cb:
+        progress_cb(f"Computing ROI exclusion mask ({n_cells} cells, "
+                     f"{exclude_px:.0f}px)...")
+    excl = build_exclusion_mask(stat, exclude_px)
+    iu = np.triu_indices(n_cells, k=1)
+    pair_keep = ~excl[iu]
+    n_pairs = int(pair_keep.sum())
+    if n_pairs == 0:
+        raise RuntimeError(
+            "Every cell pair was excluded by the exclusion distance -- "
+            "try a smaller exclusion radius.")
+
+    alphas = np.asarray(alphas, dtype=float)
+    means = np.full(len(alphas), np.nan)
+    sems = np.full(len(alphas), np.nan)
+    for ai, alpha in enumerate(alphas):
+        if progress_cb and (ai % 5 == 0 or ai == len(alphas) - 1):
+            progress_cb(f"Sweeping alpha: {ai + 1}/{len(alphas)} "
+                        f"(alpha={alpha:.2f})...")
+        Fcorr = F - alpha * Fneu
+        with np.errstate(invalid="ignore"):
+            R = np.corrcoef(Fcorr)
+        vals = R[iu][pair_keep]
+        vals = vals[np.isfinite(vals)]
+        if len(vals) == 0:
+            continue
+        means[ai] = float(np.mean(vals))
+        sems[ai] = float(np.std(vals, ddof=1) / math.sqrt(len(vals))) if len(vals) > 1 else 0.0
+
+    return {
+        "alphas": alphas,
+        "mean_corr": means,
+        "sem_corr": sems,
+        "n_cells": n_cells,
+        "n_pairs": n_pairs,
+        "exclude_px": float(exclude_px),
+        "kurtosis_thresh": kurtosis_thresh,
+    }
+
+
+# ═════════════════════════════════════════════════════════════════════════
 # Main app
 # ═════════════════════════════════════════════════════════════════════════
 
@@ -5808,7 +6013,15 @@ class KurtosisChecker:
         # big centered popup shown only while NormCorre is genuinely running
         self._motion_overlay = None
 
-        self.tab_var = tk.StringVar(value="kurtosis")  # "kurtosis" | "gain"
+        # neuropil-sweep-mode state (mode 3 -- Suite2p only, no registered
+        # movie ever needed: F.npy/Fneu.npy/stat.npy/iscell.npy are enough)
+        self.np_plane_dir = None
+        self.np_F    = None
+        self.np_Fneu = None
+        self.np_stat = None
+        self.np_results = None
+
+        self.tab_var = tk.StringVar(value="kurtosis")  # "kurtosis" | "gain" | "neuropil"
 
         self._build_controls()
         self._build_canvas()
@@ -5984,7 +6197,9 @@ class KurtosisChecker:
                                         bg=GREY_BTN_ACTIVE, fg=GREY_BTN_TEXT_ACTIVE,
                                         font_size=11, padx=(0, 2))
         self._tab_gain_btn = _lbtn(center, "Gain Estimation", lambda: self._switch_tab("gain"),
-                                    bg=GREY_BTN, font_size=11, padx=(2, 0))
+                                    bg=GREY_BTN, font_size=11, padx=(2, 2))
+        self._tab_neuropil_btn = _lbtn(center, "Neuropil Sweep", lambda: self._switch_tab("neuropil"),
+                                        bg=GREY_BTN, font_size=11, padx=(2, 0))
 
         self._action_btn = _lbtn(right, "▶  Plot", self._on_action_click,
                                   bg=GREY_BTN_ACTIVE, fg=GREY_BTN_TEXT_ACTIVE,
@@ -6078,7 +6293,7 @@ class KurtosisChecker:
 
     CARD_RADIUS = 18  # corner radius for the rounded sidebar cards, in px
 
-    def _sidebar_card(self, title=None):
+    def _sidebar_card(self, title=None, parent=None):
         """A rounded-corner, padded group -- the "areas" the settings/
         buttons are grouped into, echoing the boxed-panel look Filip
         pointed to (rounded per his "smoother angles" follow-up). Plain
@@ -6086,8 +6301,15 @@ class KurtosisChecker:
         a rounded-rectangle drawn on a backing Canvas, with the actual
         content (title + returned body frame) embedded on top via
         create_window; the canvas auto-resizes to fit the content and
-        redraws the rounded rect to match on every size change."""
-        canvas = tk.Canvas(self._gain_sidebar_inner, bg=BG_MID, highlightthickness=0, bd=0)
+        redraws the rounded rect to match on every size change.
+
+        `parent` defaults to the Gain-tab sidebar's inner scroll frame
+        (the original, only caller for a long time); pass the Neuropil
+        Sweep sidebar's inner frame explicitly to build cards there
+        instead."""
+        if parent is None:
+            parent = self._gain_sidebar_inner
+        canvas = tk.Canvas(parent, bg=BG_MID, highlightthickness=0, bd=0)
         canvas.pack(fill=tk.X, padx=12, pady=(0, 10))
 
         content = tk.Frame(canvas, bg=CARD_BG)
@@ -6116,61 +6338,54 @@ class KurtosisChecker:
         body.pack(fill=tk.X, padx=10, pady=(2, 10))
         return body
 
-    def _make_tooltip(self, widgets, text):
-        """Attach a shared hover tooltip to one or more widgets -- a small
-        floating borderless window with `text`, appearing just below the
-        first widget on <Enter> (of ANY of them) and disappearing once the
-        pointer has left ALL of them. Bound to every widget in a
-        parameter row (label, entry, suffix, "?" glyph) rather than just
-        the tiny "?" icon, per Filip's "only show descriptions when
-        someone hovers over the parameter" -- a bare Enter/Leave on the
-        row's own Frame doesn't fire reliably once child widgets cover its
-        whole area, so each child gets its own binding into this shared
-        state instead."""
-        if not isinstance(widgets, (list, tuple)):
-            widgets = [widgets]
-        state = {"win": None, "hover_count": 0}
-        anchor = widgets[0]
+    def _make_tooltip(self, icon, text):
+        """Attach a click-to-toggle info popup to a single "?" icon -- a
+        small floating borderless window with `text`, shown just below
+        the icon on click and dismissed by clicking the icon (or the
+        popup itself) again. Previously this opened on hover over an
+        entire parameter row (label/entry/suffix/icon all wired in),
+        which Filip found intrusive ("the information brackets are a bit
+        intrusive... only appear after the ? is clicked on") -- now it's
+        click-only and scoped to just the icon, so typing in a nearby
+        entry or reading a label never triggers it."""
+        state = {"win": None}
 
-        def _show(event=None):
-            state["hover_count"] += 1
+        def _close():
             if state["win"] is not None:
+                state["win"].destroy()
+                state["win"] = None
+
+        def _toggle(event=None):
+            if state["win"] is not None:
+                _close()
                 return
-            win = tk.Toplevel(anchor)
+            win = tk.Toplevel(icon)
             win.wm_overrideredirect(True)
             try:
                 win.wm_attributes("-topmost", True)
             except Exception:
                 pass
-            x = anchor.winfo_rootx() - 6
-            y = anchor.winfo_rooty() + anchor.winfo_height() + 4
+            x = icon.winfo_rootx() - 6
+            y = icon.winfo_rooty() + icon.winfo_height() + 4
             win.wm_geometry(f"+{x}+{y}")
-            tk.Label(win, text=text, bg="#1c1c1c", fg=TEXT_BRIGHT,
-                     font=(FONT_FAMILY, 9), justify="left", wraplength=260,
-                     padx=8, pady=6, bd=1, relief=tk.SOLID).pack()
+            lbl = tk.Label(win, text=text, bg="#1c1c1c", fg=TEXT_BRIGHT,
+                            font=(FONT_FAMILY, 9), justify="left", wraplength=260,
+                            padx=8, pady=6, bd=1, relief=tk.SOLID, cursor="hand2")
+            lbl.pack()
+            lbl.bind("<Button-1>", lambda e: _close())
             state["win"] = win
 
-        def _hide(event=None):
-            state["hover_count"] = max(0, state["hover_count"] - 1)
-            if state["hover_count"] == 0 and state["win"] is not None:
-                state["win"].destroy()
-                state["win"] = None
-
-        for w in widgets:
-            w.bind("<Enter>", _show)
-            w.bind("<Leave>", _hide)
+        icon.bind("<Button-1>", _toggle)
         return state
 
     def _help_icon(self, parent, help_text=None):
-        """A small "?" glyph -- purely a visual cue now (shrunk down per
-        Filip's "make the ? icons smaller" feedback); the actual hover
-        trigger is the whole parameter row, wired up by the caller via
-        _make_tooltip(list_of_row_widgets, ...) rather than this icon
-        alone, so `help_text` here is optional/for simple standalone
-        call sites only."""
+        """A small "?" glyph -- click it to toggle a floating info popup
+        open/closed (see _make_tooltip). Previously the whole parameter
+        row opened this on hover; per Filip's "only appear after the ? is
+        clicked on" it's now click-only and scoped to just this icon."""
         icon = tk.Label(parent, text="?", bg=CARD_BG, fg=TEXT_DIM,
                          font=(FONT_FAMILY, 6, "bold"), width=1,
-                         relief=tk.RIDGE, bd=1, cursor="question_arrow")
+                         relief=tk.RIDGE, bd=1, cursor="hand2")
         icon.pack(side=tk.LEFT, padx=(3, 0))
         if help_text:
             self._make_tooltip(icon, help_text)
@@ -6182,20 +6397,14 @@ class KurtosisChecker:
         lbl = tk.Label(row, text=label_text, bg=CARD_BG, fg=TEXT_MAIN,
                         font=(FONT_FAMILY, 10))
         lbl.pack(side=tk.LEFT)
-        hover_widgets = [row, lbl]
         if help_text:
-            hover_widgets.append(self._help_icon(row))
+            self._help_icon(row, help_text)
         if suffix:
             suf = tk.Label(row, text=suffix, bg=CARD_BG, fg=TEXT_DIM,
                             font=(FONT_FAMILY, 9))
             suf.pack(side=tk.RIGHT)
-            hover_widgets.append(suf)
         entry_canvas, entry = _rounded_entry(row, var, width=width, justify="right")
         entry_canvas.pack(side=tk.RIGHT, padx=(0, 6))
-        hover_widgets.append(entry_canvas)
-        hover_widgets.append(entry)
-        if help_text:
-            self._make_tooltip(hover_widgets, help_text)
         return row
 
     def _sidebar_check(self, parent, text, var, help_text=None):
@@ -6206,10 +6415,8 @@ class KurtosisChecker:
                        activeforeground=TEXT_BRIGHT, font=(FONT_FAMILY, 10),
                        anchor="w", justify="left", wraplength=190)
         chk.pack(side=tk.LEFT, fill=tk.X)
-        hover_widgets = [row, chk]
         if help_text:
-            hover_widgets.append(self._help_icon(row))
-            self._make_tooltip(hover_widgets, help_text)
+            self._help_icon(row, help_text)
 
     def _build_gain_sidebar(self):
         # Tk variables the old row-based _build_settings_gain used to create
@@ -6272,7 +6479,7 @@ class KurtosisChecker:
         fitrange_lbl = tk.Label(fitrange_row, text="Fit range (% of mean)", bg=CARD_BG,
                                  fg=TEXT_MAIN, font=(FONT_FAMILY, 10))
         fitrange_lbl.pack(side=tk.LEFT)
-        fitrange_icon = self._help_icon(fitrange_row)
+        self._help_icon(fitrange_row, fitrange_help)
         fitrange_entries = tk.Frame(fit_body, bg=CARD_BG)
         fitrange_entries.pack(fill=tk.X, pady=(0, 2))
         fitrange_lo_canvas, fitrange_lo = _rounded_entry(fitrange_entries, self.fit_lo_var,
@@ -6283,9 +6490,6 @@ class KurtosisChecker:
         fitrange_hi_canvas, fitrange_hi = _rounded_entry(fitrange_entries, self.fit_hi_var,
                                                            width=5, justify="center")
         fitrange_hi_canvas.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(3, 0))
-        self._make_tooltip([fitrange_row, fitrange_lbl, fitrange_icon, fitrange_entries,
-                             fitrange_lo_canvas, fitrange_lo, fitrange_dash,
-                             fitrange_hi_canvas, fitrange_hi], fitrange_help)
         self._sidebar_row(fit_body, "Spatial bin", self.spatial_bin_var, suffix="px",
                            help_text="Superpixel binning applied before the PTC fit "
                                      "(pixels are summed, not averaged, so the "
@@ -6416,6 +6620,95 @@ class KurtosisChecker:
                    bg=GREY_BTN_ACTIVE, fg=GREY_BTN_TEXT_ACTIVE, font_size=12,
                    side=tk.TOP, padx=0, fill=tk.X)
 
+    def _build_neuropil_sidebar(self):
+        """Third tab: sweeps the neuropil-subtraction coefficient alpha in
+        Fcorr = rawF - alpha*Fneu and plots the mean pairwise cell-cell
+        correlation at each alpha (see neuropil_alpha_sweep). Suite2p
+        only -- there's no registered-movie fallback here since F.npy/
+        Fneu.npy/stat.npy/iscell.npy are all this needs."""
+        ip = self._neuropil_sidebar_inner
+
+        self.np_alpha_lo_var = tk.DoubleVar(value=0.0)
+        self.np_alpha_hi_var = tk.DoubleVar(value=2.0)
+        self.np_alpha_step_var = tk.DoubleVar(value=0.05)
+        # 4px: closely-adjacent/overlapping ROIs can share optical
+        # bleed-through independent of alpha, which would bias the sweep
+        # at every alpha the same way -- see build_exclusion_mask.
+        self.np_exclude_px_var = tk.IntVar(value=4)
+        self.np_kurt_filter_var = tk.BooleanVar(value=False)
+        self.np_kurt_thresh_var = tk.DoubleVar(value=5.0)
+
+        # ── Load ──────────────────────────────────────────────────────
+        load_body = self._sidebar_card("LOAD", parent=ip)
+        self._lbtn(load_body, "📁  Suite2p Folder", self._load_neuropil_folder,
+                   side=tk.TOP, padx=0, fill=tk.X)
+        tk.Label(load_body, text="Suite2p only — needs F.npy, Fneu.npy, "
+                 "stat.npy, and iscell.npy in the same folder.",
+                 bg=CARD_BG, fg=TEXT_DIM, font=(FONT_FAMILY, 8),
+                 wraplength=210, justify="left").pack(anchor="w", pady=(6, 0))
+
+        # ── Alpha sweep ──────────────────────────────────────────────
+        sweep_body = self._sidebar_card("ALPHA SWEEP", parent=ip)
+        alpha_help = ("Sweeps the neuropil-subtraction coefficient alpha "
+                      "in Fcorr = rawF - alpha*Fneu across this range, in "
+                      "steps of 'Step' below, and plots the mean pairwise "
+                      "cell-cell correlation at each alpha.")
+        alpha_row = tk.Frame(sweep_body, bg=CARD_BG)
+        alpha_row.pack(fill=tk.X, pady=2)
+        alpha_lbl = tk.Label(alpha_row, text="Alpha range", bg=CARD_BG,
+                              fg=TEXT_MAIN, font=(FONT_FAMILY, 10))
+        alpha_lbl.pack(side=tk.LEFT)
+        self._help_icon(alpha_row, alpha_help)
+        alpha_entries = tk.Frame(sweep_body, bg=CARD_BG)
+        alpha_entries.pack(fill=tk.X, pady=(0, 2))
+        alpha_lo_canvas, alpha_lo = _rounded_entry(alpha_entries, self.np_alpha_lo_var,
+                                                     width=5, justify="center")
+        alpha_lo_canvas.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 3))
+        tk.Label(alpha_entries, text="–", bg=CARD_BG, fg=TEXT_DIM).pack(side=tk.LEFT)
+        alpha_hi_canvas, alpha_hi = _rounded_entry(alpha_entries, self.np_alpha_hi_var,
+                                                     width=5, justify="center")
+        alpha_hi_canvas.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(3, 0))
+        self._sidebar_row(sweep_body, "Step", self.np_alpha_step_var,
+                           help_text="Alpha increment for the sweep -- "
+                                     "smaller = finer resolution, slower "
+                                     "to compute (one full pairwise-"
+                                     "correlation matrix per step).")
+        self._sidebar_row(sweep_body, "Exclusion", self.np_exclude_px_var, suffix="px",
+                           help_text="Cell pairs whose ROI masks come "
+                                     "within this many pixels of each "
+                                     "other (nearest-pixel, edge-to-edge, "
+                                     "from Suite2p's own stat.npy masks) "
+                                     "are dropped from the pairwise-"
+                                     "correlation average. Closely "
+                                     "adjacent/overlapping ROIs can share "
+                                     "optical bleed-through independent "
+                                     "of alpha, which would bias the "
+                                     "sweep the same way at every step.")
+
+        # ── Cell filter ──────────────────────────────────────────────
+        filt_body = self._sidebar_card("CELL FILTER", parent=ip)
+        self._sidebar_check(filt_body, "Filter by kurtosis", self.np_kurt_filter_var,
+                             help_text="Restrict the sweep to cells with "
+                                       "Pearson kurtosis (fisher=False, "
+                                       "normal≈3) above the threshold "
+                                       "below, computed on the raw trace "
+                                       "-- same convention as the "
+                                       "Kurtosis tab. Keeps the sweep "
+                                       "focused on clearly active/spiky "
+                                       "cells rather than flat or noise-"
+                                       "dominated ROIs.")
+        self._sidebar_row(filt_body, "Kurtosis >", self.np_kurt_thresh_var,
+                           help_text="Threshold applied only when "
+                                     "'Filter by kurtosis' above is "
+                                     "checked.")
+
+        # ── Run Analysis (primary action, bottom of the sidebar) ────────
+        run_frame = tk.Frame(ip, bg=BG_MID)
+        run_frame.pack(fill=tk.X, padx=12, pady=(4, 14))
+        self._lbtn(run_frame, "▶  Run Analysis", self.run_neuropil_analysis,
+                   bg=GREY_BTN_ACTIVE, fg=GREY_BTN_TEXT_ACTIVE, font_size=12,
+                   side=tk.TOP, padx=0, fill=tk.X)
+
     def _toggle_settings(self):
         """Kurtosis-tab only now -- the Gain tab's settings are always
         visible in the left sidebar, no toggle needed there."""
@@ -6437,27 +6730,40 @@ class KurtosisChecker:
             return
         self.tab_var.set(new_tab)
 
+        self._tab_kurtosis_btn.config(
+            bg=GREY_BTN_ACTIVE if new_tab == "kurtosis" else GREY_BTN,
+            fg=GREY_BTN_TEXT_ACTIVE if new_tab == "kurtosis" else TEXT_BRIGHT)
+        self._tab_gain_btn.config(
+            bg=GREY_BTN_ACTIVE if new_tab == "gain" else GREY_BTN,
+            fg=GREY_BTN_TEXT_ACTIVE if new_tab == "gain" else TEXT_BRIGHT)
+        self._tab_neuropil_btn.config(
+            bg=GREY_BTN_ACTIVE if new_tab == "neuropil" else GREY_BTN,
+            fg=GREY_BTN_TEXT_ACTIVE if new_tab == "neuropil" else TEXT_BRIGHT)
+
         if new_tab == "kurtosis":
-            self._tab_kurtosis_btn.config(bg=GREY_BTN_ACTIVE, fg=GREY_BTN_TEXT_ACTIVE)
-            self._tab_gain_btn.config(bg=GREY_BTN, fg=TEXT_BRIGHT)
             self._action_btn.config(text="▶  Plot")
             self._action_btn.pack(side=tk.RIGHT, padx=10, pady=5)
             self._sort_frame.pack(side=tk.LEFT, padx=(16, 0))
             self._load_data_btn.pack(side=tk.LEFT, padx=(4, 6), pady=5)
             self._settings_btn.pack(side=tk.LEFT, padx=6, pady=5)
             self._gain_sidebar.pack_forget()
+            self._neuropil_sidebar.pack_forget()
         else:
-            self._tab_kurtosis_btn.config(bg=GREY_BTN, fg=TEXT_BRIGHT)
-            self._tab_gain_btn.config(bg=GREY_BTN_ACTIVE, fg=GREY_BTN_TEXT_ACTIVE)
             self._sort_frame.pack_forget()
-            # Gain tab has no top-bar Load/Settings/Plot -- all of that
-            # lives in the always-visible sidebar now.
+            # Gain / Neuropil Sweep tabs have no top-bar Load/Settings/
+            # Plot -- all of that lives in each tab's own always-visible
+            # sidebar instead.
             self._action_btn.pack_forget()
             self._load_data_btn.pack_forget()
             self._settings_btn.pack_forget()
             if self._settings_open:
                 self._toggle_settings()  # close the kurtosis panel if it was open
-            self._gain_sidebar.pack(side=tk.LEFT, fill=tk.Y, before=self._main_area)
+            if new_tab == "gain":
+                self._neuropil_sidebar.pack_forget()
+                self._gain_sidebar.pack(side=tk.LEFT, fill=tk.Y, before=self._main_area)
+            else:  # "neuropil"
+                self._gain_sidebar.pack_forget()
+                self._neuropil_sidebar.pack(side=tk.LEFT, fill=tk.Y, before=self._main_area)
 
         if new_tab == "kurtosis":
             if self.F is not None:
@@ -6466,7 +6772,7 @@ class KurtosisChecker:
                 self._draw_splash()
             self.status_var.set(
                 self.status_var.get() if self.F is not None else "No data loaded — Kurtosis mode")
-        else:
+        elif new_tab == "gain":
             if self.g_results is not None:
                 self._render_gain_results()
             else:
@@ -6474,6 +6780,13 @@ class KurtosisChecker:
             if self.g_plane_dir is None and not self.g_raw_tiffs and self.g_mat_movie is None:
                 self.status_var.set("No data loaded — Gain Estimation mode "
                                      "(registered movie is only loaded when you click Run Analysis)")
+        else:  # "neuropil"
+            if self.np_results is not None:
+                self._render_neuropil_results()
+            else:
+                self._draw_neuropil_splash()
+            if self.np_plane_dir is None:
+                self.status_var.set("No data loaded — Neuropil Sweep mode (Suite2p only)")
 
     def _load_dispatch(self):
         if self.tab_var.get() == "kurtosis":
@@ -6597,64 +6910,18 @@ class KurtosisChecker:
         self._content_row = tk.Frame(self.root, bg=BG_DARK)
         self._content_row.pack(fill=tk.BOTH, expand=True)
 
-        # The sidebar's card stack (LOAD / FIT PARAMETERS / FRAME WINDOW /
-        # CNMF / PHOTON FLUX / MOTION CORRECTION / Run Analysis) is taller
-        # than the window at the default 990px height, which silently
-        # clipped "Run Analysis" off the bottom with no way to reach it --
-        # so the sidebar is a scrollable Canvas+Frame rather than a plain
-        # Frame. self._gain_sidebar is still the thing _switch_tab packs/
-        # unpacks; card-building (_sidebar_card) targets the inner
-        # self._gain_sidebar_inner frame that actually scrolls.
-        self._gain_sidebar = tk.Frame(self._content_row, bg=BG_MID, width=260)
-        self._gain_sidebar.pack_propagate(False)
-        # not packed here -- _switch_tab packs/unpacks it depending on tab
-
-        sidebar_canvas = tk.Canvas(self._gain_sidebar, bg=BG_MID, highlightthickness=0, bd=0)
-        # Black scrollbar (not the platform-default grey/silver one), to
-        # match the sidebar's own greyscale palette. troughcolor blends
-        # with the sidebar background; bg/activebackground are the
-        # draggable thumb itself.
-        sidebar_scrollbar = tk.Scrollbar(
-            self._gain_sidebar, orient="vertical", command=sidebar_canvas.yview,
-            bg="black", activebackground="black", troughcolor=BG_MID,
-            highlightthickness=0, bd=0, elementborderwidth=0)
-        sidebar_canvas.configure(yscrollcommand=sidebar_scrollbar.set)
-        sidebar_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        sidebar_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        self._gain_sidebar_inner = tk.Frame(sidebar_canvas, bg=BG_MID)
-        inner_win = sidebar_canvas.create_window((0, 0), window=self._gain_sidebar_inner, anchor="nw")
-
-        def _on_inner_configure(event=None):
-            sidebar_canvas.configure(scrollregion=sidebar_canvas.bbox("all"))
-        self._gain_sidebar_inner.bind("<Configure>", _on_inner_configure)
-
-        def _on_canvas_configure(event):
-            sidebar_canvas.itemconfig(inner_win, width=event.width)
-        sidebar_canvas.bind("<Configure>", _on_canvas_configure)
-
-        # Mouse-wheel scroll, only while the pointer is actually over the
-        # sidebar (bound/unbound on Enter/Leave) so it doesn't hijack
-        # scrolling anywhere else in the app. Covers Windows/macOS
-        # (<MouseWheel>, event.delta) and Linux (<Button-4>/<Button-5>).
-        def _on_mousewheel(event):
-            if getattr(event, "num", None) == 5 or getattr(event, "delta", 0) < 0:
-                sidebar_canvas.yview_scroll(1, "units")
-            elif getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0:
-                sidebar_canvas.yview_scroll(-1, "units")
-
-        def _bind_wheel(event=None):
-            sidebar_canvas.bind_all("<MouseWheel>", _on_mousewheel)
-            sidebar_canvas.bind_all("<Button-4>", _on_mousewheel)
-            sidebar_canvas.bind_all("<Button-5>", _on_mousewheel)
-
-        def _unbind_wheel(event=None):
-            sidebar_canvas.unbind_all("<MouseWheel>")
-            sidebar_canvas.unbind_all("<Button-4>")
-            sidebar_canvas.unbind_all("<Button-5>")
-
-        sidebar_canvas.bind("<Enter>", _bind_wheel)
-        sidebar_canvas.bind("<Leave>", _unbind_wheel)
+        # Each tab's sidebar card stack can be taller than the window at
+        # the default 990px height, which silently clipped "Run Analysis"
+        # off the bottom with no way to reach it -- so every sidebar is a
+        # scrollable Canvas+Frame rather than a plain Frame (factored into
+        # _build_scrollable_sidebar so the Gain and Neuropil Sweep tabs
+        # share the exact same scroll/mousewheel/black-scrollbar behavior
+        # instead of two hand-copied versions). The returned outer frame
+        # is still what _switch_tab packs/unpacks; card-building
+        # (_sidebar_card) targets the returned inner frame that actually
+        # scrolls.
+        self._gain_sidebar, self._gain_sidebar_inner = self._build_scrollable_sidebar()
+        self._neuropil_sidebar, self._neuropil_sidebar_inner = self._build_scrollable_sidebar()
 
         self._main_area = tk.Frame(self._content_row, bg=BG_DARK)
         self._main_area.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -6666,11 +6933,74 @@ class KurtosisChecker:
 
         # Busy animation lives in the same main output area, swapped in for
         # the canvas by _progress_start/_progress_stop while an analysis is
-        # running -- not packed until then.
+        # running -- not packed until then. Shared by the Gain and
+        # Neuropil Sweep tabs alike (both are "click Run Analysis, wait,
+        # see a plot" workflows).
         self.gain_progress_bar = PhotonNeuronBar(self._main_area)
 
         self._build_gain_sidebar()
+        self._build_neuropil_sidebar()
         self._draw_splash()
+
+    def _build_scrollable_sidebar(self, width=260):
+        """Build one left sidebar: a non-propagating outer Frame (what
+        _switch_tab packs/unpacks) wrapping a Canvas+Scrollbar whose inner
+        Frame is where a tab's _sidebar_card content actually goes.
+        Returns (outer, inner). Factored out of what was originally a
+        Gain-tab-only block so the Neuropil Sweep sidebar gets the same
+        scrolling/mousewheel/black-scrollbar behavior for free."""
+        outer = tk.Frame(self._content_row, bg=BG_MID, width=width)
+        outer.pack_propagate(False)
+        # not packed here -- _switch_tab packs/unpacks it depending on tab
+
+        canvas = tk.Canvas(outer, bg=BG_MID, highlightthickness=0, bd=0)
+        # Black scrollbar (not the platform-default grey/silver one), to
+        # match the sidebar's own greyscale palette. troughcolor blends
+        # with the sidebar background; bg/activebackground are the
+        # draggable thumb itself.
+        scrollbar = tk.Scrollbar(
+            outer, orient="vertical", command=canvas.yview,
+            bg="black", activebackground="black", troughcolor=BG_MID,
+            highlightthickness=0, bd=0, elementborderwidth=0)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        inner = tk.Frame(canvas, bg=BG_MID)
+        inner_win = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _on_inner_configure(event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        inner.bind("<Configure>", _on_inner_configure)
+
+        def _on_canvas_configure(event):
+            canvas.itemconfig(inner_win, width=event.width)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        # Mouse-wheel scroll, only while the pointer is actually over this
+        # sidebar (bound/unbound on Enter/Leave) so it doesn't hijack
+        # scrolling anywhere else in the app. Covers Windows/macOS
+        # (<MouseWheel>, event.delta) and Linux (<Button-4>/<Button-5>).
+        def _on_mousewheel(event):
+            if getattr(event, "num", None) == 5 or getattr(event, "delta", 0) < 0:
+                canvas.yview_scroll(1, "units")
+            elif getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0:
+                canvas.yview_scroll(-1, "units")
+
+        def _bind_wheel(event=None):
+            canvas.bind_all("<MouseWheel>", _on_mousewheel)
+            canvas.bind_all("<Button-4>", _on_mousewheel)
+            canvas.bind_all("<Button-5>", _on_mousewheel)
+
+        def _unbind_wheel(event=None):
+            canvas.unbind_all("<MouseWheel>")
+            canvas.unbind_all("<Button-4>")
+            canvas.unbind_all("<Button-5>")
+
+        canvas.bind("<Enter>", _bind_wheel)
+        canvas.bind("<Leave>", _unbind_wheel)
+
+        return outer, inner
 
     def _draw_splash(self):
         """Draw the K-trace logo as matplotlib lines — no image, no hard edges."""
@@ -7202,6 +7532,59 @@ class KurtosisChecker:
         self.status_var.set(f"Loaded: {plane_dir}  ·  {n_cells} cells  ·  "
                               f"fs={self.fs_var.get()} Hz  ·  {src_hint}  ·  click Run Analysis")
         self._draw_gain_splash()
+
+    def _load_neuropil_folder(self):
+        """Neuropil Sweep tab's loader -- Suite2p only, no registered-
+        movie fallback (unlike the Gain tab). Needs F.npy, Fneu.npy,
+        stat.npy (for the ROI exclusion distance), and iscell.npy."""
+        folder = filedialog.askdirectory(title="Select Suite2p output folder")
+        if not folder:
+            return
+        plane_dir = find_suite2p_plane(folder)
+        if plane_dir is None:
+            messagebox.showerror(
+                "Not found",
+                "No Suite2p plane folder found (needs F.npy, Fneu.npy, "
+                "stat.npy, and iscell.npy) -- Neuropil Sweep only works "
+                "with Suite2p output, unlike the other two tabs.")
+            return
+        try:
+            F = np.load(os.path.join(plane_dir, "F.npy")).astype(float)
+            fneu_p = os.path.join(plane_dir, "Fneu.npy")
+            if not os.path.exists(fneu_p):
+                messagebox.showerror("Not found", "Fneu.npy not found -- "
+                                      "needed for the neuropil sweep.")
+                return
+            Fneu = np.load(fneu_p).astype(float)
+            stat_p = os.path.join(plane_dir, "stat.npy")
+            if not os.path.exists(stat_p):
+                messagebox.showerror("Not found", "stat.npy not found -- "
+                                      "needed for the ROI exclusion "
+                                      "distance.")
+                return
+            stat = np.load(stat_p, allow_pickle=True)
+            iscell_p = os.path.join(plane_dir, "iscell.npy")
+            if os.path.exists(iscell_p):
+                iscell = np.load(iscell_p)
+                mask = iscell[:, 0].astype(bool)
+                F = F[mask]
+                Fneu = Fneu[mask]
+                stat = stat[mask]
+            else:
+                messagebox.showwarning(
+                    "No iscell.npy",
+                    "iscell.npy not found -- using all ROIs, not just "
+                    "user-curated cells.")
+        except Exception as e:
+            messagebox.showerror("Error", str(e)); return
+
+        self.np_plane_dir = plane_dir
+        self.np_F, self.np_Fneu, self.np_stat = F, Fneu, list(stat)
+        self.np_results = None
+        n_cells, n_frames = F.shape
+        self.status_var.set(f"Loaded: {plane_dir}  ·  {n_cells} cells × "
+                             f"{n_frames} frames  ·  click Run Analysis")
+        self._draw_neuropil_splash()
 
     def _load_gain_manual_tiff(self, folder):
         """No Suite2p ops.npy found — offer to run the PTC gain estimate directly
@@ -7805,6 +8188,113 @@ class KurtosisChecker:
             self.status_var.set(
                 f"Done  ·  source={r['movie_source']}  ({r['movie_note']})  ·  "
                 f"gain_true={gain_true:.2f} ADU/ph  ·  no F.npy — flux not computed")
+
+    # ── neuropil-sweep mode: running + rendering ────────────────────────
+
+    def run_neuropil_analysis(self):
+        if self.np_F is None:
+            messagebox.showwarning("No data", "Load a Suite2p folder first.")
+            return
+        lo = float(self.np_alpha_lo_var.get())
+        hi = float(self.np_alpha_hi_var.get())
+        step = float(self.np_alpha_step_var.get())
+        if step <= 0 or hi <= lo:
+            messagebox.showerror("Invalid range",
+                "Alpha range needs a high end greater than the low end, "
+                "and a positive step.")
+            return
+
+        self.status_var.set("Running neuropil sweep...")
+        self._progress_start()
+        self.root.update_idletasks()
+        t = threading.Thread(target=self._run_neuropil_worker, daemon=True)
+        t.start()
+
+    def _run_neuropil_worker(self):
+        try:
+            lo = float(self.np_alpha_lo_var.get())
+            hi = float(self.np_alpha_hi_var.get())
+            step = float(self.np_alpha_step_var.get())
+            n_steps = int(round((hi - lo) / step)) + 1
+            alphas = lo + np.arange(n_steps) * step
+            alphas = alphas[alphas <= hi + 1e-9]
+            exclude_px = float(self.np_exclude_px_var.get())
+            kurt_thresh = (float(self.np_kurt_thresh_var.get())
+                           if self.np_kurt_filter_var.get() else None)
+
+            result = neuropil_alpha_sweep(
+                self.np_F, self.np_Fneu, self.np_stat, alphas, exclude_px,
+                kurtosis_thresh=kurt_thresh, progress_cb=self._gain_progress)
+            result["plane_dir"] = self.np_plane_dir
+            self.np_results = result
+            self.root.after(0, self._render_neuropil_results)
+        except Exception as e:
+            traceback.print_exc()
+            msg = str(e)
+            self.root.after(0, lambda: messagebox.showerror("Neuropil sweep failed", msg))
+            self.root.after(0, lambda: self.status_var.set("Neuropil sweep failed"))
+        finally:
+            self._progress_stop()
+
+    def _render_neuropil_results(self):
+        r = self.np_results
+
+        self.fig.clear()
+        ax = self.fig.add_axes([0.10, 0.12, 0.85, 0.78])
+        ax.set_facecolor(BG_DARK)
+        for s in ax.spines.values(): s.set_color("#555")
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.tick_params(colors=TEXT_MAIN, labelsize=8)
+
+        alphas = r["alphas"]
+        mean_c = r["mean_corr"]
+        sem_c = r["sem_corr"]
+        finite = np.isfinite(mean_c)
+        ax.fill_between(alphas, mean_c - sem_c, mean_c + sem_c,
+                         color=C_INCL, alpha=0.25, zorder=1)
+        ax.plot(alphas, mean_c, color=C_INCL, lw=2, zorder=2, marker="o", ms=3)
+        ax.axhline(0, color="#555", lw=1, ls=":", zorder=0)
+
+        if finite.any():
+            best_i = np.nanargmin(np.abs(mean_c))
+            ax.axvline(alphas[best_i], color=C_FLOOR, lw=1.2, ls="--", alpha=0.8, zorder=1)
+            ax.text(0.98, 0.95,
+                    f"alpha ≈ {alphas[best_i]:.2f}\n(closest to zero mean corr.)",
+                    transform=ax.transAxes, ha="right", va="top",
+                    color=TEXT_BRIGHT, fontsize=8,
+                    bbox=dict(facecolor=BG_MID, edgecolor="#555", boxstyle="round,pad=0.4"))
+
+        ax.set_xlabel("alpha   (Fcorr = rawF − alpha·Fneu)", color=TEXT_DIM, fontsize=9)
+        ax.set_ylabel("Mean pairwise correlation\n(off-diagonal, ± SEM)", color=TEXT_DIM, fontsize=9)
+        filt_note = (f"kurtosis > {r['kurtosis_thresh']:.1f}"
+                     if r.get("kurtosis_thresh") is not None else "no kurtosis filter")
+        ax.set_title(f"Neuropil sweep  ·  {r['n_cells']} cells, {r['n_pairs']} pairs  ·  "
+                     f"exclusion={r['exclude_px']:.0f}px  ·  {filt_note}",
+                     color=TEXT_BRIGHT, fontsize=10, pad=8)
+
+        self.canvas.draw()
+
+        alpha_span = f"{alphas[0]:.2f}–{alphas[-1]:.2f}" if len(alphas) else "n/a"
+        self.status_var.set(
+            f"Done  ·  {r['n_cells']} cells  ·  {r['n_pairs']} pairs  ·  "
+            f"alpha {alpha_span}  ·  {r.get('plane_dir', '')}")
+
+    def _draw_neuropil_splash(self):
+        """Neuropil-sweep-tab splash, shown before any sweep has run yet."""
+        self.fig.clear()
+        ax = self.fig.add_axes([0.05, 0.05, 0.9, 0.9])
+        ax.set_facecolor(BG_DARK)
+        for s in ax.spines.values():
+            s.set_visible(False)
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.text(0.5, 0.55, "chasing the flat line",
+                 color="white", fontsize=15, fontweight="bold",
+                 fontfamily="sans-serif", ha="center", va="center",
+                 transform=ax.transAxes)
+        ax.text(0.5, 0.15, "Load a Suite2p folder, then click Run Analysis",
+                 color=TEXT_DIM, fontsize=11, ha="center", transform=ax.transAxes)
+        self.canvas.draw_idle()
 
 
 # ── entry ─────────────────────────────────────────────────────────────────────
