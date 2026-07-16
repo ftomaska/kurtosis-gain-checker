@@ -47,7 +47,7 @@ Optional (only for the raw-TIFF NormCorre fallback in gain mode): caiman
 # Bump this on every change so a running instance's window title can be checked
 # against what's actually in this file -- handy when the app runs on a machine
 # separate from wherever this source file is being edited.
-APP_VERSION = "2026-07-15.26"
+APP_VERSION = "2026-07-15.27"
 
 import os
 import gc
@@ -129,8 +129,11 @@ GREY_BTN_HOVER  = "#3a3a3a"
 GREY_BTN_ACTIVE = "#e8e8e8"   # primary/selected action -- light fill, dark text
 GREY_BTN_TEXT_ACTIVE = "#111111"
 GREY_BORDER     = "#333333"
-CARD_BG         = "#161616"   # grouped-settings card background (vs BG_MID chrome)
-CARD_BORDER     = "#2a2a2a"
+CARD_BG         = "#232323"   # grouped-settings card background (vs BG_MID chrome) --
+                               # was #161616, barely distinguishable from BG_MID
+                               # (#1a1a1a) and made the rounded-corner cards
+                               # effectively invisible; lightened for real contrast
+CARD_BORDER     = "#3d3d3d"   # was #2a2a2a, same low-contrast problem
 
 SLAB_LAB_URL = "https://slslab.org"
 
@@ -4991,6 +4994,165 @@ def _rounded_rect_points(x1, y1, x2, y2, radius):
     ]
 
 
+def _lighten_hex(hex_color, amt):
+    """Blend a "#rrggbb" color toward white by `amt` (0-1) -- used for the
+    hover state of rounded buttons, a flat color-shift instead of the old
+    relief=RAISED/SUNKEN 3D bevel (which doesn't read right on a rounded
+    shape)."""
+    hex_color = hex_color.lstrip("#")
+    r, g, b = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
+    r = min(255, int(r + (255 - r) * amt))
+    g = min(255, int(g + (255 - g) * amt))
+    b = min(255, int(b + (255 - b) * amt))
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+BTN_RADIUS = 10     # corner radius for pill-shaped buttons, in px
+ENTRY_RADIUS = 8    # corner radius for pill-shaped entry fields, in px
+
+
+def _rounded_entry(parent, textvariable, width=7, justify="right", font_size=10):
+    """A rounded-pill entry field -- a small Canvas draws the rounded-rect
+    background (BG_PANEL, matching the old square entry's own fill), with
+    a borderless tk.Entry (same bg, so its own square corners blend
+    invisibly into the canvas fill beneath/around it) inset within it via
+    create_window. Redraws on <Configure> of either the entry itself
+    (natural-width case, most sidebar rows) or the canvas itself (the
+    fill=X/expand=True case, e.g. the fit-range lo/hi pair sharing a row).
+    Returns (canvas, entry) -- pack/grid the canvas; bind tooltips, focus,
+    etc. to `entry` exactly as with a plain tk.Entry."""
+    parent_bg = parent["bg"]
+    canvas = tk.Canvas(parent, bg=parent_bg, highlightthickness=0, bd=0)
+    entry = tk.Entry(canvas, textvariable=textvariable, width=width,
+                      bg=BG_PANEL, fg="white", insertbackground="white",
+                      relief=tk.FLAT, font=(FONT_FAMILY, font_size),
+                      justify=justify, bd=0, highlightthickness=0)
+    win_id = canvas.create_window(0, 0, window=entry, anchor="nw")
+    state = {"bg_item": None}
+
+    def _redraw(event=None):
+        req_w = entry.winfo_reqwidth()
+        req_h = entry.winfo_reqheight()
+        w, h = req_w + 14, req_h + 8
+        cw = canvas.winfo_width()
+        if cw > 1:
+            w = max(w, cw)
+        canvas.config(height=h)
+        if cw <= 1:
+            canvas.config(width=w)
+        canvas.coords(win_id, max((w - req_w) // 2, 6), (h - req_h) // 2)
+        pts = _rounded_rect_points(1, 1, w - 1, h - 1, ENTRY_RADIUS)
+        if state["bg_item"] is None:
+            state["bg_item"] = canvas.create_polygon(pts, smooth=True, fill=BG_PANEL, outline="")
+            canvas.tag_lower(state["bg_item"])
+        else:
+            canvas.coords(state["bg_item"], *pts)
+
+    entry.bind("<Configure>", _redraw)
+    canvas.bind("<Configure>", _redraw)
+    canvas.after_idle(_redraw)
+    return canvas, entry
+
+
+def _rounded_button(parent, text, command, bg=None, fg="white", font_size=10,
+                     bold=False, side=tk.LEFT, padx=6, pady=5, fill=None):
+    """Rounded-pill button -- shared by the top-bar/sidebar `_lbtn` helper
+    (KurtosisChecker._build_controls) and standalone Toplevel dialogs
+    (OK/Cancel/Continue/Close), so every clickable button in the app gets
+    the same treatment instead of just the ones inside the main window.
+
+    A small Canvas draws the rounded-rect background (redrawn on every
+    <Configure> to match its content/parent size, same recipe as
+    _sidebar_card / _rounded_entry), with a borderless Label holding the
+    text embedded on top via create_window. Hover gives a flat
+    color-shift instead of a 3D relief bevel, which doesn't read right on
+    a rounded shape.
+
+    Returns the outer Frame, with .config()/.configure() overridden so
+    `btn.config(bg=..., fg=..., text=...)` keeps working exactly like it
+    did against the old plain widgets (e.g. the active-tab toggle)."""
+    if bg is None:
+        bg = GREY_BTN
+    weight = "bold" if bold else "normal"
+    parent_bg = parent["bg"]
+    outer = tk.Frame(parent, bg=parent_bg)
+    if fill:
+        outer.pack(side=side, padx=padx, pady=pady, fill=fill)
+    else:
+        outer.pack(side=side, padx=padx, pady=pady)
+
+    canvas = tk.Canvas(outer, bg=parent_bg, highlightthickness=0, bd=0, cursor="hand2")
+    canvas.pack(fill=tk.BOTH if fill else None, expand=bool(fill))
+
+    label = tk.Label(canvas, text=text, bg=bg, fg=fg,
+                      font=(FONT_FAMILY, font_size, weight), cursor="hand2")
+    win_id = canvas.create_window(0, 0, window=label, anchor="nw")
+
+    state = {"bg_item": None, "base_bg": bg}
+
+    def _apply_bg(color):
+        label.config(bg=color)
+        if state["bg_item"] is not None:
+            canvas.itemconfig(state["bg_item"], fill=color)
+
+    def _redraw(event=None):
+        req_w = label.winfo_reqwidth()
+        req_h = label.winfo_reqheight()
+        w, h = req_w + 30, req_h + 12
+        cw = canvas.winfo_width()
+        if fill and cw > 1:
+            w = max(w, cw)
+        canvas.config(height=h)
+        if not fill or cw <= 1:
+            canvas.config(width=w)
+        canvas.coords(win_id, (w - req_w) // 2, (h - req_h) // 2)
+        pts = _rounded_rect_points(1, 1, w - 1, h - 1, BTN_RADIUS)
+        if state["bg_item"] is None:
+            state["bg_item"] = canvas.create_polygon(
+                pts, smooth=True, fill=state["base_bg"], outline="")
+            canvas.tag_lower(state["bg_item"])
+        else:
+            canvas.coords(state["bg_item"], *pts)
+
+    label.bind("<Configure>", _redraw)
+    if fill:
+        canvas.bind("<Configure>", _redraw)
+
+    def _click(e=None):
+        command()
+
+    def _enter(e=None):
+        _apply_bg(_lighten_hex(state["base_bg"], 0.18))
+
+    def _leave(e=None):
+        _apply_bg(state["base_bg"])
+
+    for w_ in (canvas, label):
+        w_.bind("<Button-1>", _click)
+        w_.bind("<Enter>", _enter)
+        w_.bind("<Leave>", _leave)
+
+    orig_config = outer.config
+
+    def _custom_config(**kwargs):
+        if "text" in kwargs:
+            label.config(text=kwargs.pop("text"))
+            outer.after_idle(_redraw)
+        if "fg" in kwargs:
+            label.config(fg=kwargs.pop("fg"))
+        if "bg" in kwargs:
+            state["base_bg"] = kwargs.pop("bg")
+            _apply_bg(state["base_bg"])
+        if kwargs:
+            orig_config(**kwargs)
+
+    outer.config = _custom_config
+    outer.configure = _custom_config
+
+    outer.after_idle(_redraw)
+    return outer
+
+
 class PhotonNeuronBar(tk.Canvas):
     """Busy-state animation replacing the plain progress strip: a chameleon
     (light source) launches red photon squiggles at the neuron; each impact
@@ -5009,8 +5171,17 @@ class PhotonNeuronBar(tk.Canvas):
     # while Run Analysis works) rather than the old slim strip under the
     # status line -- bumped up proportionally from the original 190/42/46
     # so the characters read at a reasonable size in that much larger space.
-    HEIGHT = 300
-    NRN_SCALE = 66
+    #
+    # HEIGHT/NRN_SCALE/nrn_cy (in _render, below) were previously 300/66/0.68
+    # -- with the neuron centered that low and that tall (scale*4.2 =
+    # ~277px), its bottom edge landed at y=~343, well past the 300px-tall
+    # canvas, so its legs (and the "photons:" tally line sitting right
+    # underneath) were silently clipped by the canvas boundary. Fixed by
+    # raising the neuron's vertical anchor (closer to the chameleon's own,
+    # for a more natural "facing each other" eye-line too), trimming its
+    # scale slightly, and giving the canvas a bit more headroom overall.
+    HEIGHT = 340
+    NRN_SCALE = 56
     CHAM_SCALE = 72
 
     # Each volley: the chameleon fires two red photons in quick succession
@@ -5211,7 +5382,7 @@ class PhotonNeuronBar(tk.Canvas):
     def _render(self, t):
         w = max(self._width, 60)
         h = self.HEIGHT
-        nrn_cx, nrn_cy = w * 0.16, h * 0.68
+        nrn_cx, nrn_cy = w * 0.16, h * 0.55
         cham_cx, cham_cy = w * 0.86, h * 0.46
 
         nrn_w, nrn_h = draw_neuron(self, nrn_cx, nrn_cy, scale=self.NRN_SCALE,
@@ -5478,19 +5649,16 @@ class MeanProjectionViewer:
                  bg=BG_DARK, fg=TEXT_MAIN, font=(FONT_FAMILY, 10)
                  ).pack(side=tk.LEFT, padx=(0, 8))
         self.diam_var = tk.StringVar(value=str(default_diameter))
-        entry = tk.Entry(entry_row, textvariable=self.diam_var, width=8,
-                          bg=BG_PANEL, fg=TEXT_BRIGHT, insertbackground=TEXT_BRIGHT,
-                          relief=tk.FLAT)
-        entry.pack(side=tk.LEFT)
+        entry_canvas, entry = _rounded_entry(entry_row, self.diam_var, width=8, justify="left")
+        entry_canvas.pack(side=tk.LEFT)
         tk.Label(entry_row, text="→ sets CNMF cell radius to half of this",
                  bg=BG_DARK, fg=TEXT_DIM, font=(FONT_FAMILY, 9)
                  ).pack(side=tk.LEFT, padx=(8, 0))
 
         btn_row = tk.Frame(self.top, bg=BG_DARK)
         btn_row.pack(pady=10)
-        tk.Button(btn_row, text="Continue →", command=self._continue,
-                  bg=ACCENT, fg="white", font=(FONT_FAMILY, 10, "bold"),
-                  relief=tk.FLAT, padx=16, pady=4).pack()
+        _rounded_button(btn_row, "Continue →", self._continue,
+                        bg=ACCENT, fg="white", font_size=10, bold=True, side=tk.TOP)
 
     def _continue(self):
         diameter = None
@@ -5596,9 +5764,8 @@ class CNMFMaskViewer:
         self.toolbar.update()
         self.canvas.draw()
 
-        tk.Button(self.top, text="Close", command=self.top.destroy,
-                  bg=BG_PANEL, fg=TEXT_BRIGHT, font=(FONT_FAMILY, 10),
-                  relief=tk.FLAT, padx=16, pady=4).pack(pady=10)
+        _rounded_button(self.top, "Close", self.top.destroy,
+                        bg=BG_PANEL, fg=TEXT_BRIGHT, font_size=10, pady=10, side=tk.TOP)
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -5788,25 +5955,17 @@ class KurtosisChecker:
 
         def _lbtn(parent, text, command, bg=GREY_BTN, fg=TEXT_BRIGHT, font_size=12,
                    bold=True, side=tk.LEFT, padx=6, fill=None):
-            """Label-based button — colour always renders on macOS. Greyscale
-            by default now (bg=GREY_BTN); pass bg=GREY_BTN_ACTIVE + fg=GREY_BTN_TEXT_ACTIVE
-            for the one "primary action" button in a given view. Pass
-            fill=tk.X for sidebar buttons that should stretch full-width
-            (avoids the winfo_children() re-pack dance, which also chokes
-            under the _fake_tkinter test shim)."""
-            weight = "bold" if bold else "normal"
-            lbl = tk.Label(parent, text=text, bg=bg, fg=fg,
-                           font=(FONT_FAMILY, font_size, weight),
-                           padx=16, pady=7, cursor="hand2", relief=tk.RAISED, bd=1,
-                           highlightbackground=GREY_BORDER)
-            if fill:
-                lbl.pack(side=side, padx=padx, pady=5, fill=fill)
-            else:
-                lbl.pack(side=side, padx=padx, pady=5)
-            lbl.bind("<Button-1>", lambda e: command())
-            lbl.bind("<Enter>",    lambda e: lbl.config(relief=tk.SUNKEN))
-            lbl.bind("<Leave>",    lambda e: lbl.config(relief=tk.RAISED))
-            return lbl
+            """Rounded-pill button (see module-level _rounded_button for the
+            implementation, shared with standalone dialogs) — colour
+            always renders on macOS. Greyscale by default now (bg=GREY_BTN);
+            pass bg=GREY_BTN_ACTIVE + fg=GREY_BTN_TEXT_ACTIVE for the one
+            "primary action" button in a given view. Pass fill=tk.X for
+            sidebar buttons that should stretch full-width (avoids the
+            winfo_children() re-pack dance, which also chokes under the
+            _fake_tkinter test shim)."""
+            return _rounded_button(parent, text, command, bg=bg, fg=fg,
+                                    font_size=font_size, bold=bold, side=side,
+                                    padx=padx, pady=5, fill=fill)
         self._lbtn = _lbtn  # reused by the gain sidebar
 
         self._build_slab_logo(left)
@@ -5866,10 +6025,8 @@ class KurtosisChecker:
                      font=(FONT_FAMILY, 10)).pack(side=tk.LEFT, padx=(0, 2))
 
         def ent(var, w=6, parent=sf):
-            e = tk.Entry(parent, textvariable=var, width=w,
-                         bg=BG_PANEL, fg="white", insertbackground="white",
-                         relief=tk.FLAT, font=(FONT_FAMILY, 10))
-            e.pack(side=tk.LEFT)
+            c, e = _rounded_entry(parent, var, width=w, justify="left")
+            c.pack(side=tk.LEFT)
             return e
 
         lbl("Frame rate fs:")
@@ -5883,10 +6040,8 @@ class KurtosisChecker:
                      font=(FONT_FAMILY, 10)).pack(side=tk.LEFT, padx=(0, 2))
 
         def ent(var, w=5, parent=sf):
-            e = tk.Entry(parent, textvariable=var, width=w,
-                         bg=BG_PANEL, fg="white", insertbackground="white",
-                         relief=tk.FLAT, font=(FONT_FAMILY, 10))
-            e.pack(side=tk.LEFT)
+            c, e = _rounded_entry(parent, var, width=w, justify="left")
+            c.pack(side=tk.LEFT)
             return e
 
         self.do_neuropil = tk.BooleanVar(value=True)
@@ -6035,10 +6190,9 @@ class KurtosisChecker:
                             font=(FONT_FAMILY, 9))
             suf.pack(side=tk.RIGHT)
             hover_widgets.append(suf)
-        entry = tk.Entry(row, textvariable=var, width=width, bg=BG_PANEL, fg="white",
-                          insertbackground="white", relief=tk.FLAT,
-                          font=(FONT_FAMILY, 10), justify="right")
-        entry.pack(side=tk.RIGHT, padx=(0, 6))
+        entry_canvas, entry = _rounded_entry(row, var, width=width, justify="right")
+        entry_canvas.pack(side=tk.RIGHT, padx=(0, 6))
+        hover_widgets.append(entry_canvas)
         hover_widgets.append(entry)
         if help_text:
             self._make_tooltip(hover_widgets, help_text)
@@ -6121,18 +6275,17 @@ class KurtosisChecker:
         fitrange_icon = self._help_icon(fitrange_row)
         fitrange_entries = tk.Frame(fit_body, bg=CARD_BG)
         fitrange_entries.pack(fill=tk.X, pady=(0, 2))
-        fitrange_lo = tk.Entry(fitrange_entries, textvariable=self.fit_lo_var, width=5, bg=BG_PANEL, fg="white",
-                 insertbackground="white", relief=tk.FLAT, font=(FONT_FAMILY, 10),
-                 justify="center")
-        fitrange_lo.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 3))
+        fitrange_lo_canvas, fitrange_lo = _rounded_entry(fitrange_entries, self.fit_lo_var,
+                                                           width=5, justify="center")
+        fitrange_lo_canvas.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 3))
         fitrange_dash = tk.Label(fitrange_entries, text="–", bg=CARD_BG, fg=TEXT_DIM)
         fitrange_dash.pack(side=tk.LEFT)
-        fitrange_hi = tk.Entry(fitrange_entries, textvariable=self.fit_hi_var, width=5, bg=BG_PANEL, fg="white",
-                 insertbackground="white", relief=tk.FLAT, font=(FONT_FAMILY, 10),
-                 justify="center")
-        fitrange_hi.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(3, 0))
+        fitrange_hi_canvas, fitrange_hi = _rounded_entry(fitrange_entries, self.fit_hi_var,
+                                                           width=5, justify="center")
+        fitrange_hi_canvas.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(3, 0))
         self._make_tooltip([fitrange_row, fitrange_lbl, fitrange_icon, fitrange_entries,
-                             fitrange_lo, fitrange_dash, fitrange_hi], fitrange_help)
+                             fitrange_lo_canvas, fitrange_lo, fitrange_dash,
+                             fitrange_hi_canvas, fitrange_hi], fitrange_help)
         self._sidebar_row(fit_body, "Spatial bin", self.spatial_bin_var, suffix="px",
                            help_text="Superpixel binning applied before the PTC fit "
                                      "(pixels are summed, not averaged, so the "
@@ -6783,8 +6936,8 @@ class KurtosisChecker:
                            activebackground=BG_DARK).pack(anchor=tk.W, padx=24)
         result = [None]
         def ok(): result[0] = choice.get(); win.destroy()
-        tk.Button(win, text="OK", command=ok, bg=BG_PANEL, fg="white",
-                  relief=tk.FLAT, padx=14, pady=5).pack(pady=12)
+        _rounded_button(win, "OK", ok, bg=BG_PANEL, fg="white",
+                        font_size=10, pady=12, side=tk.TOP)
         self.root.wait_window(win)
         return result[0]
 
@@ -7495,8 +7648,8 @@ class KurtosisChecker:
         tk.Label(win, text=prompt, bg=BG_DARK, fg=TEXT_BRIGHT, padx=16,
                  pady=10, wraplength=280, justify="left").pack()
         var = tk.StringVar(value=default)
-        entry = tk.Entry(win, textvariable=var, width=30)
-        entry.pack(padx=16, pady=(0, 10))
+        entry_canvas, entry = _rounded_entry(win, var, width=30, justify="left")
+        entry_canvas.pack(padx=16, pady=(0, 10))
         entry.focus_set()
         entry.select_range(0, tk.END)
         result = [None]
@@ -7510,10 +7663,8 @@ class KurtosisChecker:
         win.protocol("WM_DELETE_WINDOW", cancel)
         btn_row = tk.Frame(win, bg=BG_DARK)
         btn_row.pack(pady=(0, 12))
-        tk.Button(btn_row, text="OK", command=ok, bg=BG_PANEL, fg="white",
-                  relief=tk.FLAT, padx=14, pady=5).pack(side=tk.LEFT, padx=6)
-        tk.Button(btn_row, text="Cancel", command=cancel, bg=BG_PANEL, fg="white",
-                  relief=tk.FLAT, padx=14, pady=5).pack(side=tk.LEFT, padx=6)
+        _rounded_button(btn_row, "OK", ok, bg=BG_PANEL, fg="white", font_size=10, padx=6)
+        _rounded_button(btn_row, "Cancel", cancel, bg=BG_PANEL, fg="white", font_size=10, padx=6)
         self.root.wait_window(win)
         return result[0]
 
