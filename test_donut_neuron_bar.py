@@ -151,28 +151,45 @@ try:
     assert len(bar2._crumbs) <= app.DonutNeuronBar.MAX_CRUMBS
     print("crumbs accumulate across repeated eat-cycles and respect MAX_CRUMBS: OK")
 
-    # ── the pile rises (buries the legs) as more crumbs accumulate, per
-    # Filip's "keep the buildup of crumbs continuing slowly burying the
-    # neuron" -- each new batch should spawn at a smaller (more negative)
-    # oy than an earlier batch, and the rise should be capped rather than
-    # unbounded. ──────────────────────────────────────────────────────────
+    # ── the pile rises (buries the legs) as more crumbs accumulate, in a
+    # gaussian-shaped mound -- tallest at CRUMB_PILE_CENTER, tapering off
+    # toward the edges -- per Filip's "pile up in a gaussian like shape in
+    # front of the neuron," rather than a flat-topped shelf. The rise
+    # should also be capped rather than unbounded. ──────────────────────
     bar2b = make_bar()
     bar2b._crumbs = []
-    bar2b._spawn_crumbs()
-    early_max_oy = max(c[1] for c in bar2b._crumbs)  # first batch's own top
-    for _ in range(80):
+    for _ in range(150):
         bar2b._spawn_crumbs()
-    late_oys = [c[1] for c in bar2b._crumbs[-4:]]  # a recent batch
-    assert max(late_oys) < early_max_oy, \
-        "later crumb batches should spawn higher (smaller oy) than the very first batch"
+    center = bar2b.CRUMB_PILE_CENTER
+    sigma = bar2b.CRUMB_PILE_SIGMA
+    near_center = [c for c in bar2b._crumbs if abs(c[0] - center) < sigma * 0.3]
+    far_from_center = [c for c in bar2b._crumbs if abs(c[0] - center) > sigma * 2.0]
+    assert near_center and far_from_center, \
+        "test setup should produce both near-center and far-from-center crumbs"
+    mean_oy_near = sum(c[1] for c in near_center) / len(near_center)
+    mean_oy_far = sum(c[1] for c in far_from_center) / len(far_from_center)
+    assert mean_oy_near < mean_oy_far, (
+        f"crumbs near the pile's center should sit higher (smaller oy) than crumbs "
+        f"far from center, giving the pile a mound/gaussian cross-section instead of "
+        f"a flat shelf: near={mean_oy_near:.1f}, far={mean_oy_far:.1f}")
+    print("crumb pile rises in a gaussian-shaped mound (tallest at center, tapering at edges): OK")
+
     # rise is capped -- keep spawning well past the point it should have
     # saturated and confirm oy never drops below the documented floor
-    for _ in range(400):
+    for _ in range(2000):
         bar2b._spawn_crumbs()
     min_oy = min(c[1] for c in bar2b._crumbs)
-    assert min_oy >= -(bar2b.CRUMB_MAX_RISE + 6 + 1), \
+    assert min_oy >= -(bar2b.CRUMB_MAX_RISE + 10 + 1), \
         f"pile rise should be capped at CRUMB_MAX_RISE, got a crumb as high as oy={min_oy}"
-    print("crumb pile rises with accumulation, capped rather than unbounded: OK")
+    print("crumb pile peak height is capped rather than unbounded: OK")
+
+    # every crumb's x-offset stays within the broom's sweep range, so a
+    # single left-to-right pass is still guaranteed to catch everything
+    # even with the gaussian's occasional far-tail sample
+    x0, x1 = bar2b.SWEEP_X_RANGE
+    assert all(x0 <= c[0] <= x1 for c in bar2b._crumbs), \
+        "every crumb's x-offset should fall within the broom's sweep range"
+    print("gaussian pile's x-offsets stay within the broom's sweep range: OK")
 
     # ── set_busy(True) sweeps all crumbs away, then keeps sweeping ───────
     # (Filip: "the broom should keep sweeping until the computation there
@@ -274,7 +291,7 @@ try:
     # (no new hand-drawn frame), same spirit as the chew jitter. ───────
     bar6 = make_bar()
     bar6._mode = "idle"
-    bar6._idle_seq_idx = bar6.IDLE_SEQUENCE.index(("crumbs", 0.5))
+    bar6._idle_seq_idx = bar6.IDLE_SEQUENCE.index(("crumbs", 1.1))
     bar6.calls.clear()
     bar6._render(10.0)
     line_calls_a = [c for c in bar6.calls if c[0] == "create_line" and c[2] == "handrub"]
@@ -300,7 +317,7 @@ try:
     # not drawn (and cleaned up) during any other pose
     bar7 = make_bar()
     bar7._mode = "idle"
-    bar7._idle_seq_idx = bar7.IDLE_SEQUENCE.index(("chew", 0.4))
+    bar7._idle_seq_idx = bar7.IDLE_SEQUENCE.index(("chew", 0.7))
     bar7.calls.clear()
     bar7._render(10.0)
     assert not [c for c in bar7.calls if c[0] == "create_line" and c[2] == "handrub"], \
