@@ -1,0 +1,899 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Event Detection Parameter Explorer — d′ vs FOV vs Frame Rate</title>
+<script>
+  window.MathJax = {
+    tex: { inlineMath: [['\\(', '\\)']] },
+    svg: { fontCache: 'global' }
+  };
+</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-mml-chtml.min.js" id="MathJax-script" async></script>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; background: #ffffff;
+    display: flex; align-items: center; justify-content: center;
+    font-family: "Helvetica Neue", Helvetica, Arial, sans-serif; padding: 20px; color: #000000;
+  }
+  .wrap { width: 100%; max-width: 1240px; }
+  .eyebrow { color:#000; font-size:13px; margin-bottom:4px; font-weight:700; }
+  h1 {
+    margin:0; color:#000; font-size:24px; font-weight:700; letter-spacing:-0.5px;
+    font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+  }
+  .header-row { display:flex; justify-content:space-between; align-items:center; gap:24px; margin-bottom:16px; }
+  .header-left { flex-shrink:0; }
+  .eq-callout { display:flex; align-items:center; gap:22px; }
+  .eq-main { font-size:26px; color:#000; flex-shrink:0; }
+  .eq-legend { display:flex; flex-direction:column; gap:5px; }
+  .eq-legend-row { font-size:10px; color:#000; white-space:nowrap; }
+  .eq-legend-row b { margin-right:5px; }
+  .row { display:flex; gap:56px; align-items:flex-start; }
+  .controls { width:250px; flex-shrink:0; }
+  .section {
+    margin-bottom:12px; border:1px solid #000; border-radius:8px;
+    padding:12px; background:#fff;
+  }
+  .section-title { color:#000; font-size:13px; margin-bottom:8px; font-weight:700; }
+  .label { color:#000; font-size:10px; margin-bottom:3px; }
+  .field { margin-bottom:6px; }
+  input[type=text], input[type=number] {
+    width:100%; background:#ffffff; border:1px solid #333; border-radius:4px;
+    color:#000; font-size:11px; padding:5px 8px; font-family:inherit; box-sizing:border-box; outline:none;
+  }
+  input[type=range] { width:100%; accent-color:#000; cursor:pointer; }
+  .indicator-btns { display:flex; flex-wrap:wrap; gap:3px; margin-bottom:6px; }
+  .indicator-btn {
+    padding:3px 7px; font-size:9px; border:1px solid #000; border-radius:4px; cursor:pointer;
+    font-family:inherit; background:#ffffff; color:#000; font-weight:400; flex:1;
+  }
+  .indicator-btn.active { background:#000; color:#fff; font-weight:600; }
+  .stat-grid {
+    display:grid; grid-template-columns:1fr 1fr; gap:6px; margin-bottom:8px;
+    background:#f2f2f2; border-radius:6px; padding:8px 10px;
+  }
+  .stat-small { text-align:center; }
+  .stat-small .l { color:#000; font-size:8px; letter-spacing:1px; }
+  .stat-small .v { color:#000; font-size:11px; font-weight:600; }
+  .slider-block { margin-bottom:9px; }
+  .slider-head { display:flex; justify-content:space-between; margin-bottom:2px; }
+  .slider-head span.val { color:#000; font-size:10px; }
+  .hint { color:#333; font-size:9px; margin-top:4px; margin-bottom:2px; line-height:1.5; }
+  .stat-row { display:flex; justify-content:space-between; margin-bottom:5px; align-items:baseline; }
+  .stat-row .l { color:#000; font-size:10px; }
+  .stat-row .v { font-size:11px; font-weight:600; color:#000; }
+  .stat-row .v.warn { color:#c40000; }
+  .stat-row .v.good { color:#0a7a1f; }
+  .checkbox-row { display:flex; align-items:center; gap:6px; cursor:pointer; color:#000; font-size:10px; margin-bottom:10px; flex-wrap:wrap; }
+  .checkbox-row input { accent-color:#000; }
+  .bidi-note { color:#333; font-weight:400; }
+  .panel { border-radius:6px; padding:10px 12px; }
+  .panel.warn-panel { background:#fdecec; border:1px solid #c40000; }
+  .panel.ok-panel { background:#eaf7ec; border:1px solid #0a7a1f; }
+  .warn-title { color:#c40000; font-size:10px; font-weight:700; letter-spacing:2px; margin-bottom:6px; }
+  .warn-line { color:#a30000; font-size:9px; margin-bottom:3px; }
+  .ok-line { color:#0a7a1f; font-size:10px; }
+  .divider { border-top:1px solid #ccc; margin:8px 0; }
+  .two-col { display:flex; gap:8px; }
+  .two-col .field { flex:1; }
+  .canvas-area { flex:1; display:flex; flex-direction:column; align-items:center; }
+  .canvas-shell { position:relative; display:flex; }
+  .canvas-inner { position:relative; }
+  .readout-overlay {
+    position:absolute; top:10px; left:10px; z-index:5;
+    background:rgba(255,255,255,0.94); border:1px solid #000; border-radius:8px;
+    padding:10px 12px; width:180px; box-shadow:0 2px 6px rgba(0,0,0,0.15);
+  }
+  .readout-overlay input[type=text] { pointer-events:auto; }
+  canvas#chart { display:block; border-radius:6px; border:1px solid #000; cursor:crosshair; }
+  canvas#chart.dragging { cursor: grabbing; }
+  svg.axes { position:absolute; inset:0; pointer-events:none; }
+  .footnote { color:#000; font-size:9px; margin-top:5px; text-align:center; }
+  .logo-block { margin-top:22px; display:flex; flex-direction:column; align-items:center; gap:5px; }
+  .logo-block a { display:flex; flex-direction:column; align-items:center; gap:5px; text-decoration:none; }
+  .logo-block img { height:44px; width:auto; }
+  .logo-caption { font-size:10px; color:#000; text-decoration:underline; }
+  .area-note { color:#333; font-size:9px; margin-top:2px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="header-row">
+    <div class="header-left">
+      <div class="eyebrow">2P Calcium Imaging</div>
+      <h1>Event Detection Parameter Explorer</h1>
+    </div>
+    <div class="eq-callout" id="eqCallout">
+      <div class="eq-main" id="eqMain"></div>
+      <div class="eq-legend">
+        <div class="eq-legend-row"><b>d′</b>detectability index (≥3 reliable)</div>
+        <div class="eq-legend-row"><b>ΔF/F</b>indicator's fractional response per AP</div>
+        <div class="eq-legend-row"><b>F₀</b>baseline photon flux (photon/s)</div>
+        <div class="eq-legend-row"><b>τ</b>decay time constant</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="controls">
+
+      <div id="statusPanel"></div>
+
+      <div class="section">
+        <div class="section-title">Readout</div>
+        <div class="stat-row"><span class="l">\(d'\)</span><span class="v" id="rDp"></span></div>
+        <div class="stat-row"><span class="l">F₀ at setup</span><span class="v" id="rF0"></span></div>
+        <div class="stat-row"><span class="l">Line spacing Y</span><span class="v" id="rLsY"></span></div>
+        <div class="stat-row"><span class="l">Pixel size X</span><span class="v" id="rPxX"></span></div>
+        <div class="stat-row"><span class="l">FOV</span><span class="v" id="rFov"></span></div>
+        <div class="stat-row"><span class="l">Frame rate</span><span class="v" id="rFr"></span></div>
+        <div class="stat-row"><span class="l">Nyquist</span><span class="v" id="rNyq"></span></div>
+        <div class="divider"></div>
+        <div class="stat-row"><span class="l">Pulses/µm (center)</span><span class="v" id="rPulsesUm"></span></div>
+        <div class="stat-row"><span class="l">Pulses/px (center)</span><span class="v" id="rPulsesPx"></span></div>
+        <div class="divider"></div>
+        <div class="field">
+          <div class="label">Neuron diameter (µm)</div>
+          <input type="text" id="neuronInput">
+        </div>
+        <div class="stat-row"><span class="l">Pulses across neuron</span><span class="v" id="rPulsesNeuron"></span></div>
+        <div class="stat-row"><span class="l">Neuron width</span><span class="v" id="rNeuronPx"></span></div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">Indicator</div>
+        <div class="indicator-btns" id="indicatorBtns"></div>
+        <div class="stat-grid">
+          <div class="stat-small"><div class="l">ΔF/F</div><div class="v" id="statDff"></div></div>
+          <div class="stat-small"><div class="l">τ</div><div class="v" id="statTau"></div></div>
+        </div>
+        <div class="slider-block">
+          <div class="slider-head"><span class="label">ΔF/F</span><span class="val" id="dffVal"></span></div>
+          <input type="range" id="dffSlider" min="0.05" max="3" step="0.05">
+        </div>
+        <div class="slider-block">
+          <div class="slider-head"><span class="label">τ decay</span><span class="val" id="tauVal"></span></div>
+          <input type="range" id="tauSlider" min="0.01" max="1.5" step="0.01">
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">Flux Calibration</div>
+        <div class="hint" style="margin-top:0;">F₀ measured at reference FOV.</div>
+        <div class="field">
+          <div class="label">F₀ (photon/s per cell)</div>
+          <input type="text" id="fluxInput">
+        </div>
+        <div class="slider-block">
+          <div class="slider-head"><span class="label">Typical range</span><span class="val" id="fluxVal"></span></div>
+          <input type="range" id="fluxSlider" min="100" max="30000" step="10">
+        </div>
+        <div class="field">
+          <div class="label">at FOV area (mm²)</div>
+          <input type="text" id="refAreaInput">
+        </div>
+        <div class="hint">Photon flux depends on the properties of the imaging system, the sample, laser power and indicator.</div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">FOV Dimensions</div>
+        <div class="two-col">
+          <div class="field">
+            <div class="label">FOV X (µm)</div>
+            <input type="text" id="fovXInput">
+          </div>
+          <div class="field">
+            <div class="label">FOV Y (µm)</div>
+            <input type="text" id="fovYInput">
+          </div>
+        </div>
+        <div class="area-note" id="setupNote"></div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">Scan Rate</div>
+        <div class="label">Lines / s (resonant)</div>
+        <div class="indicator-btns" id="linesPerSecBtns"></div>
+        <input type="text" id="linesPerSecInput">
+        <label class="checkbox-row" style="margin-top:8px;">
+          <input type="checkbox" id="bidirectional" checked>
+          Bidirectional <span class="bidi-note" id="bidiNote"></span>
+        </label>
+        <div class="label">Lines / frame (Y res)</div>
+        <div class="indicator-btns" id="linesPerFrameBtns"></div>
+        <input type="text" id="linesPerFrameInput">
+        <div class="stat-row" style="margin-top:8px;"><span class="l">Frame rate</span><span class="v" id="scFrameRate"></span></div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">Laser</div>
+        <div class="label">Pulse rate (MHz)</div>
+        <div class="indicator-btns" id="pulseRateBtns"></div>
+        <input type="text" id="pulseRateInput">
+        <div class="stat-row" style="margin-top:8px; display:none;"><span class="l">Pixels / line (derived)</span><span class="v" id="pxPerLine"></span></div>
+        <div class="hint" style="display:none;">square pixels: lines/frame × fovX/fovY</div>
+      </div>
+
+    </div>
+
+    <div class="canvas-area">
+      <div class="canvas-shell">
+        <div class="canvas-inner">
+          <canvas id="chart" width="580" height="580"></canvas>
+          <svg class="axes" id="axesSvg" width="580" height="580"></svg>
+        </div>
+        <svg id="colorbar" width="48" height="580" style="flex-shrink:0;"></svg>
+      </div>
+      <label class="checkbox-row" style="justify-content:center; margin-top:8px;">
+        <input type="checkbox" id="showLS" checked>
+        Show line spacing contours
+      </label>
+      <div class="footnote" id="footnote"></div>
+      <div class="logo-block">
+        <a href="https://slslab.org" target="_blank" rel="noopener noreferrer">
+          <img src="data:image/png;base64,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" alt="SLAB logo">
+          <span class="logo-caption">slslab.org</span>
+        </a>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── resonant-scanner center-dwell correction ─────────────────────────────
+// A resonant scanner sweeps sinusoidally; velocity (and therefore dwell
+// time per pixel) is lowest at the edges and highest at the center of the
+// sweep. Average speed over a half-sine sweep = (2/π) × peak speed, so the
+// pulses/pixel collected at the FOV center is (2/π) of the frame-average.
+const CENTER_FACTOR = 2 / Math.PI;
+
+const INDICATORS = [
+  { label: "GCaMP6s",  dff: 0.25,  tau: 0.500, color: "#4ec9b0" },
+  { label: "GCaMP6f",  dff: 0.12,  tau: 0.150, color: "#79c0ff" },
+  { label: "jGCaMP8s", dff: 1.10,  tau: 0.1883, color: "#ffa657" },
+  { label: "jGCaMP8m", dff: 0.75,  tau: 0.0380, color: "#ff7b72" },
+  { label: "jGCaMP8f", dff: 0.37,  tau: 0.0193, color: "#d2a8ff" },
+  { label: "Custom",   dff: 0.25,  tau: 0.500, color: "#e6edf3" },
+];
+const LINES_PER_SEC_PRESETS = [8000, 12000, 16000];
+const LINES_PER_FRAME_PRESETS = [512, 1024, 2048];
+const PULSE_RATE_PRESETS = [80, 160];
+
+const N_FOV = 140, N_FR = 100;
+const AREA_MIN = 0.01, AREA_MAX = 25;
+const FR_MIN = 1, FR_MAX = 100;
+
+function logspace(mn, mx, n) {
+  return Array.from({length:n},(_,i) => mn * Math.pow(mx/mn, i/(n-1)));
+}
+const AREA_VALS = logspace(AREA_MIN, AREA_MAX, N_FOV);
+const FR_VALS   = logspace(FR_MIN,   FR_MAX,   N_FR);
+
+// d′ depends only on FOV area (F0 ∝ 1/area at fixed calibration) — NOT on
+// frame rate or scan settings, matching the reference formula.
+function calcF0(area_mm2, refFlux, refArea_mm2) {
+  return refFlux * refArea_mm2 / area_mm2;
+}
+function dprime(area_mm2, dff, tau, refFlux, refArea) {
+  const F0 = calcF0(area_mm2, refFlux, refArea);
+  return dff * Math.sqrt(0.5 * F0 * tau);
+}
+function nyquistHz(tau) { return 2 / tau; }
+
+function dpToColor(dp, maxD = 10) {
+  const t = Math.min(Math.max(dp / maxD, 0), 1);
+  const stops = [[68,1,84],[59,82,139],[33,145,140],[94,201,98],[253,231,37]];
+  const seg = t*(stops.length-1);
+  const i   = Math.min(Math.floor(seg), stops.length-2);
+  const f   = seg-i;
+  const c   = stops[i].map((v,k)=>Math.round(v+f*(stops[i+1][k]-v)));
+  return `rgb(${c[0]},${c[1]},${c[2]})`;
+}
+
+// The color LUT is calibrated so GCaMP6s spans 0–10. Other indicators have
+// very different ΔF/F·√τ sensitivity, so a fixed 0–10 scale can leave the
+// whole map saturated at one end. Rescale the LUT max in proportion to the
+// current indicator's sensitivity relative to GCaMP6s, so every indicator's
+// heatmap uses roughly the same order-of-magnitude spread as 6s.
+const REF_INDICATOR = INDICATORS[0]; // GCaMP6s
+function lutMaxNow() {
+  const refS = REF_INDICATOR.dff * Math.sqrt(REF_INDICATOR.tau);
+  const curS = state.dff * Math.sqrt(state.tau);
+  return Math.min(100, Math.max(1, 10 * (curS / refS)));
+}
+
+// Adaptive contrast: instead of a hard black/white flip (which snaps
+// abruptly as the underlying d′ crosses a threshold) or a drop-shadow
+// halo, slide continuously through grey — inverted luminance of the
+// heatmap color right under the line/label, with the contrast stretched
+// a bit around the midpoint so it never goes fully flat grey-on-grey.
+function luminanceOfColor(rgbStr) {
+  const m = rgbStr.match(/[\d.]+/g).map(Number);
+  return 0.299*m[0] + 0.587*m[1] + 0.114*m[2];
+}
+function contrastColorFor(dp, maxD) {
+  const t = luminanceOfColor(dpToColor(dp, maxD)) / 255;
+  let ot = 1 - t;                 // invert background luminance
+  ot = 0.5 + (ot - 0.5) * 1.8;    // stretch away from mid-grey a bit
+  ot = Math.min(1, Math.max(0, ot));
+  const v = Math.round(ot * 255);
+  return `rgb(${v},${v},${v})`;
+}
+
+// Same idea as contrastColorFor, but for text labels specifically: a
+// stronger stretch plus a guaranteed minimum luminance gap so labels stay
+// legible even in the colormap's mid-luminance band (e.g. the teal/green
+// stretch), where the plain line contrast above can land too close to it.
+// Lines stay gradual/subtle; labels get a harder pop.
+function labelColorFor(dp, maxD) {
+  const t = luminanceOfColor(dpToColor(dp, maxD)) / 255;
+  let ot = 1 - t;
+  ot = 0.5 + (ot - 0.5) * 2.6;
+  const MIN_GAP = 0.35;
+  if (Math.abs(ot - t) < MIN_GAP) {
+    ot = t < 0.5 ? Math.min(1, t + MIN_GAP) : Math.max(0, t - MIN_GAP);
+  }
+  ot = Math.min(1, Math.max(0, ot));
+  const v = Math.round(ot * 255);
+  return `rgb(${v},${v},${v})`;
+}
+
+function buildRaster(dff, tau, refFlux, refArea) {
+  return AREA_VALS.map(area =>
+    FR_VALS.map(() => dprime(area, dff, tau, refFlux, refArea))
+  );
+}
+
+// Stroke a polyline as a manually-drawn dash pattern where each visible
+// dash segment is colored for contrast against the heatmap right under it
+// (sampled via the FOV area interpolated along that segment). pts is an
+// array of {x,y,area} in drawing order. Pass dashOff=0 for a solid line.
+function strokeAdaptiveDashed(pts, dashOn, dashOff, lineWidth, maxD) {
+  if (pts.length < 2) return;
+  let phase = 0, on = true;
+  const cycle = dashOn + dashOff;
+  for (let i = 0; i < pts.length - 1; i++) {
+    const A = pts[i], B = pts[i+1];
+    const segLen = Math.hypot(B.x - A.x, B.y - A.y);
+    if (segLen < 1e-6) continue;
+    let traveled = 0;
+    while (traveled < segLen - 1e-6) {
+      const capacity = (cycle === 0 ? segLen : (on ? dashOn : dashOff) - phase);
+      const step = Math.min(capacity, segLen - traveled);
+      const t0 = traveled / segLen, t1 = (traveled + step) / segLen;
+      if (on) {
+        const sx0 = A.x+(B.x-A.x)*t0, sy0 = A.y+(B.y-A.y)*t0;
+        const sx1 = A.x+(B.x-A.x)*t1, sy1 = A.y+(B.y-A.y)*t1;
+        const areaMid = A.area + (B.area - A.area) * ((t0+t1)/2);
+        const dpMid = dprime(areaMid, state.dff, state.tau, state.refFlux, state.refArea);
+        ctx.strokeStyle = contrastColorFor(dpMid, maxD);
+        ctx.lineWidth = lineWidth;
+        ctx.beginPath(); ctx.moveTo(sx0,sy0); ctx.lineTo(sx1,sy1); ctx.stroke();
+      }
+      traveled += step;
+      if (cycle > 0) {
+        phase += step;
+        if (phase >= (on ? dashOn : dashOff) - 1e-6) { phase = 0; on = !on; }
+      }
+    }
+  }
+}
+
+// ── state ──────────────────────────────────────────────────────────────────
+const state = {
+  indicatorIdx: 0,
+  dff: INDICATORS[0].dff,
+  tau: INDICATORS[0].tau,
+  refFlux: 700,
+  refArea: 0.5625,
+  linesPerSec: 8000,
+  bidirectional: true,
+  linesPerFrame: 512,
+  pulseRateMHz: 80,
+  fovX: 750,
+  fovY: 750,
+  neuronDiameter: 12,
+  showLS: true,
+  dragging: false,
+  hovering: false,
+};
+
+let CW = 580, CH = 580;
+const PAD = { l:44, r:8, t:10, b:34 };
+const COLORBAR_W = 56; // colorbar svg width + gap
+
+function typeset() {
+  if (window.MathJax && window.MathJax.typesetPromise) return window.MathJax.typesetPromise();
+  return Promise.resolve();
+}
+
+// ── header equation callout: big d′ formula + a plain legend beside it ───
+document.getElementById("eqMain").innerHTML =
+  `\\(d' \\;=\\; \\dfrac{\\Delta F}{F}\\sqrt{\\dfrac{1}{2}\\,F_0\\,\\tau}\\)`;
+
+document.getElementById("footnote").innerHTML =
+  `Drag point · or enter values in FOV Dimensions &nbsp;·&nbsp; solid line = \\(d'=3\\) threshold &nbsp;·&nbsp; thin dashed = line spacing (µm/px) contours &nbsp;·&nbsp; labeled dashed = Nyquist &nbsp;·&nbsp; line/label shade adapts to the heatmap for contrast`;
+
+// ── derived getters ──────────────────────────────────────────────────────
+function linesPerSecEff() { return state.linesPerSec * (state.bidirectional ? 2 : 1); }
+function frameRateNow()   { return linesPerSecEff() / state.linesPerFrame; }
+function areaMM2Now()     { return (state.fovX * state.fovY) / 1e6; }
+function pixelsPerLineNow() { return Math.round(state.linesPerFrame * (state.fovX / state.fovY)); }
+function pixelSizeXNow()  { return state.fovX / pixelsPerLineNow(); }
+function lineSpacingYNow(){ return state.fovY / state.linesPerFrame; }
+function totalPixelRateNow() { return linesPerSecEff() * pixelsPerLineNow(); }
+function pulsesPerPixelAvgNow() { return (state.pulseRateMHz * 1e6) / totalPixelRateNow(); }
+function pulsesPerPixelCenterNow() { return pulsesPerPixelAvgNow() * CENTER_FACTOR; }
+function pulsesPerMicronCenterNow() { return pulsesPerPixelCenterNow() / pixelSizeXNow(); }
+
+// ── indicator buttons ─────────────────────────────────────────────────────
+const btnRow = document.getElementById("indicatorBtns");
+INDICATORS.forEach((ind, i) => {
+  const b = document.createElement("button");
+  b.className = "indicator-btn";
+  b.textContent = ind.label;
+  b.onclick = () => applyIndicator(i);
+  btnRow.appendChild(b);
+});
+function applyIndicator(idx) {
+  state.indicatorIdx = idx;
+  if (idx < INDICATORS.length - 1) {
+    state.dff = INDICATORS[idx].dff;
+    state.tau = INDICATORS[idx].tau;
+  }
+  syncControls(); render();
+}
+
+const dffSlider = document.getElementById("dffSlider");
+const tauSlider = document.getElementById("tauSlider");
+dffSlider.addEventListener("input", e => { state.dff = parseFloat(e.target.value); state.indicatorIdx = 5; syncControls(); render(); });
+tauSlider.addEventListener("input", e => { state.tau = parseFloat(e.target.value); state.indicatorIdx = 5; syncControls(); render(); });
+
+// ── flux calibration ──────────────────────────────────────────────────────
+// F0 is not a universal constant: it depends on indicator, laser power,
+// pulse characteristics, PSF, imaging depth, and window quality. The slider
+// is clamped to the range typically reported in the 2P calcium-imaging
+// literature (~100–30,000 photon/s per cell) rather than left unbounded.
+const FLUX_MIN = 100, FLUX_MAX = 30000;
+const fluxInput = document.getElementById("fluxInput");
+const refAreaInput = document.getElementById("refAreaInput");
+const fluxSlider = document.getElementById("fluxSlider");
+const fluxVal = document.getElementById("fluxVal");
+fluxInput.value = String(state.refFlux);
+refAreaInput.value = String(state.refArea);
+fluxSlider.value = Math.min(FLUX_MAX, Math.max(FLUX_MIN, state.refFlux));
+fluxVal.textContent = `${Math.round(state.refFlux)} photon/s`;
+function commitFlux(){ const v=parseFloat(fluxInput.value); if(!isNaN(v)&&v>0){ state.refFlux=v; syncFluxUI(); render(); } }
+function commitRefArea(){ const v=parseFloat(refAreaInput.value); if(!isNaN(v)&&v>0){ state.refArea=v; render(); } }
+function syncFluxUI(){
+  fluxSlider.value = Math.min(FLUX_MAX, Math.max(FLUX_MIN, state.refFlux));
+  fluxVal.textContent = `${Math.round(state.refFlux)} photon/s`;
+}
+fluxInput.addEventListener("blur", commitFlux);
+fluxInput.addEventListener("keydown", e => { if(e.key==="Enter") commitFlux(); });
+refAreaInput.addEventListener("blur", commitRefArea);
+refAreaInput.addEventListener("keydown", e => { if(e.key==="Enter") commitRefArea(); });
+fluxSlider.addEventListener("input", e => {
+  state.refFlux = parseFloat(e.target.value);
+  fluxInput.value = String(state.refFlux);
+  fluxVal.textContent = `${Math.round(state.refFlux)} photon/s`;
+  render();
+});
+
+// ── scan rate: lines/s, bidirectional, lines/frame ───────────────────────
+const linesPerSecBtnRow = document.getElementById("linesPerSecBtns");
+LINES_PER_SEC_PRESETS.forEach(v => {
+  const b = document.createElement("button");
+  b.className = "indicator-btn";
+  b.textContent = `${v/1000}k`;
+  b.onclick = () => { state.linesPerSec = v; syncControls(); render(); };
+  linesPerSecBtnRow.appendChild(b);
+});
+const linesPerSecInput = document.getElementById("linesPerSecInput");
+function commitLinesPerSec(){ const v=parseFloat(linesPerSecInput.value); if(!isNaN(v)&&v>0){ state.linesPerSec=v; syncControls(); render(); } }
+linesPerSecInput.addEventListener("blur", commitLinesPerSec);
+linesPerSecInput.addEventListener("keydown", e => { if(e.key==="Enter") commitLinesPerSec(); });
+
+document.getElementById("bidirectional").addEventListener("change", e => { state.bidirectional = e.target.checked; syncControls(); render(); });
+
+const linesPerFrameBtnRow = document.getElementById("linesPerFrameBtns");
+LINES_PER_FRAME_PRESETS.forEach(v => {
+  const b = document.createElement("button");
+  b.className = "indicator-btn";
+  b.textContent = String(v);
+  b.onclick = () => { state.linesPerFrame = v; syncControls(); render(); };
+  linesPerFrameBtnRow.appendChild(b);
+});
+const linesPerFrameInput = document.getElementById("linesPerFrameInput");
+function commitLinesPerFrame(){ const v=parseFloat(linesPerFrameInput.value); if(!isNaN(v)&&v>0){ state.linesPerFrame=v; syncControls(); render(); } }
+linesPerFrameInput.addEventListener("blur", commitLinesPerFrame);
+linesPerFrameInput.addEventListener("keydown", e => { if(e.key==="Enter") commitLinesPerFrame(); });
+
+// ── laser & pixels ─────────────────────────────────────────────────────
+const pulseRateBtnRow = document.getElementById("pulseRateBtns");
+PULSE_RATE_PRESETS.forEach(v => {
+  const b = document.createElement("button");
+  b.className = "indicator-btn";
+  b.textContent = `${v} MHz`;
+  b.onclick = () => { state.pulseRateMHz = v; syncControls(); render(); };
+  pulseRateBtnRow.appendChild(b);
+});
+const pulseRateInput = document.getElementById("pulseRateInput");
+function commitPulseRate(){ const v=parseFloat(pulseRateInput.value); if(!isNaN(v)&&v>0){ state.pulseRateMHz=v; syncControls(); render(); } }
+pulseRateInput.addEventListener("blur", commitPulseRate);
+pulseRateInput.addEventListener("keydown", e => { if(e.key==="Enter") commitPulseRate(); });
+
+// ── your setup: FOV X / Y ──────────────────────────────────────────────
+const fovXInput = document.getElementById("fovXInput");
+const fovYInput = document.getElementById("fovYInput");
+function commitFovX(){ const v=parseFloat(fovXInput.value); if(!isNaN(v)&&v>0){ state.fovX=v; syncControls(); render(); } }
+function commitFovY(){ const v=parseFloat(fovYInput.value); if(!isNaN(v)&&v>0){ state.fovY=v; syncControls(); render(); } }
+fovXInput.addEventListener("blur", commitFovX);
+fovXInput.addEventListener("keydown", e => { if(e.key==="Enter") commitFovX(); });
+fovYInput.addEventListener("blur", commitFovY);
+fovYInput.addEventListener("keydown", e => { if(e.key==="Enter") commitFovY(); });
+
+// ── neuron diameter ────────────────────────────────────────────────────
+const neuronInput = document.getElementById("neuronInput");
+function commitNeuron(){ const v=parseFloat(neuronInput.value); if(!isNaN(v)&&v>0){ state.neuronDiameter=v; render(); } }
+neuronInput.addEventListener("blur", commitNeuron);
+neuronInput.addEventListener("keydown", e => { if(e.key==="Enter") commitNeuron(); });
+
+document.getElementById("showLS").addEventListener("change", e => { state.showLS = e.target.checked; render(); });
+
+function fmt(v, d) { return v.toFixed(d); }
+
+function syncControls() {
+  dffSlider.value = state.dff;
+  tauSlider.value = state.tau;
+  document.getElementById("dffVal").textContent = `${(state.dff*100).toFixed(0)}%`;
+  document.getElementById("tauVal").textContent = `${(state.tau*1000).toFixed(0)} ms`;
+  document.getElementById("statDff").textContent = `${(state.dff*100).toFixed(0)}%`;
+  document.getElementById("statTau").textContent = `${(state.tau*1000).toFixed(0)} ms`;
+  document.querySelectorAll("#indicatorBtns .indicator-btn").forEach((b,i) => {
+    b.classList.toggle("active", state.indicatorIdx === i);
+  });
+
+  Array.from(linesPerSecBtnRow.children).forEach((b,i) => b.classList.toggle("active", state.linesPerSec === LINES_PER_SEC_PRESETS[i]));
+  linesPerSecInput.value = state.linesPerSec;
+  document.getElementById("bidirectional").checked = state.bidirectional;
+  document.getElementById("bidiNote").textContent = state.bidirectional
+    ? `× 2 → ${(linesPerSecEff()/1000).toFixed(0)}k lines/s` : "";
+  Array.from(linesPerFrameBtnRow.children).forEach((b,i) => b.classList.toggle("active", state.linesPerFrame === LINES_PER_FRAME_PRESETS[i]));
+  linesPerFrameInput.value = Math.round(state.linesPerFrame);
+  document.getElementById("scFrameRate").textContent = `${fmt(frameRateNow(),1)} Hz`;
+
+  Array.from(pulseRateBtnRow.children).forEach((b,i) => b.classList.toggle("active", state.pulseRateMHz === PULSE_RATE_PRESETS[i]));
+  pulseRateInput.value = state.pulseRateMHz;
+  document.getElementById("pxPerLine").textContent = pixelsPerLineNow();
+
+  fovXInput.value = fmt(state.fovX, 0);
+  fovYInput.value = fmt(state.fovY, 0);
+  document.getElementById("setupNote").textContent =
+    `${fmt(areaMM2Now(),4)} mm² · ${pixelsPerLineNow()}×${Math.round(state.linesPerFrame)} px · ${fmt(pixelSizeXNow(),2)} µm/px`;
+
+  neuronInput.value = fmt(state.neuronDiameter, 0);
+}
+
+// ── canvas + coordinate helpers ──────────────────────────────────────────
+const canvas = document.getElementById("chart");
+const ctx = canvas.getContext("2d");
+
+const areaToX = a => ((Math.log(a)-Math.log(AREA_MIN))/(Math.log(AREA_MAX)-Math.log(AREA_MIN)))*CW;
+const frToY   = fr => CH-((Math.log(fr)-Math.log(FR_MIN))/(Math.log(FR_MAX)-Math.log(FR_MIN)))*CH;
+const xToArea = x => { const t=Math.max(0,Math.min(1,x/CW)); return AREA_MIN*Math.pow(AREA_MAX/AREA_MIN,t); };
+const yToFr   = y => { const t=Math.max(0,Math.min(1,1-y/CH)); return FR_MIN*Math.pow(FR_MAX/FR_MIN,t); };
+
+function renderCanvas() {
+  const { dff, tau, refFlux, refArea, showLS } = state;
+  const area = areaMM2Now(), fr = frameRateNow();
+  const maxD = lutMaxNow();
+  const raster = buildRaster(dff, tau, refFlux, refArea);
+  ctx.clearRect(0,0,CW,CH);
+
+  const cw = CW/N_FOV, ch = CH/N_FR;
+  for (let xi=0;xi<N_FOV;xi++)
+    for (let yi=0;yi<N_FR;yi++) {
+      ctx.fillStyle = dpToColor(raster[xi][N_FR-1-yi], maxD);
+      ctx.fillRect(xi*cw, yi*ch, cw+1, ch+1);
+    }
+
+  // diagonal line-spacing contours: driven by the CURRENT effective line
+  // rate (Lines/s × bidirectional factor) — not a fixed hardware constant —
+  // so they shift live as you change Scan Rate settings. Color is picked
+  // per dash segment to contrast with the heatmap right under it.
+  const lineRate = linesPerSecEff();
+  if (showLS) {
+    const lsLevels = [0.5, 1, 2, 5, 10];
+    lsLevels.forEach(ls => {
+      const isBound = ls === 0.5 || ls === 5;
+      const pts = [];
+      for (let yi=0; yi<N_FR; yi++) {
+        const frv  = FR_VALS[N_FR-1-yi];
+        const areaAt = Math.pow(ls * lineRate / (frv * 1000), 2);
+        if (areaAt < AREA_MIN || areaAt > AREA_MAX) continue;
+        pts.push({ x: areaToX(areaAt), y: frToY(frv), area: areaAt });
+      }
+      // the 0.5 µm/px bound shares the Nyquist line's exact dash/weight,
+      // since both mark a hard sampling-limit boundary.
+      const dashOn  = ls === 0.5 ? 10 : (isBound ? 8 : 5);
+      const dashOff = 4;
+      const lw      = ls === 0.5 ? 2 : 1;
+      strokeAdaptiveDashed(pts, dashOn, dashOff, lw, maxD);
+
+      // all labels sit at the same fixed height so they stay lined up with
+      // each other and don't drift as flux/other settings change.
+      const fr_label = FR_MAX * 0.7;
+      const area_label = Math.pow(ls * lineRate / (fr_label * 1000), 2);
+      if (area_label > AREA_MIN && area_label < AREA_MAX) {
+        const lx = areaToX(area_label), ly = frToY(fr_label);
+        const dpAtLabel = dprime(area_label, dff, tau, refFlux, refArea);
+        ctx.save();
+        ctx.translate(lx, ly);
+        ctx.rotate(-0.42);
+        ctx.font = `${isBound?'bold ':' '}12px Helvetica Neue,Arial,sans-serif`;
+        ctx.fillStyle = labelColorFor(dpAtLabel, maxD);
+        ctx.fillText(`${ls} µm`, 2, -3);
+        ctx.restore();
+      }
+    });
+  }
+
+  // d′ threshold contour: vertical (area-only), matching F0 ∝ 1/area.
+  // Only the d′=3 detectability threshold is drawn. The heatmap directly
+  // under the line is exactly dpToColor(level), so that's what its own
+  // contrast color is computed from. Thin, no shadow — the "d′=" label sits
+  // immediately to the left of the number, right next to the line itself.
+  const contourLevels = [3];
+  contourLevels.forEach(level => {
+    const critArea = refArea * refFlux * dff * dff * tau * 0.5 / (level * level);
+    const cxRaw = areaToX(critArea);
+    if (cxRaw < 0 || cxRaw > CW) return;
+    const cx = Math.round(cxRaw) + 0.5;
+    const lineColor = contrastColorFor(level, maxD);
+    const labelColor = labelColorFor(level, maxD);
+    ctx.shadowColor = "transparent";
+    ctx.shadowBlur = 0;
+    ctx.strokeStyle = lineColor;
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(cx,0); ctx.lineTo(cx,CH); ctx.stroke();
+
+    const levelLabel = `${level}`;
+    ctx.fillStyle = labelColor;
+    ctx.font = `bold 15px Helvetica Neue,Arial,sans-serif`;
+    ctx.fillText(levelLabel, cxRaw+4, 16);
+    ctx.font = `12px Helvetica Neue,Arial,sans-serif`;
+    const prefixW = ctx.measureText("d′=").width;
+    ctx.fillText("d′=", Math.max(2, cxRaw - prefixW - 2), 16);
+  });
+
+  const nyq  = nyquistHz(tau);
+  const nyqYRaw = frToY(nyq);
+  if (nyqYRaw>=0 && nyqYRaw<=CH) {
+    const nyqY = Math.round(nyqYRaw) + 0.5;
+    const nyqPts = AREA_VALS.map(a => ({ x: areaToX(a), y: nyqY, area: a }));
+    strokeAdaptiveDashed(nyqPts, 10, 4, 2, maxD);
+    const dpAtNyqLabel = dprime(xToArea(90), dff, tau, refFlux, refArea);
+    ctx.font="13px Helvetica Neue,Arial,sans-serif";
+    ctx.fillStyle = labelColorFor(dpAtNyqLabel, maxD);
+    ctx.fillText(`↓ Nyquist limit (${nyq.toFixed(1)} Hz)`,6,nyqYRaw-5);
+  }
+
+  const px  = areaToX(area);
+  const py  = frToY(fr);
+  const dp  = dprime(area, dff, tau, refFlux, refArea);
+  const ls  = showLS ? lineSpacingYNow() : null;
+  const warn = dp<3 || fr<nyq || (showLS && (ls<0.5 || ls>5));
+  const hovering = state.hovering || state.dragging;
+
+  const grd = ctx.createRadialGradient(px,py,0,px,py,hovering?30:22);
+  grd.addColorStop(0, warn?"rgba(255,60,60,0.45)":"rgba(255,255,255,0.3)");
+  grd.addColorStop(1,"rgba(0,0,0,0)");
+  ctx.fillStyle=grd;
+  ctx.beginPath(); ctx.arc(px,py,hovering?30:22,0,Math.PI*2); ctx.fill();
+
+  ctx.beginPath(); ctx.arc(px,py,hovering?13:10,0,Math.PI*2);
+  ctx.strokeStyle=warn?"#ff4040":"#ffffff"; ctx.lineWidth=2.5; ctx.stroke();
+  ctx.beginPath(); ctx.arc(px,py,5,0,Math.PI*2);
+  ctx.fillStyle=warn?"#ff4040":"#ffffff"; ctx.fill();
+}
+
+// ── axes SVG ──────────────────────────────────────────────────────────────
+function dedupeTicks(ticks, toPixel, minGap) {
+  let last = -Infinity;
+  const kept = [];
+  ticks.forEach(v => {
+    const p = toPixel(v);
+    if (p - last >= minGap) { kept.push(v); last = p; }
+  });
+  return kept;
+}
+
+function renderAxes() {
+  const svg = document.getElementById("axesSvg");
+  const allAreaTicks = [0.01,0.02,0.05,0.1,0.25,0.5,1,2,5,10,25];
+  const allFrTicks   = [1,2,5,10,20,30,50,100];
+  const aToX = a => ((Math.log(a)-Math.log(AREA_MIN))/(Math.log(AREA_MAX)-Math.log(AREA_MIN)))*CW;
+  const fToY = fr => CH-((Math.log(fr)-Math.log(FR_MIN))/(Math.log(FR_MAX)-Math.log(FR_MIN)))*CH;
+
+  const areaTicks = dedupeTicks(allAreaTicks, aToX, 34);
+  // fToY() decreases as fr increases, so feed dedupeTicks a list whose
+  // pixel positions increase monotonically (highest fr first) — otherwise
+  // every tick after the first gets dropped as "too close".
+  const frTicks    = dedupeTicks([...allFrTicks].reverse(), fToY, 18);
+
+  let s = "";
+  areaTicks.forEach(v => {
+    const x = aToX(v);
+    s += `<line x1="${x}" y1="${CH}" x2="${x}" y2="${CH+5}" stroke="#000" stroke-width="1"/>`;
+    s += `<text x="${x}" y="${CH+16}" text-anchor="middle" fill="#000" font-size="10" font-family="Helvetica Neue,Arial,sans-serif">${v}</text>`;
+  });
+  frTicks.forEach(v => {
+    const y = fToY(v);
+    s += `<line x1="-5" y1="${y}" x2="0" y2="${y}" stroke="#000" stroke-width="1"/>`;
+    s += `<text x="-8" y="${y+4}" text-anchor="end" fill="#000" font-size="10" font-family="Helvetica Neue,Arial,sans-serif">${v}</text>`;
+  });
+  s += `<text x="${CW/2}" y="${CH+30}" text-anchor="middle" fill="#000" font-size="12" font-family="Helvetica Neue,Arial,sans-serif">FOV area (mm²)</text>`;
+  s += `<text x="-34" y="${CH/2}" text-anchor="middle" fill="#000" font-size="12" font-family="Helvetica Neue,Arial,sans-serif" transform="rotate(-90,-34,${CH/2})">Frame rate (Hz)</text>`;
+
+  svg.setAttribute("viewBox", `${-PAD.l} ${-PAD.t} ${CW+PAD.l+PAD.r} ${CH+PAD.t+PAD.b}`);
+  svg.setAttribute("width", CW+PAD.l+PAD.r);
+  svg.setAttribute("height", CH+PAD.t+PAD.b);
+  svg.style.left = `-${PAD.l}px`;
+  svg.style.top = `-${PAD.t}px`;
+  svg.innerHTML = s;
+}
+
+function renderColorbar() {
+  const svg = document.getElementById("colorbar");
+  const H = CH + PAD.t + PAD.b;
+  const steps = 60;
+  const pt = 10, pb = 34;
+  const maxD = lutMaxNow();
+  let s = "";
+  for (let i=0;i<steps;i++) {
+    const y = pt + (i/steps)*(H-pt-pb);
+    const h = (H-pt-pb)/steps + 1;
+    s += `<rect x="4" y="${y}" width="16" height="${h}" fill="${dpToColor((1-i/steps)*maxD, maxD)}"/>`;
+  }
+  // Ticks scale with the current indicator's LUT max instead of a fixed 0–10.
+  const tickDp = val => (maxD < 3 ? val.toFixed(1) : Math.round(val));
+  [0, 0.2, 0.4, 0.6, 0.8, 1].forEach(frac => {
+    const v = frac * maxD;
+    const y = pt + (1-frac)*(H-pt-pb);
+    s += `<line x1="20" y1="${y}" x2="24" y2="${y}" stroke="#000" stroke-width="1"/>`;
+    s += `<text x="27" y="${y+4}" fill="#000" font-size="10" font-family="Helvetica Neue,Arial,sans-serif">${tickDp(v)}</text>`;
+  });
+  s += `<text x="42" y="${H/2}" text-anchor="middle" fill="#000" font-size="10" font-family="Helvetica Neue,Arial,sans-serif" transform="rotate(90,42,${H/2})">d′</text>`;
+  svg.setAttribute("height", H);
+  svg.innerHTML = s;
+}
+
+// ── readouts ──────────────────────────────────────────────────────────────
+function renderReadouts() {
+  const { dff, tau, refFlux, refArea, showLS } = state;
+  const area = areaMM2Now(), fr = frameRateNow();
+  const dp   = dprime(area, dff, tau, refFlux, refArea);
+  const nyq  = nyquistHz(tau);
+  const lsY  = lineSpacingYNow();
+  const pxX  = pixelSizeXNow();
+  const F0now= calcF0(area, refFlux, refArea);
+
+  const warnDp  = dp<3;
+  const warnTmp = fr<nyq;
+  const warnOv  = showLS && lsY<0.5;
+  const warnUn  = showLS && lsY>5;
+  const anyWarn = warnDp||warnTmp||warnOv||warnUn;
+
+  const rDp = document.getElementById("rDp");
+  rDp.textContent = dp.toFixed(2);
+  rDp.className = "v" + (warnDp ? " warn" : dp>=3 ? " good" : "");
+
+  document.getElementById("rF0").textContent = `${Math.round(F0now)} photon/s`;
+
+  const rLsY = document.getElementById("rLsY");
+  rLsY.textContent = `${lsY.toFixed(2)} µm`;
+  rLsY.className = "v" + ((warnOv||warnUn) ? " warn" : "");
+
+  document.getElementById("rPxX").textContent = `${pxX.toFixed(2)} µm`;
+  document.getElementById("rFov").textContent = `${fmt(state.fovX,0)}×${fmt(state.fovY,0)} µm`;
+  document.getElementById("rFr").textContent = `${fr.toFixed(1)} Hz`;
+
+  const rNyq = document.getElementById("rNyq");
+  rNyq.textContent = `${nyq.toFixed(1)} Hz`;
+  rNyq.className = "v" + (warnTmp ? " warn" : "");
+
+  document.getElementById("rPulsesUm").textContent = pulsesPerMicronCenterNow().toFixed(1);
+  document.getElementById("rPulsesPx").textContent = pulsesPerPixelCenterNow().toFixed(0);
+  document.getElementById("rPulsesNeuron").textContent = `${Math.round(pulsesPerMicronCenterNow()*state.neuronDiameter)} pulses`;
+  document.getElementById("rNeuronPx").textContent = `${(state.neuronDiameter/pxX).toFixed(1)} px`;
+
+  const panel = document.getElementById("statusPanel");
+  if (anyWarn) {
+    let lines = "";
+    if (warnDp)  lines += `<div class="warn-line">· \\(d' < 3\\): single-spike detection unreliable</div>`;
+    if (warnTmp) lines += `<div class="warn-line">· Frame rate below Nyquist for τ=${(tau*1000).toFixed(0)} ms</div>`;
+    if (warnOv)  lines += `<div class="warn-line">· Spatially oversampled (&lt;0.5 µm/px)</div>`;
+    if (warnUn)  lines += `<div class="warn-line">· Spatially undersampled (&gt;5 µm/px)</div>`;
+    panel.innerHTML = `<div class="panel warn-panel"><div class="warn-title">⚠ WARNINGS</div>${lines}</div>`;
+  } else {
+    panel.innerHTML = `<div class="panel ok-panel"><div class="ok-line">✓ All parameters nominal</div></div>`;
+  }
+  typeset();
+}
+
+function render() {
+  syncControls();
+  renderCanvas();
+  renderAxes();
+  renderColorbar();
+  renderReadouts();
+}
+
+// ── responsive sizing: chart is a SQUARE that fits both the available ────
+// width AND the full height of the sidebar (.controls).
+const canvasArea = document.querySelector(".canvas-area");
+const controlsEl = document.querySelector(".controls");
+function updateSize() {
+  const totalW = canvasArea.clientWidth;
+  const availW = Math.max(360, Math.round(totalW - COLORBAR_W));
+  const sidebarH = controlsEl.getBoundingClientRect().height;
+  const availH = Math.max(280, Math.round(sidebarH - PAD.t - PAD.b));
+  const side = Math.min(availW, availH);
+  if (side === CW && side === CH) return;
+  CW = side; CH = side;
+  canvas.width = CW; canvas.height = CH;
+  render();
+}
+window.addEventListener("resize", () => requestAnimationFrame(updateSize));
+if (window.ResizeObserver) {
+  new ResizeObserver(() => requestAnimationFrame(updateSize)).observe(canvasArea);
+  new ResizeObserver(() => requestAnimationFrame(updateSize)).observe(controlsEl);
+}
+
+// ── mouse interaction: dragging sets FOV (square) + solves lines/frame ───
+function getXY(e) {
+  const r = canvas.getBoundingClientRect();
+  return { x: e.clientX - r.left, y: e.clientY - r.top };
+}
+function setPointFromPixel(x, y) {
+  const area = xToArea(x);
+  const fr   = yToFr(y);
+  // Horizontal drag → FOV (X = Y, snapped to the nearest µm).
+  const side_um = Math.round(Math.sqrt(area) * 1000);
+  state.fovX = side_um;
+  state.fovY = side_um;
+  // Vertical drag → frame rate, via Lines/frame (Y res); Lines/s stays
+  // fixed. Snapped to the nearest 10 lines/frame to avoid float noise.
+  const rawLinesPerFrame = linesPerSecEff() / fr;
+  state.linesPerFrame = Math.max(10, Math.round(rawLinesPerFrame / 10) * 10);
+  syncControls();
+  render();
+}
+canvas.addEventListener("mousedown", e => {
+  const {x,y} = getXY(e);
+  state.dragging = true;
+  canvas.classList.add("dragging");
+  setPointFromPixel(x,y);
+});
+canvas.addEventListener("mousemove", e => {
+  if (!state.dragging) return;
+  const {x,y} = getXY(e);
+  setPointFromPixel(x,y);
+});
+window.addEventListener("mouseup", () => {
+  state.dragging = false;
+  canvas.classList.remove("dragging");
+  render();
+});
+canvas.addEventListener("mouseenter", () => { state.hovering = true; render(); });
+canvas.addEventListener("mouseleave", () => { state.hovering = false; state.dragging = false; canvas.classList.remove("dragging"); render(); });
+
+render();
+updateSize();
+typeset();
+</script>
+</body>
+</html>
