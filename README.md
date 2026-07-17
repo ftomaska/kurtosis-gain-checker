@@ -41,7 +41,7 @@ pip install numpy scipy matplotlib pillow tifffile
 python kurtosis_checker.py
 ```
 
-That's everything you need if you already have registered TIFFs saved (see Case 1 below). CaImAn is an optional, heavier dependency only needed if Suite2p's `reg_tif` export is missing (Case 2). `h5py` is an optional extra only needed if you're loading a pre-motion-corrected `.mat` movie saved in MATLAB's v7.3/HDF5 format (Case 3).
+That's everything you need if you already have registered TIFFs saved (see Case 1 below). CaImAn is an optional, heavier dependency only needed if Suite2p's `reg_tif` export is missing (Case 2), if a Raw Movie needs motion correction, or if you choose CNMF segmentation. `h5py` is an optional extra only needed if you're loading a `.mat` movie saved in MATLAB's v7.3/HDF5 format.
 
 ## Gain Estimation: two setup cases
 
@@ -85,29 +85,34 @@ Once CaImAn is installed:
 
 **Saving the motion-corrected movie:** the **"Save motion-corrected TIFF (reg_tif)"** setting (checked by default) writes the NormCorre output as `reg_tif/file000_chan0.tif`-style chunks next to the source data, matching Suite2p's own naming convention. Next time you load the same folder, the tool finds this `reg_tif/` export and uses it directly.
 
-**CNMF segmentation prompt:** any time there's no `F.npy` available for the loaded dataset, the tool asks whether to run CaImAn's CNMF on the registered movie to detect cells and extract traces on the spot. Accepting fills in the flux panel using CNMF-derived footprints; the results panel labels these cells "CaImAn CNMF (unverified — sanity-check!)" as a reminder to check footprints/traces before trusting the numbers. The **"CNMF cell radius (px)"** setting (default 6) controls the expected cell size (`gSig`) passed to CNMF.
+**Cell segmentation when there's no `F.npy`:** any time there's no `F.npy` available for the loaded dataset — Case 2, the Raw Movie flow below, or the no-Suite2p fallback further down — the tool asks how to fill the photon-flux panel, with three choices: run CaImAn **CNMF** on the registered movie to detect cells and extract traces automatically; draw **Manual ROIs** yourself; or **Skip** and leave the flux panel empty (the gain estimate itself doesn't need cell traces either way).
 
-Right before that prompt, the tool shows a zoomable/pannable **mean-projection viewer** of the just-loaded registered movie, so you can count how many pixels a cell spans. It then asks directly for the cell diameter (px), converts it to a radius, and writes it into the **"CNMF cell radius (px)"** setting.
+Right before that choice, the tool shows a zoomable/pannable **mean-projection viewer** of the just-loaded registered movie, so you can count how many pixels a cell spans. It then asks directly for the cell diameter (px), converts it to a radius, and writes it into the **"CNMF cell radius (px)"** setting.
 
-**Component-quality filtering:** after CNMF finds candidate components, the tool calls CaImAn's own `evaluate_components()` and keeps only the top 60% by whichever quality score that produces — CaImAn's CNN-classifier probability if a CNN model is installed and usable, otherwise the `r_value` spatial-consistency score as a fallback. If quality evaluation isn't available at all, all components are kept.
+**CNMF:** fills the flux panel using CNMF-derived footprints; the results panel labels these cells "CaImAn CNMF (unverified — sanity-check!)" as a reminder to check footprints/traces before trusting the numbers. The **"CNMF cell radius (px)"** setting (default 6) controls the expected cell size (`gSig`) passed to CNMF. After CNMF finds candidate components, the tool calls CaImAn's own `evaluate_components()` and keeps only the top 60% by whichever quality score that produces — CaImAn's CNN-classifier probability if a CNN model is installed and usable, otherwise the `r_value` spatial-consistency score as a fallback. If quality evaluation isn't available at all, all components are kept.
 
-A **footprint sanity-check popup** shows the mean projection with the surviving masks outlined in green and the quality-filtered-out ones in red. It's non-blocking and has the same zoom/pan toolbar as the mean-projection viewer.
+**Manual ROIs:** opens a polygon-drawing tool over the same mean projection — click to place vertices, click the first vertex again (or press Enter) to close the polygon, then **Add ROI** to bank it and start the next one, and **Done** when finished. Each banked polygon becomes a cell, with its photon flux computed the same way as every other path: an unweighted sum of raw pixel values over the ROI mask. Results are labeled "Manual ROIs (user-drawn)" in the flux panel.
 
-The animation runs on Tk's main-thread event loop (~30fps) while the actual PTC/CNMF computation runs in a separate background thread.
+A **footprint sanity-check popup** shows the mean projection with the resulting masks outlined in green (and, for CNMF, the quality-filtered-out ones in red) — non-blocking, with the same zoom/pan toolbar as the mean-projection viewer, for both CNMF and Manual ROIs.
 
-### Case 3 (optional) — Load an already motion-corrected movie from a .mat file
+The animation runs on Tk's main-thread event loop (~30fps) while the actual PTC/segmentation computation runs in a separate background thread.
 
-If motion correction was already done somewhere else (e.g. in MATLAB), or NormCorre keeps failing with `OSError: [Errno 28] No space left on device`, skip NormCorre entirely with the **"🎬 Load .mat Movie"** button (in the sidebar's LOAD card, next to Suite2p Folder).
+### Raw Movie — load a TIFF, .mat, or .npy movie directly
+
+The **"🎬 Raw Movie"** button (in the sidebar's LOAD card, next to Suite2p Folder) loads a movie straight from a file instead of a Suite2p folder. It asks two questions:
+
+1. **Already motion corrected, or raw?** "Already motion corrected" loads the movie as-is and skips NormCorre entirely — useful when motion correction was already done somewhere else (e.g. in MATLAB), or when NormCorre keeps failing with `OSError: [Errno 28] No space left on device`. "Raw — needs motion correction" runs it through the same NoRMCorre/CaImAn pipeline as Case 2, exactly as if it were a manually-selected raw TIFF folder — for a raw `.mat`/`.npy` source, the movie is first written out to temporary TIFF chunk files so it can go through that same pipeline unchanged.
+2. **File format:** TIFF, `.mat`, or `.npy`.
+
+For `.mat` files, both classic (pre-v7.3) and v7.3/HDF5 formats are supported (the latter needs `pip install h5py`); the expected matrix shape is **(x, y, time)**, MATLAB's own `size(mov)` convention, and if the file has more than one 3D array in it, the largest one is picked automatically. For `.npy` files, the array is expected already shaped **(time, y, x)** — numpy's own natural frame-stacking order, no axis transpose applied. Either way, a confirmation dialog shows the detected shape before committing.
 
 The **"Scratch folder"** setting in the sidebar's MOTION CORRECTION card (click **"📁 Choose…"**, or **"Reset"** to go back to CaImAn's default) points NormCorre's memmap writes at a folder on a drive with more room, for the disk-space case above.
 
-Pick a `.mat` file containing a 3D numeric matrix shaped **(x, y, time)** — MATLAB's own `size(mov)` convention. Both classic (pre-v7.3) and v7.3/HDF5 `.mat` files are supported (the latter needs `pip install h5py`); if the file has more than one 3D array in it, the largest one is picked automatically. A confirmation dialog shows the detected variable name and the frame count / pixel dimensions it inferred before committing.
-
-This mode has no Suite2p `F.npy`, so — like the manual-TIFF fallback below — only the gain estimate is available by default; the per-cell photon-flux panel needs the CNMF fallback (see above) to get cell traces.
+A Raw Movie load has no Suite2p `F.npy`, so it goes through the same three-way segmentation choice (CNMF / Manual ROIs / Skip) described above to fill in the photon-flux panel.
 
 ### No Suite2p output at all
 
-If the selected folder has no `ops.npy` anywhere, the tool offers to run the PTC gain estimate directly on manually-selected TIFF file(s), bypassing Suite2p entirely. Without `F.npy`, only the gain estimate is available. A **"Skip motion correction"** setting lets you tell it the TIFF is already registered, avoiding an unnecessary NormCorre pass.
+If the selected folder has no `ops.npy` anywhere, the tool offers to run the PTC gain estimate directly on manually-selected TIFF file(s), bypassing Suite2p entirely. A **"Skip motion correction"** setting lets you tell it the TIFF is already registered, avoiding an unnecessary NormCorre pass. This path also has no `F.npy`, so it goes through the same three-way segmentation choice (CNMF / Manual ROIs / Skip) described above.
 
 ## Memory behavior
 
