@@ -22,7 +22,7 @@ class RecordingCanvas:
         self.calls.append(("create_image", c, kw.get("tags")))
         return len(self.calls)
     def create_line(self, *c, **kw):
-        self.calls.append(("create_line", c, kw.get("tags")))
+        self.calls.append(("create_line", c, kw.get("tags"), kw.get("fill")))
         return len(self.calls)
     def create_text(self, *c, **kw):
         return len(self.calls)
@@ -151,6 +151,29 @@ try:
     assert len(bar2._crumbs) <= app.DonutNeuronBar.MAX_CRUMBS
     print("crumbs accumulate across repeated eat-cycles and respect MAX_CRUMBS: OK")
 
+    # ── the pile rises (buries the legs) as more crumbs accumulate, per
+    # Filip's "keep the buildup of crumbs continuing slowly burying the
+    # neuron" -- each new batch should spawn at a smaller (more negative)
+    # oy than an earlier batch, and the rise should be capped rather than
+    # unbounded. ──────────────────────────────────────────────────────────
+    bar2b = make_bar()
+    bar2b._crumbs = []
+    bar2b._spawn_crumbs()
+    early_max_oy = max(c[1] for c in bar2b._crumbs)  # first batch's own top
+    for _ in range(80):
+        bar2b._spawn_crumbs()
+    late_oys = [c[1] for c in bar2b._crumbs[-4:]]  # a recent batch
+    assert max(late_oys) < early_max_oy, \
+        "later crumb batches should spawn higher (smaller oy) than the very first batch"
+    # rise is capped -- keep spawning well past the point it should have
+    # saturated and confirm oy never drops below the documented floor
+    for _ in range(400):
+        bar2b._spawn_crumbs()
+    min_oy = min(c[1] for c in bar2b._crumbs)
+    assert min_oy >= -(bar2b.CRUMB_MAX_RISE + 6 + 1), \
+        f"pile rise should be capped at CRUMB_MAX_RISE, got a crumb as high as oy={min_oy}"
+    print("crumb pile rises with accumulation, capped rather than unbounded: OK")
+
     # ── set_busy(True) sweeps all crumbs away, then keeps sweeping ───────
     # (Filip: "the broom should keep sweeping until the computation there
     # is done" -- an initial pass clears the pile, then the broom loops
@@ -255,16 +278,24 @@ try:
     bar6.calls.clear()
     bar6._render(10.0)
     line_calls_a = [c for c in bar6.calls if c[0] == "create_line" and c[2] == "handrub"]
-    # 2 forearms x (1 main stroke + 2 finger ticks) = 6 line segments
-    assert len(line_calls_a) == 6, \
-        f"expected 6 hand-rub line segments during the crumbs pose, got {len(line_calls_a)}"
+    # 2 forearms x (1 main stroke + 2 finger ticks) x (halo pass + ink
+    # pass) = 12 line segments -- each stroke is drawn twice (a wider
+    # light halo, then a narrower dark ink line on top) so it reads as
+    # dark against the dark canvas, matching the character's own linework.
+    assert len(line_calls_a) == 12, \
+        f"expected 12 hand-rub line segments (halo+ink x 6 strokes) during the crumbs pose, got {len(line_calls_a)}"
+    ink_calls_a = [c for c in line_calls_a if c[3] == app.DonutNeuronBar.HANDRUB_COLOR]
+    halo_calls_a = [c for c in line_calls_a if c[3] == app.DonutNeuronBar.HANDRUB_HALO_COLOR]
+    assert len(ink_calls_a) == 6 and len(halo_calls_a) == 6, \
+        "expected an even 6/6 split between dark ink strokes and their light halo strokes"
     bar6.calls.clear()
     bar6._render(10.0 + 1.0 / bar6.HANDRUB_HZ / 2)  # quarter-cycle later
     line_calls_b = [c for c in bar6.calls if c[0] == "create_line" and c[2] == "handrub"]
-    assert len(line_calls_b) == 6
+    assert len(line_calls_b) == 12
     assert line_calls_a[0][1] != line_calls_b[0][1], \
         "hand-rub forearms should move across ticks (pivoting), not sit static"
     print("hand-rub forearms pivot and animate during the crumbs pose: OK")
+    print("hand-rub strokes are dark ink with a light halo, matching the character's linework: OK")
 
     # not drawn (and cleaned up) during any other pose
     bar7 = make_bar()
