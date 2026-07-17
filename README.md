@@ -2,11 +2,18 @@
 
 A desktop tool for two-photon calcium imaging QC, built around Suite2p output. It has three modes, toggled from the top bar:
 
-- **Kurtosis** — sorts and visualizes ROI traces by kurtosis or SNR to spot noisy or non-cell-like extractions.
-- **Gain Estimation** — runs a photon-transfer-curve ("hockey stick") analysis on a Suite2p recording to recover true PMT/camera gain (ADU/photon) and convert each cell's fluorescence to photons/cell/s.
-- **Neuropil Sweep** — Suite2p only. Sweeps the neuropil-subtraction coefficient alpha (`Fcorr = rawF - alpha*Fneu`) and plots the mean ± SEM pairwise cell-cell correlation at each alpha, to help pick a good alpha for your recording. See its own section below.
+- **Kurtosis** — sorts and visualizes ROI traces by kurtosis or SNR to let the user assess whether one or the other can sort their data better
+- **Gain Estimation** — runs a photon-transfer-curve analysis on a Suite2p recording to estimate PMT/camera gain (ADU/photon) and convert each cell's fluorescence to photons/cell/s. Option to use raw recordings that can be motion corrected (requires caiman package) and segmented.
+- **Neuropil Sweep** — Suite2p only. Sweeps the neuropil-subtraction coefficient alpha (`Fcorr = rawF - alpha*Fneu`) and plots the mean ± SEM pairwise cell-cell correlation at each alpha, to help pick a good alpha for your recording.
 
-This README focuses on **Gain Estimation** mode, since that's the part with real setup decisions.
+## Installation
+
+```
+pip install numpy scipy matplotlib pillow tifffile
+python kurtosis_checker.py
+```
+
+That's everything you need if you already have registered TIFFs saved (see Case 1 below). CaImAn is an optional, heavier dependency only needed if Suite2p's `reg_tif` export is missing (Case 2), if a Raw Movie needs motion correction, or if you choose CNMF segmentation. `h5py` is optional, only needed if you're loading a `.mat` movie saved in MATLAB's v7.3/HDF5 format.
 
 ## Demo
 
@@ -16,32 +23,14 @@ This README focuses on **Gain Estimation** mode, since that's the part with real
 
 ## Interface
 
-**Layout:** the Gain Estimation and Neuropil Sweep tabs each have an always-visible left sidebar (Load buttons, then settings grouped into rounded-corner cards, then Run Analysis), scrollable independently once its cards outgrow the window height. The Kurtosis tab has a top-bar Load Data + collapsible Settings, plus a **▶ Plot** button. A busy animation (chameleon lobbing photons at the neuron) takes over the main output area while a Gain Estimation or Neuropil Sweep run is in progress, and swaps back to the plot when it's done. Every sidebar parameter has a small "?" glyph next to it — click it to toggle a popup explaining what the setting does.
+**Layout:** the Gain Estimation and Neuropil Sweep tabs each have an always-visible left sidebar (Load buttons, then settings grouped into rounded-corner cards, then Run Analysis), scrollable independently once its cards outgrow the window height. The Kurtosis tab has a top-bar Load Data + collapsible Settings, plus a **▶ Plot** button. Every sidebar parameter has a small "?" glyph next to it — click it to toggle a popup explaining what the setting does.
 
-**De-whimsify the GUI:** a button at the far right of the top bar, visible on every tab. Click it and every creative busy-animation in the app — the chameleon/neuron photon-volley bar and the neuron-art distortion in the motion-correction popup — is replaced with a plain progress indicator. It also strips the decorative bits off the two idle splash screens (the Gain tab's quote and the Neuropil Sweep tab's donut-eating animation), leaving just plain guidance text. Click again to bring everything back.
+**De-whimsify the GUI:** a button at the far right of the top bar, visible on every tab. Click it and every 'creative' 100% not ai generated animation in the app is removed or replaced with a generic loading bar. I did go a little bit overboard. If you want it to go away that's totally fair. But if you change your mind just click again to bring all the whimsy back.
 
-**Neuropil Sweep idle screen:** before you've run a sweep, the plot area shows a live animation of a neuron working through a donut (approach → bite → chew → cleaning its hands → crumbs, looping). Crumbs from each pass accumulate on the ground and only clear once a real sweep starts, at which point a broom sweeps the pile clean and keeps sweeping for as long as the computation is running. The neuron is centered and scales with the widget's on-screen size.
+**Character "art":** the artwork is hand-drawn, rasterized from vector source files and embedded directly in `kurtosis_checker.py` as base64 PNG data — no separate `art/` folder is needed to run the app. 
 
-**Kurtosis tab splash:** with whimsy on, the idle Kurtosis-tab screen shows four neurons each examining a trace of different peakiness/kurtosis, built from the source vector artwork's own layers for a crisp, high-resolution result. De-whimsify swaps to the plain "K-trace" logo instead.
+**PTC reference citation:** the Gain Estimation sidebar's Export card links directly to the Lees et al. 2025 photon-transfer-curve reference protocol citation, with the DOI as a clickable link. (See Box 8 and Fig.16).
 
-**Progress animation (Gain Estimation tab):** a chameleon lobs photon squiggles at a cartoon neuron for the duration of Run Analysis, with an impact tally counter and a random idle reaction pose between hits. The neuron's return shot flies to a fixed midpoint where a slab-hand rises out of a hole to catch it, then drags it back down. During NormCorre motion correction, a separate popup shows a progress bar plus the neuron redrawn with a scanline distortion effect that resolves into the clean drawing as the correction proceeds.
-
-**Rounded corners:** buttons and entry fields throughout the app are drawn as rounded pills rather than square-cornered native widgets.
-
-**Sharper outlines:** every character/photon has a white silhouette traced around its outer edge (via a distance-transform-based anti-aliased outline) so it reads clearly against the dark canvas background.
-
-**Character art:** the artwork is hand-drawn, rasterized from vector source files and embedded directly in `kurtosis_checker.py` as base64 PNG data — no separate `art/` folder is needed to run the app. Character green fill matches the "kept cell" green used in the neuropil mask viewer (`#2ecc71`).
-
-**PTC reference citation:** the Gain Estimation sidebar's Export card links directly to the Lees et al. 2025 photon-transfer-curve reference protocol citation, with the DOI as a clickable link.
-
-## Installation
-
-```
-pip install numpy scipy matplotlib pillow tifffile
-python kurtosis_checker.py
-```
-
-That's everything you need if you already have registered TIFFs saved (see Case 1 below). CaImAn is an optional, heavier dependency only needed if Suite2p's `reg_tif` export is missing (Case 2), if a Raw Movie needs motion correction, or if you choose CNMF segmentation. `h5py` is an optional extra only needed if you're loading a `.mat` movie saved in MATLAB's v7.3/HDF5 format.
 
 ## Gain Estimation: two setup cases
 
@@ -56,12 +45,12 @@ If you ran Suite2p with the `reg_tif` option enabled, your plane folder has a `r
 1. **Suite2p Folder** → select the folder. The status bar shows the full resolved path plus a `reg_tif found (N file(s))` / `no usable reg_tif` hint.
 2. Click **Run Analysis** (bottom of the sidebar).
 3. The tool reads only the chunk files it needs for a contiguous window of frames (see *Memory behavior* below), computes the PTC gain fit, and shows:
-   - Left panel: the hockey-stick plot (mean vs. variance, shot-noise fit, read-noise floor)
-   - Right panel: per-cell photon flux histogram (median ± bootstrap SEM)
+   - Left panel: the Photon Transfer Curve (mean vs. variance, shot-noise fit)
+   - Right panel: per-cell photon flux histogram (median)
 
 **Notes:**
 - Suite2p's own `data.bin` binary is never used as a fallback, even if present — it's a scratch/working file Suite2p can overwrite on a later run. If there's no `reg_tif` export, the tool goes straight to Case 2.
-- File matching inside `reg_tif/` is case-insensitive and doesn't require `chan0` in the filename. If a `reg_tif/` folder exists but has no readable TIFFs inside it, the tool raises an error listing that folder's contents.
+- File matching inside `reg_tif/` is case-insensitive and doesn't require `chan0` in the filename. If a `reg_tif/` folder exists but has no readable TIFFs inside it, the tool raises an error listing that folder's contents. If you have multiple channels maybe copy them out to a separate file. Or email me. If this video gets 10 likes I will add the channel selection option.
 
 ### Case 2 (optional) — You don't have motion-corrected TIFFs saved
 
@@ -85,17 +74,18 @@ Once CaImAn is installed:
 
 **Saving the motion-corrected movie:** the **"Save motion-corrected TIFF (reg_tif)"** setting (checked by default) writes the NormCorre output as `reg_tif/file000_chan0.tif`-style chunks next to the source data, matching Suite2p's own naming convention. Next time you load the same folder, the tool finds this `reg_tif/` export and uses it directly.
 
-**Cell segmentation when there's no `F.npy`:** any time there's no `F.npy` available for the loaded dataset — Case 2, the Raw Movie flow below, or the no-Suite2p fallback further down — the tool asks how to fill the photon-flux panel, with three choices: run CaImAn **CNMF** on the registered movie to detect cells and extract traces automatically; draw **Manual ROIs** yourself; or **Skip** and leave the flux panel empty (the gain estimate itself doesn't need cell traces either way).
+**Cell segmentation when there's no `F.npy`:** any time there's no `F.npy` available for the loaded dataset — Case 2, the Raw Movie flow below, or the no-Suite2p fallback further down — the tool asks how to fill the photon-flux panel, with three choices: run CaImAn **CNMF** on the registered movie to detect cells and extract traces automatically; draw **Manual ROIs** yourself; or **Skip** and leave the flux panel empty (the gain estimate itself doesn't need cell traces).
 
 Right before that choice, the tool shows a zoomable/pannable **mean-projection viewer** of the just-loaded registered movie, so you can count how many pixels a cell spans. It then asks directly for the cell diameter (px), converts it to a radius, and writes it into the **"CNMF cell radius (px)"** setting.
 
 **CNMF:** fills the flux panel using CNMF-derived footprints; the results panel labels these cells "CaImAn CNMF (unverified — sanity-check!)" as a reminder to check footprints/traces before trusting the numbers. The **"CNMF cell radius (px)"** setting (default 6) controls the expected cell size (`gSig`) passed to CNMF. After CNMF finds candidate components, the tool calls CaImAn's own `evaluate_components()` and keeps only the top 60% by whichever quality score that produces — CaImAn's CNN-classifier probability if a CNN model is installed and usable, otherwise the `r_value` spatial-consistency score as a fallback. If quality evaluation isn't available at all, all components are kept.
+Note: CNMF might run for a while. I was considering adding cellpose, but we already have CaImAn from motion correction and I want to keep the number of dependencies minimal. I do like cellpose though. 
 
-**Manual ROIs:** opens a polygon-drawing tool over the same mean projection — click to place vertices, click the first vertex again (or press Enter) to close the polygon, then **Add ROI** to bank it and start the next one, and **Done** when finished. Each banked polygon becomes a cell, with its photon flux computed the same way as every other path: an unweighted sum of raw pixel values over the ROI mask. Results are labeled "Manual ROIs (user-drawn)" in the flux panel.
+**Manual ROIs:** opens a polygon-drawing tool over the same mean projection — click to place points, click the first point again (or press Enter) to close the polygon, then **Add ROI** to glue it on and start the next one, and **Done** when finished. Each banked polygon becomes a cell, with its photon flux computed the same way as every other path: an unweighted sum of raw pixel values over the ROI mask. Results are labeled "Manual ROIs (user-drawn)" in the flux panel.
 
 A **footprint sanity-check popup** shows the mean projection with the resulting masks outlined in green (and, for CNMF, the quality-filtered-out ones in red) — non-blocking, with the same zoom/pan toolbar as the mean-projection viewer, for both CNMF and Manual ROIs.
 
-The animation runs on Tk's main-thread event loop (~30fps) while the actual PTC/segmentation computation runs in a separate background thread.
+The animation runs on Tk's main-thread event loop (~30fps) while the actual PTC/segmentation computation runs in a separate background thread. That doesn't mean the animation isn't slowing down the compute time, but it is so worth it.
 
 ### Raw Movie — load a TIFF, .mat, or .npy movie directly
 
@@ -116,7 +106,7 @@ If the selected folder has no `ops.npy` anywhere, the tool offers to run the PTC
 
 ## Memory behavior
 
-Gain Estimation mode is deliberately conservative about RAM:
+Gain Estimation mode is deliberately conservative about RAM as it kept crashing my laptop:
 
 - The registered movie is only loaded when you click **Run Analysis** — never on folder load, never on tab switch.
 - Above ~1.5 GB estimated usage, a confirmation dialog shows the estimate before loading anything.
@@ -124,6 +114,7 @@ Gain Estimation mode is deliberately conservative about RAM:
 - Frame subsampling (`Max frames` setting) always picks a contiguous window of frames, not evenly-spaced samples. By default that window is auto-centered on the recording; the **"Start frame"** setting lets you pin it to an explicit starting index instead.
 - `reg_tif`/raw-TIFF arrays are kept in their native dtype (typically int16) rather than eagerly upcast to float32; the PTC computation streams frame-pairs in chunks so peak memory doesn't scale with total recording length.
 - The raw movie array is dropped from memory immediately after the PTC bins are computed.
+- Spatial binning is possible to reduce size, but is set to 1 by default (no binning).
 
 ## Key settings (Gain Estimation)
 
@@ -143,7 +134,7 @@ Gain Estimation mode is deliberately conservative about RAM:
 | Use baseline (F0) for flux | on | Converts each cell's own low-percentile baseline value directly to photons/s, instead of the trace's plain mean |
 | Baseline pctile | 30 | Which percentile of each cell's own raw trace counts as its baseline (F0) when the above is checked |
 
-Photon flux uses **raw F only** — no neuropil subtraction — consistent with the Wilt et al. convention that F0 includes all detected photons (signal + background light). F itself is never modified for the flux calculation; what changes is which per-cell scalar gets converted to photons/s. With **Use baseline (F0) for flux** unchecked, that's the plain per-frame mean of the whole trace. Checked (the default), it's each cell's own baseline — the `Baseline pctile`-th percentile of its raw trace — converted directly.
+Photon flux uses **raw F only** — no neuropil subtraction — consistent with the Wilt et al. (2013) convention that F0 includes all detected photons (signal + background light). F itself is never modified for the flux calculation; what changes is which per-cell scalar gets converted to photons/s. With **Use baseline (F0) for flux** unchecked, that's the plain per-frame mean of the whole trace. Checked (the default), it's each cell's own baseline — the `Baseline pctile`-th percentile of its raw trace — converted directly.
 
 Both Suite2p's `F.npy` and CaImAn CNMF traces are put on a comparable per-cell-total scale before this conversion, but they get there differently: CNMF traces (via `footprints_to_raw_traces`) are already a true unweighted pixel sum over each ROI mask. Suite2p's `F.npy` normalizes its per-pixel ROI weights (`lam`) to sum to 1 before extraction, so it's actually a weighted mean pixel value. The Suite2p loader corrects for this at load time by multiplying `F` (and `Fneu`) by each ROI's pixel count (`npix`, from `stat.npy`), recovering a per-cell total that matches the CNMF path's convention.
 
@@ -165,7 +156,7 @@ The third tab, Suite2p-only (needs `F.npy`, `Fneu.npy`, `stat.npy`, and `iscell.
 
 **What it does:** sweeps the neuropil-subtraction coefficient alpha across a configurable range (default 0–2, step 0.05) in `Fcorr = rawF - alpha*Fneu`, and at each alpha computes the mean ± SEM of the off-diagonal pairwise Pearson correlation between cells (only cells with `iscell == 1`). The plot marks the alpha whose mean correlation is closest to zero with a dashed line, as a starting-point suggestion.
 
-**Exclusion distance (default 4px):** cell pairs whose ROI masks come within this many pixels of each other are dropped from every alpha's pairwise-correlation average. Distance is the exact nearest-pixel (edge-to-edge) gap between the two ROIs' `stat.npy` pixel masks, not centroid-to-centroid.
+**Exclusion distance (default 4px):** cell pairs whose ROI masks come within this many pixels of each other are dropped from every alpha's pairwise-correlation average. Distance is the exact nearest-pixel (edge-to-edge) gap between the two ROIs' `stat.npy` pixel masks, not centroid-to-centroid. This is due to non-cells often existing at FOV borders in suite2p segmented datasets. 
 
 **Cell filter (optional):** the **"Filter by kurtosis"** checkbox restricts the sweep to cells with Pearson kurtosis (`fisher=False`, normal ≈ 3) above a threshold (default 5), computed on the raw, un-subtracted trace before anything else runs.
 
