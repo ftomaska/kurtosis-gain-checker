@@ -22,6 +22,7 @@ class RecordingCanvas:
         self.calls.append(("create_image", c, kw.get("tags")))
         return len(self.calls)
     def create_line(self, *c, **kw):
+        self.calls.append(("create_line", c, kw.get("tags")))
         return len(self.calls)
     def create_text(self, *c, **kw):
         return len(self.calls)
@@ -29,6 +30,9 @@ class RecordingCanvas:
         return len(self.calls)
     def create_oval(self, *c, **kw):
         self.calls.append(("create_oval", c, kw.get("tags")))
+        return len(self.calls)
+    def create_arc(self, *c, **kw):
+        self.calls.append(("create_arc", c, kw.get("tags")))
         return len(self.calls)
     def bbox(self, tag_or_id):
         return (0, 0, 50, 12)
@@ -238,6 +242,39 @@ try:
     image_tags = [c[2] for c in bar5.calls if c[0] == "create_image"]
     assert "broom" in image_tags, "broom should be drawn while busy"
     print("busy _render draws the broom: OK")
+
+    # ── "hands rubbing to clear off crumbs" -- two forearm strokes (each
+    # with a couple of finger-tick strokes) pivot at fixed shoulder
+    # points during the "crumbs" pose, swinging their hand-tip ends
+    # toward/apart from each other, per Filip's "I was hoping for the
+    # hands to move at elbows against each other." Low-effort/procedural
+    # (no new hand-drawn frame), same spirit as the chew jitter. ───────
+    bar6 = make_bar()
+    bar6._mode = "idle"
+    bar6._idle_seq_idx = bar6.IDLE_SEQUENCE.index(("crumbs", 0.5))
+    bar6.calls.clear()
+    bar6._render(10.0)
+    line_calls_a = [c for c in bar6.calls if c[0] == "create_line" and c[2] == "handrub"]
+    # 2 forearms x (1 main stroke + 2 finger ticks) = 6 line segments
+    assert len(line_calls_a) == 6, \
+        f"expected 6 hand-rub line segments during the crumbs pose, got {len(line_calls_a)}"
+    bar6.calls.clear()
+    bar6._render(10.0 + 1.0 / bar6.HANDRUB_HZ / 2)  # quarter-cycle later
+    line_calls_b = [c for c in bar6.calls if c[0] == "create_line" and c[2] == "handrub"]
+    assert len(line_calls_b) == 6
+    assert line_calls_a[0][1] != line_calls_b[0][1], \
+        "hand-rub forearms should move across ticks (pivoting), not sit static"
+    print("hand-rub forearms pivot and animate during the crumbs pose: OK")
+
+    # not drawn (and cleaned up) during any other pose
+    bar7 = make_bar()
+    bar7._mode = "idle"
+    bar7._idle_seq_idx = bar7.IDLE_SEQUENCE.index(("chew", 0.4))
+    bar7.calls.clear()
+    bar7._render(10.0)
+    assert not [c for c in bar7.calls if c[0] == "create_line" and c[2] == "handrub"], \
+        "no hand-rub forearms outside the crumbs pose"
+    print("hand-rub forearms absent outside the crumbs pose: OK")
 finally:
     app.time.monotonic = orig_monotonic
 

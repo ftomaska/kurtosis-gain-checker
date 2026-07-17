@@ -458,6 +458,30 @@ try:
     assert bar4._flight_frac is not None and bar4._out_landed == 0, \
         "a new volley should launch once the hand is hidden and the pause has elapsed"
     print("a new volley launches once the hand is hidden and the pause has elapsed -- OK")
+
+    # --- regression for Filip's "the hand catching the green photon stays
+    # a bit too long and gets hit by the red double coming from the
+    # chameleon": the outbound flight path runs straight through the
+    # hand's rest spot (mid_pt, at flight_frac==0.5), so there should be a
+    # comfortable margin between "hand fully hidden" and "the next
+    # volley's shot passing back through that spot", not just a
+    # technically-non-negative one -- some slack is what actually absorbs
+    # the GIL-related rendering jitter noted elsewhere in this file. ----
+    dur = 0.55
+    time_to_midpoint = dur * 0.5
+    margin = app.PhotonNeuronBar.NEXT_VOLLEY_PAUSE_S - 0  # pause is measured
+    # from the moment the hand goes hidden, and the shot can only launch
+    # after that pause AND after the hand-hidden guard clears, so the
+    # earliest a shot could reach the midpoint is PAUSE + time_to_midpoint
+    # after the hand goes hidden -- assert that's a comfortably large
+    # margin (at least 1s), and that hold+drag (how long the hand lingers
+    # after catching) is short relative to it.
+    total_margin_s = app.PhotonNeuronBar.NEXT_VOLLEY_PAUSE_S + time_to_midpoint
+    assert total_margin_s >= 1.0, \
+        f"expected a comfortable (>=1s) margin between hand-hidden and the next shot reaching the midpoint, got {total_margin_s:.2f}s"
+    assert app.PhotonNeuronBar.HAND_HOLD_DUR <= 0.3, \
+        "hand should leave soon after catching (short hold), per Filip's ask"
+    print(f"hand-hidden -> next shot reaches midpoint margin is {total_margin_s:.2f}s -- OK")
 finally:
     app.time.monotonic = orig_monotonic
 
