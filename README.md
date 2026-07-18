@@ -29,8 +29,6 @@ That's everything you need if you already have registered TIFFs saved (see Case 
 
 **Character "art":** the artwork is hand-drawn, rasterized from vector source files and embedded directly in `kurtosis_checker.py` as base64 PNG data — no separate `art/` folder is needed to run the app. 
 
-**Neuropil Sweep idle screen:** before you've run a sweep, the plot area shows a live animation of a neuron working through a donut (approach → bite → chew → cleaning its hands → crumbs, looping). An occasional loose crumb can fall mid-chew, and crumbs fall off the neuron's hands progressively while it cleans them, building up a pile on the ground in front of it. That pile only clears once a real sweep starts, at which point a broom sweeps it clean and keeps sweeping for as long as the computation is running. The neuron is centered and scales with the widget's on-screen size.
-
 **PTC reference citation:** the Gain Estimation sidebar's Export card links directly to the Lees et al. 2025 photon-transfer-curve reference protocol citation, with the DOI as a clickable link. (See Box 8 and Fig.16).
 
 
@@ -176,4 +174,3 @@ Checked against a MATLAB reference implementation of the Lees et al. 2025 (*Natu
 
 - `kurtosis_checker.py` — the app (single file, tkinter + matplotlib). Fully self-contained: all embedded artwork and the slab wordmark logo are base64 PNG data inside this file, so there's nothing else to copy alongside it.
 - `art/` — the source PNGs the embedded art data was generated from. Not needed to run the app; keep around only if the art ever needs regenerating.
-- `hockey_stick_requirements.txt` — dependency list, including the CaImAn/NormCorre setup notes above.

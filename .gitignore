@@ -2,3 +2,10 @@ __pycache__/
 *.pyc
 .DS_Store
 *.egg-info/
+
+# Support/dev scripts kept locally for regression testing but not part of
+# the public repo -- see README's "Repo contents" section.
+test_*.py
+hockey_stick_app.py
+hockey_stick_requirements.txt
+plot_gain_vs_power.m
