@@ -87,7 +87,7 @@ Note: CNMF might run for a while. I was considering adding cellpose, but we alre
 
 A **footprint sanity-check popup** shows the mean projection with the resulting masks outlined in green (and, for CNMF, the quality-filtered-out ones in red) — non-blocking, with the same zoom/pan toolbar as the mean-projection viewer, for both CNMF and Manual ROIs.
 
-The animation runs on Tk's main-thread event loop (~30fps) while the actual PTC/segmentation computation runs in a separate background thread. That doesn't mean the animation isn't slowing down the compute time, but it is so worth it.
+The animation runs on Tk's main-thread event loop (~30fps) while the actual PTC/segmentation computation runs in a separate background thread. That doesn't mean the animation isn't slowing down the compute time, but it is so worth it. An "Estimating gain" title sits directly above the animation while it's running.
 
 ### Raw Movie — load a TIFF, .mat, or .npy movie directly
 
