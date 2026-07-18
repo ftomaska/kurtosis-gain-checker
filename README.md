@@ -29,6 +29,8 @@ That's everything you need if you already have registered TIFFs saved (see Case 
 
 **Character "art":** the artwork is hand-drawn, rasterized from vector source files and embedded directly in `kurtosis_checker.py` as base64 PNG data — no separate `art/` folder is needed to run the app. 
 
+**Neuropil Sweep idle screen:** before you've run a sweep, the plot area shows a live animation of a neuron working through a donut (approach → bite → chew → cleaning its hands → crumbs, looping). An occasional loose crumb can fall mid-chew, and crumbs fall off the neuron's hands progressively while it cleans them, building up a pile on the ground in front of it. That pile only clears once a real sweep starts, at which point a broom sweeps it clean and keeps sweeping for as long as the computation is running. The neuron is centered and scales with the widget's on-screen size.
+
 **PTC reference citation:** the Gain Estimation sidebar's Export card links directly to the Lees et al. 2025 photon-transfer-curve reference protocol citation, with the DOI as a clickable link. (See Box 8 and Fig.16).
 
 
@@ -156,11 +158,11 @@ The third tab, Suite2p-only (needs `F.npy`, `Fneu.npy`, `stat.npy`, and `iscell.
 
 **What it does:** sweeps the neuropil-subtraction coefficient alpha across a configurable range (default 0–2, step 0.05) in `Fcorr = rawF - alpha*Fneu`, and at each alpha computes the mean ± SEM of the off-diagonal pairwise Pearson correlation between cells (only cells with `iscell == 1`). The plot marks the alpha whose mean correlation is closest to zero with a dashed line, as a starting-point suggestion.
 
-**Exclusion distance (default 4px):** cell pairs whose ROI masks come within this many pixels of each other are dropped from every alpha's pairwise-correlation average. Distance is the exact nearest-pixel (edge-to-edge) gap between the two ROIs' `stat.npy` pixel masks, not centroid-to-centroid. This is due to non-cells often existing at FOV borders in suite2p segmented datasets. 
+**Exclusion distance (default 4px):** cells whose ROI mask comes within this many pixels of the FOV border are dropped from the sweep entirely. Distance is the exact nearest-pixel (edge-to-edge) gap between the ROI's `stat.npy` pixel mask and the frame edge (using `ops.npy`'s `Ly`/`Lx`), not centroid-to-centroid — cells right at the edge of the field of view can have a clipped/incomplete neuropil ring, biasing `Fneu` the same way at every alpha.
 
 **Cell filter (optional):** the **"Filter by kurtosis"** checkbox restricts the sweep to cells with Pearson kurtosis (`fisher=False`, normal ≈ 3) above a threshold (default 5), computed on the raw, un-subtracted trace before anything else runs.
 
-The sidebar's alpha range/step and exclusion-distance fields, and the kurtosis-filter checkbox/threshold, are the only settings — see `neuropil_alpha_sweep`, `build_exclusion_mask`, and `roi_pair_min_distance` in `kurtosis_checker.py` for the implementation.
+The sidebar's alpha range/step and exclusion-distance fields, and the kurtosis-filter checkbox/threshold, are the only settings — see `neuropil_alpha_sweep`, `build_border_exclusion_mask`, and `roi_border_distance` in `kurtosis_checker.py` for the implementation.
 
 ## PTC method notes (vs. the Lees et al. 2025 reference protocol)
 

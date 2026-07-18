@@ -52,6 +52,8 @@ def make_bar():
     b._crumbs = []
     b._sweep_phase = None
     b._sweep_t0 = 0.0
+    b._crumbs_target = 0
+    b._crumbs_spawned_this_beat = 0
     b.after = lambda delay, fn: None
     return b
 
@@ -64,7 +66,9 @@ def run_ticks(bar, n, fake_t, dt=0.033):
 
 # ── the new sprite assets all decode ─────────────────────────────────────
 for name in ["neuron_idle_standing", "neuron_donut_approach", "neuron_donut_bite",
-             "neuron_donut_chew", "neuron_donut_crumbs", "broom"]:
+             "neuron_donut_chew", "neuron_donut_crumbs", "broom",
+             "neuron_donut_handclean_a", "neuron_donut_handclean_b",
+             "neuron_donut_handclean_c"]:
     im = app._load_art_image(name)
     assert im.mode == "RGBA" and im.width > 10 and im.height > 10, name
 print("all donut-eating-neuron sprite assets decode to real images: OK")
@@ -283,46 +287,99 @@ try:
     assert "broom" in image_tags, "broom should be drawn while busy"
     print("busy _render draws the broom: OK")
 
-    # ── "hands rubbing to clear off crumbs" -- two forearm strokes (each
-    # with a couple of finger-tick strokes) pivot at fixed shoulder
-    # points during the "crumbs" pose, swinging their hand-tip ends
-    # toward/apart from each other, per Filip's "I was hoping for the
-    # hands to move at elbows against each other." Low-effort/procedural
-    # (no new hand-drawn frame), same spirit as the chew jitter. ───────
+    # ── real hand-cleaning art cycles during the "crumbs" beat, replacing
+    # the old procedural forearm-line-segment stand-in, now that Filip's
+    # drawn three real frames by hand (uploaded as eating.svg: "I added
+    # the hand cleaning") ─────────────────────────────────────────────────
     bar6 = make_bar()
     bar6._mode = "idle"
     bar6._idle_seq_idx = bar6.IDLE_SEQUENCE.index(("crumbs", 1.1))
-    bar6.calls.clear()
-    bar6._render(10.0)
-    line_calls_a = [c for c in bar6.calls if c[0] == "create_line" and c[2] == "handrub"]
-    # 2 forearms x (1 main stroke + 2 finger ticks) x (halo pass + ink
-    # pass) = 12 line segments -- each stroke is drawn twice (a wider
-    # light halo, then a narrower dark ink line on top) so it reads as
-    # dark against the dark canvas, matching the character's own linework.
-    assert len(line_calls_a) == 12, \
-        f"expected 12 hand-rub line segments (halo+ink x 6 strokes) during the crumbs pose, got {len(line_calls_a)}"
-    ink_calls_a = [c for c in line_calls_a if c[3] == app.DonutNeuronBar.HANDRUB_COLOR]
-    halo_calls_a = [c for c in line_calls_a if c[3] == app.DonutNeuronBar.HANDRUB_HALO_COLOR]
-    assert len(ink_calls_a) == 6 and len(halo_calls_a) == 6, \
-        "expected an even 6/6 split between dark ink strokes and their light halo strokes"
-    bar6.calls.clear()
-    bar6._render(10.0 + 1.0 / bar6.HANDRUB_HZ / 2)  # quarter-cycle later
-    line_calls_b = [c for c in bar6.calls if c[0] == "create_line" and c[2] == "handrub"]
-    assert len(line_calls_b) == 12
-    assert line_calls_a[0][1] != line_calls_b[0][1], \
-        "hand-rub forearms should move across ticks (pivoting), not sit static"
-    print("hand-rub forearms pivot and animate during the crumbs pose: OK")
-    print("hand-rub strokes are dark ink with a light halo, matching the character's linework: OK")
+    bar6._pose_t0 = 0.0
+    seen_handclean_poses = []
+    orig_draw_donut_neuron2 = app.draw_donut_neuron
+    def _spy2(canvas, cx, cy, scale, pose="standing", tag="donut_neuron"):
+        seen_handclean_poses.append(pose)
+        return orig_draw_donut_neuron2(canvas, cx, cy, scale, pose=pose, tag=tag)
+    app.draw_donut_neuron = _spy2
+    try:
+        for frame_t in (0.0, 1.0 / bar6.HANDCLEAN_FPS, 2.0 / bar6.HANDCLEAN_FPS):
+            bar6.calls.clear()
+            bar6._render(frame_t)
+    finally:
+        app.draw_donut_neuron = orig_draw_donut_neuron2
+    assert seen_handclean_poses == ["handclean_a", "handclean_b", "handclean_c"], \
+        f"expected the 3 hand-clean frames to cycle in order a->b->c, got {seen_handclean_poses}"
+    print("the 3 hand-cleaning frames cycle in order during the crumbs pose: OK")
 
-    # not drawn (and cleaned up) during any other pose
-    bar7 = make_bar()
-    bar7._mode = "idle"
-    bar7._idle_seq_idx = bar7.IDLE_SEQUENCE.index(("chew", 0.7))
-    bar7.calls.clear()
-    bar7._render(10.0)
-    assert not [c for c in bar7.calls if c[0] == "create_line" and c[2] == "handrub"], \
-        "no hand-rub forearms outside the crumbs pose"
-    print("hand-rub forearms absent outside the crumbs pose: OK")
+    # no create_line "handrub" calls anywhere anymore -- that whole
+    # procedural stand-in is retired
+    bar6.calls.clear()
+    bar6._render(0.0)
+    assert not [c for c in bar6.calls if c[0] == "create_line" and c[2] == "handrub"], \
+        "the old procedural hand-rub line segments should be fully retired"
+    print("old procedural hand-rub line segments are gone: OK")
+
+    # ── the donut never shrinks/gets bitten smaller, even across repeated
+    # chewing beats -- per Filip's "dont make the donut smaller" (an
+    # earlier version resized the sprite down each consecutive chew beat;
+    # dropped per his explicit ask) ───────────────────────────────────────
+    bar7b = make_bar()
+    bar7b._mode = "idle"
+    bar7b._idle_seq_idx = bar7b.IDLE_SEQUENCE.index(("chew", 0.7))
+    bar7b._pose_t0 = 0.0
+    seen_chew_poses = []
+    orig_dn = app.draw_donut_neuron
+    def _spy_no_shrink(canvas, cx, cy, scale, pose="standing", tag="donut_neuron"):
+        seen_chew_poses.append(pose)
+        return orig_dn(canvas, cx, cy, scale, pose=pose, tag=tag)
+    app.draw_donut_neuron = _spy_no_shrink
+    try:
+        for _ in range(5):
+            bar7b._render(bar7b._pose_t0 + 0.1)
+    finally:
+        app.draw_donut_neuron = orig_dn
+    assert seen_chew_poses and all(p == "chew" for p in seen_chew_poses), \
+        f"expected every chew-beat frame to draw the plain 'chew' pose (no shrink variants), got {seen_chew_poses}"
+    print("the donut never shrinks while chewing, even across repeated chew beats: OK")
+
+    # ── the "crumbs"/hand-cleaning beat's batch falls progressively over
+    # its own duration, growing the ground pile as the cleaning animation
+    # plays, instead of dumping the whole batch the instant the beat
+    # starts -- per Filip: "the crumbs should fall off the hands down to
+    # the pile that should get larger when the hand cleaning happens." ──
+    random.seed(2)
+    bar10 = make_bar()
+    bar10._mode = "idle"
+    bar10._idle_seq_idx = bar10.IDLE_SEQUENCE.index(("crumbs", 1.1))
+    bar10._pose_t0 = 0.0
+    bar10._crumbs = []
+    bar10._crumbs_target = 8
+    bar10._crumbs_spawned_this_beat = 0
+    _, crumbs_dur = bar10.IDLE_SEQUENCE[bar10._idle_seq_idx]
+    bar10._advance_handclean_crumbs(0.0, crumbs_dur)
+    assert len(bar10._crumbs) == 0, "no crumbs should have fallen yet right as the beat begins"
+    bar10._advance_handclean_crumbs(crumbs_dur * 0.5, crumbs_dur)
+    n_half = len(bar10._crumbs)
+    assert 0 < n_half < bar10._crumbs_target, \
+        f"expected a partial number of crumbs fallen halfway through the beat, got {n_half}"
+    bar10._advance_handclean_crumbs(crumbs_dur, crumbs_dur)
+    assert len(bar10._crumbs) == bar10._crumbs_target, \
+        "the full batch should have fallen by the end of the hand-cleaning beat"
+    assert n_half < len(bar10._crumbs), "the pile should keep growing partway through to the end"
+    print("crumbs fall progressively during hand-cleaning, growing the pile as it plays: OK")
+
+    # ── singular crumbs can fall during chewing too (not just the big
+    # batch on entering "crumbs"), per Filip's exact words ───────────────
+    random.seed(1)
+    bar9 = make_bar()
+    bar9.start_idle()
+    bar9.CHEW_CRUMB_CHANCE = 1.0  # force it every time, for a deterministic test
+    n_before = len(bar9._crumbs)
+    while app.DonutNeuronBar.IDLE_SEQUENCE[bar9._idle_seq_idx][0] != "chew":
+        run_ticks(bar9, 1, fake_t)
+    assert len(bar9._crumbs) == n_before + 1, \
+        "with CHEW_CRUMB_CHANCE=1.0, entering a chew beat should drop exactly one loose crumb"
+    print("a single crumb can fall on entering a chew beat: OK")
 finally:
     app.time.monotonic = orig_monotonic
 
