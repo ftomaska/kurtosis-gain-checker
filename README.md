@@ -20,9 +20,9 @@ A desktop tool for two-photon calcium imaging QC, built around Suite2p output. I
 
 ![Neuropil Sweep](neuropil.gif)
 
-## Quick Start Demo
+## Director's cut demo
 
-[![Quick Start Demo](https://img.youtube.com/vi/zqxz35iwyIM/hqdefault.jpg)](https://youtu.be/zqxz35iwyIM)
+https://youtu.be/zqxz35iwyIM
 
 ## Installation
 
