@@ -6,6 +6,24 @@ A desktop tool for two-photon calcium imaging QC, built around Suite2p output. I
 - **Gain Estimation** — runs a photon-transfer-curve analysis on a Suite2p recording to estimate PMT/camera gain (ADU/photon) and convert each cell's fluorescence to photons/cell/s. Option to use raw recordings that can be motion corrected (requires caiman package) and segmented.
 - **Neuropil Sweep** — Suite2p only. Sweeps the neuropil-subtraction coefficient alpha (`Fcorr = rawF - alpha*Fneu`) and plots the mean ± SEM pairwise cell-cell correlation at each alpha, to help pick a good alpha for your recording.
 
+## At a Glance
+
+**Kurtosis** — sorts and visualizes ROI traces by kurtosis or SNR.
+
+![Kurtosis](kurt.gif)
+
+**Gain Estimation** — photon-transfer-curve gain estimate (ADU/photon) and per-cell photon flux.
+
+![Gain Estimation](gain.gif)
+
+**Neuropil Sweep** — sweeps the neuropil-subtraction coefficient alpha and plots the mean pairwise cell-cell correlation at each alpha.
+
+![Neuropil Sweep](neuropil.gif)
+
+## Quick Start Demo
+
+[![Quick Start Demo](https://img.youtube.com/vi/zqxz35iwyIM/hqdefault.jpg)](https://youtu.be/zqxz35iwyIM)
+
 ## Installation
 
 ```
@@ -15,17 +33,13 @@ python kurtosis_checker.py
 
 That's everything you need if you already have registered TIFFs saved (see Case 1 below). CaImAn is an optional, heavier dependency only needed if Suite2p's `reg_tif` export is missing (Case 2), if a Raw Movie needs motion correction, or if you choose CNMF segmentation. `h5py` is optional, only needed if you're loading a `.mat` movie saved in MATLAB's v7.3/HDF5 format.
 
-## Demo
-
-*(placeholder for a demo GIF)*
-
-![demo](demo.gif)
-
 ## Interface
 
 **Layout:** the Gain Estimation and Neuropil Sweep tabs each have an always-visible left sidebar (Load buttons, then settings grouped into rounded-corner cards, then Run Analysis), scrollable independently once its cards outgrow the window height. The Kurtosis tab has a top-bar Load Data + collapsible Settings, plus a **▶ Plot** button. Every sidebar parameter has a small "?" glyph next to it — click it to toggle a popup explaining what the setting does.
 
 **De-whimsify the GUI:** a button at the far right of the top bar, visible on every tab. Click it and every 'creative' 100% not ai generated animation in the app is removed or replaced with a generic loading bar. I did go a little bit overboard. If you want it to go away that's totally fair. But if you change your mind just click again to bring all the whimsy back.
+
+![De-whimsify the GUI](dewhim.gif)
 
 **Character "art":** the artwork is hand-drawn, rasterized from vector source files and embedded directly in `kurtosis_checker.py` as base64 PNG data — no separate `art/` folder is needed to run the app. 
 
@@ -88,6 +102,8 @@ A **footprint sanity-check popup** shows the mean projection with the resulting 
 The animation runs on Tk's main-thread event loop (~30fps) while the actual PTC/segmentation computation runs in a separate background thread. That doesn't mean the animation isn't slowing down the compute time, but it is so worth it. An "Estimating gain" title sits directly above the animation while it's running.
 
 ### Raw Movie — load a TIFF, .mat, or .npy movie directly
+
+![Raw Movie motion-correction flow](motionCorr.gif)
 
 The **"🎬 Raw Movie"** button (in the sidebar's LOAD card, next to Suite2p Folder) loads a movie straight from a file instead of a Suite2p folder. It asks two questions:
 
