@@ -9,3 +9,8 @@ test_*.py
 hockey_stick_app.py
 hockey_stick_requirements.txt
 plot_gain_vs_power.m
+
+# Source art PNGs -- kurtosis_checker.py embeds all artwork as base64 PNG
+# data directly, so this folder isn't needed to run the app. Kept locally
+# only in case the art ever needs regenerating.
+art/
