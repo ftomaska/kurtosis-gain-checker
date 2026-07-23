@@ -114,7 +114,7 @@ For `.mat` files, both classic (pre-v7.3) and v7.3/HDF5 formats are supported (t
 
 The **"Scratch folder"** setting in the sidebar's MOTION CORRECTION card (click **"📁 Choose…"**, or **"Reset"** to go back to CaImAn's default) points NormCorre's memmap writes at a folder on a drive with more room, for the disk-space case above.
 
-A Raw Movie load has no Suite2p `F.npy`, so it goes through the same three-way segmentation choice (CNMF / Manual ROIs / Skip) described above to fill in the photon-flux panel.
+A Raw Movie load has no Suite2p `F.npy` of its own, so right after it loads you're asked whether you already have a Suite2p run's `F.npy`/`stat.npy` for this same recording (e.g. Suite2p was run without the `reg_tif` export option checked) — attaching one fills the photon-flux panel directly. If you skip that (or don't have one), it falls back to the same three-way segmentation choice (CNMF / Manual ROIs / Skip) described above.
 
 ### No Suite2p output at all
 
