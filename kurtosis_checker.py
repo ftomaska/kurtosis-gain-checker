@@ -66,7 +66,7 @@ Optional (only for the raw-TIFF NormCorre fallback in gain mode): caiman
 # Bump this on every change so a running instance's window title can be checked
 # against what's actually in this file -- handy when the app runs on a machine
 # separate from wherever this source file is being edited.
-APP_VERSION = "2026-07-17.17"
+APP_VERSION = "2026-07-17.20"
 
 import os
 import sys
@@ -442,9 +442,21 @@ def load_suite2p_traces(plane_dir):
     _run_gain_worker), so they don't need matching frame counts or even
     to come from the same registration run."""
     ops = np.load(os.path.join(plane_dir, "ops.npy"), allow_pickle=True).item()
-    F = np.load(os.path.join(plane_dir, "F.npy")).astype(float)
+    # copy=False: np.load already returns a fresh, unshared array, so if
+    # F.npy is already float64 on disk (common once a session's F.npy has
+    # gone through a save/re-save cycle, or for multi-session-concatenated
+    # recordings) there's no need for .astype to make a SECOND full-size
+    # copy of it -- that redundant copy is exactly what Filip's Ubuntu
+    # MemoryError traced back to (a 1.47 GiB float64 (256, 773000) array,
+    # matching a concatenated multi-session F.npy that was already
+    # float64 -- the crash was the astype's own copy, made right after
+    # the identical-sized np.load already succeeded and was sitting in
+    # RAM). copy=False still copies+upcasts normally for float32 F.npy
+    # (the common case), it just skips the copy when it would be a
+    # no-op.
+    F = np.load(os.path.join(plane_dir, "F.npy")).astype(np.float64, copy=False)
     fneu_p = os.path.join(plane_dir, "Fneu.npy")
-    Fneu = np.load(fneu_p).astype(float) if os.path.exists(fneu_p) else None
+    Fneu = np.load(fneu_p).astype(np.float64, copy=False) if os.path.exists(fneu_p) else None
     stat_p = os.path.join(plane_dir, "stat.npy")
     stat = np.load(stat_p, allow_pickle=True) if os.path.exists(stat_p) else None
     iscell_p = os.path.join(plane_dir, "iscell.npy")
@@ -466,10 +478,135 @@ def load_suite2p_traces(plane_dir):
     # not per-pixel averages.
     if stat is not None:
         npix = np.array([max(1, int(s.get("npix", 1))) for s in stat], dtype=float)
-        F = F * npix[:, None]
+        # In-place (*=) rather than F = F * npix[:, None] -- the latter
+        # allocates a whole SECOND full-size array before the old F is
+        # freed, doubling peak memory for this step alone on large
+        # recordings. F was just loaded fresh above (or is iscell-masked,
+        # already an independent array), so mutating it in place is safe.
+        F *= npix[:, None]
         if Fneu is not None:
-            Fneu = Fneu * npix[:, None]
+            Fneu *= npix[:, None]
     return ops, F, Fneu, stat
+
+
+# ── Kurtosis tab: "recording too long to load into memory" fallback ────────
+#
+# Filip's report: a Suite2p session built by concatenating many imaging
+# sessions to track the same neurons across days had a 1.53 GB F.npy that
+# raised numpy._core._exceptions._ArrayMemoryError while loading in
+# Kurtosis mode. The Kurtosis tab (unlike Gain Estimation) always needs
+# every frame of F/Fneu in memory at once -- kurtosis/SNR are computed
+# straight from the full trace, there's no streaming/chunked path the way
+# Gain Estimation's PTC computation has. So when the full recording
+# genuinely doesn't fit, the only real options are: use less memory per
+# frame (float32 instead of float64 -- done throughout the Kurtosis tab's
+# loaders now, see their comments), or use fewer frames. This implements
+# the second one as an explicit, user-confirmed fallback rather than a
+# silent truncation.
+
+def _find_largest_frame_crop_that_fits(try_load, n_frames_total, min_check=None):
+    """Binary-search for the largest n where try_load(n) succeeds, given
+    that try_load(n_frames_total) (the full recording) just raised
+    MemoryError.
+
+    try_load(n) must build/return whatever "n frames of data" means for
+    the caller (e.g. an (F, Fneu) tuple) or raise MemoryError. Shared by
+    the disk-based fallback (Suite2p F.npy/Fneu.npy, generic .npy -- an
+    mmap-backed try_load that only ever materializes the n-frame slice,
+    never the whole file) and plot()'s own in-memory fallback (a plain
+    slice of the already-loaded self.F/self.Fneu).
+
+    Returns (result, n_used) for the largest n that succeeded, or
+    (None, 0) if even a small window (n_frames_total // 200, at least 1
+    frame) couldn't be loaded -- meaning there isn't enough free memory
+    for this recording at all right now, regardless of cropping."""
+    if min_check is None:
+        min_check = max(1, n_frames_total // 200)
+    try:
+        best_result = try_load(min_check)
+    except MemoryError:
+        return None, 0
+    best_n = min_check
+    lo, hi = min_check, n_frames_total
+    tolerance = max(1, n_frames_total // 100)
+    while hi - lo > tolerance:
+        mid = (lo + hi) // 2
+        try:
+            result = try_load(mid)
+        except MemoryError:
+            hi = mid
+            gc.collect()
+            continue
+        best_result, best_n = result, mid
+        lo = mid
+        gc.collect()
+    return best_result, best_n
+
+
+def _crop_fallback_npy(f_path, fneu_p=None, orient_by_size=False, kind_label="recording"):
+    """Called right after a full np.load(...).astype(...) of F.npy (and
+    optionally Fneu.npy) raised MemoryError. Reopens both files as
+    read-only mmaps (just reads the .npy header -- no real memory cost),
+    finds the largest number of leading frames that can actually be
+    materialized given how much memory is free right now (see
+    _find_largest_frame_crop_that_fits), then asks the user to confirm
+    before committing to the crop -- an explicit, informed choice rather
+    than a silent truncation that could quietly change later results.
+
+    orient_by_size: Suite2p's F.npy is always (cells, frames), no
+    ambiguity, so the default (False) always crops axis 1. A generic,
+    unlabeled .npy could be stored either way -- when True, this assumes
+    frames are whichever axis is larger (the same assumption the
+    non-fallback path's _orient asks the user to confirm; a real imaging
+    session always has far more frames than cells), crops that axis, and
+    returns the result already transposed into (cells, frames) so no
+    separate _orient call is needed afterward.
+
+    Returns (F, Fneu, n_frames_total, n_used) if the user confirms the
+    crop, or None if they decline or even a tiny window couldn't be
+    loaded."""
+    F_mm = np.load(f_path, mmap_mode="r")
+    if F_mm.ndim != 2:
+        messagebox.showerror("Shape error",
+                              f"{os.path.basename(f_path)}: expected 2-D, got {F_mm.shape}.")
+        return None
+    frames_axis = int(np.argmax(F_mm.shape)) if orient_by_size else 1
+    n_frames_total = F_mm.shape[frames_axis]
+    n_cells = F_mm.shape[1 - frames_axis]
+    Fneu_mm = np.load(fneu_p, mmap_mode="r") if fneu_p else None
+
+    def _slice_n(mm, n):
+        sl = mm[:, :n] if frames_axis == 1 else mm[:n, :]
+        arr = np.array(sl, dtype=np.float32)
+        return arr.T if frames_axis == 0 else arr
+
+    def try_load(n):
+        F_s = _slice_n(F_mm, n)
+        Fneu_s = _slice_n(Fneu_mm, n) if Fneu_mm is not None else None
+        return F_s, Fneu_s
+
+    result, n_used = _find_largest_frame_crop_that_fits(try_load, n_frames_total)
+    if result is None:
+        messagebox.showerror(
+            "Out of memory",
+            f"This {kind_label} ({n_cells} cells x {n_frames_total} frames) "
+            f"is too large to load into memory, and even a small cropped "
+            f"window couldn't be loaded either -- this machine may be low "
+            f"on available RAM for other reasons right now. Try closing "
+            f"other applications, or loading on a machine with more RAM.")
+        return None
+    proceed = messagebox.askyesno(
+        "Recording too large for memory",
+        f"This {kind_label} has {n_frames_total} frames ({n_cells} cells) "
+        f"-- too large to load into memory all at once.\n\n"
+        f"It fits if cropped to the first {n_used} frames "
+        f"({100 * n_used / n_frames_total:.0f}% of the recording).\n\n"
+        f"Load that cropped window instead? Kurtosis/SNR will only "
+        f"reflect those frames.")
+    if not proceed:
+        return None
+    F, Fneu = result
+    return F, Fneu, n_frames_total, n_used
 
 
 def _resolve_raw_tiffs(plane_dir, ops):
@@ -522,6 +659,49 @@ class _ProgressLogHandler(logging.Handler):
             self.progress_cb(f"NormCorre: {msg}")
 
 
+def _caiman_missing_error(e):
+    """Shared "CaImAn isn't installed" RuntimeError, with the actionable
+    conda/mamba install instructions -- used both by run_normcorre's own
+    ImportError handling and by _require_caiman_for_normcorre's early
+    up-front check (see that function's docstring for why the early
+    check exists)."""
+    return RuntimeError(
+        "CaImAn is not installed, so raw-TIFF motion correction (NormCorre) can't run.\n\n"
+        "CaImAn's compiled dependencies mean mamba/conda is the supported install "
+        "path (plain pip is not):\n"
+        "  conda install -n base -c conda-forge mamba\n"
+        "  mamba create -n caiman caiman\n"
+        "  conda activate caiman\n\n"
+        "If you have a reg_tif/ export instead, you don't need CaImAn at all — "
+        "double-check the status bar after Load Data confirms "
+        "'reg_tif found (N file(s))' before running the analysis.\n\n"
+        f"(underlying error: {e})"
+    )
+
+
+def _require_caiman_for_normcorre():
+    """Raise immediately (with the same actionable message run_normcorre's
+    own ImportError handling gives) if CaImAn isn't importable.
+
+    Called from load_registered_movie/load_registered_movie_manual right
+    after they've confirmed reg_tif is absent, BEFORE prompting the user
+    to locate a raw-TIFF folder or doing any auto-resolve/movie-loading
+    work -- all of which is wasted if NormCorre is just going to fail at
+    the end anyway. Filip reported (Ubuntu, 2026-07-28) being walked
+    through the Suite2p-folder pick, the memory-check prompt, AND the
+    raw-TIFF folder picker only to hit "CaImAn is not installed" as the
+    very last step. That's expected/correct given CaImAn genuinely isn't
+    installed on that machine (not a bug in the analysis itself -- see
+    run_normcorre's own docstring) -- but there's no reason to make the
+    user click through two extra dialogs first to discover that. Checking
+    here surfaces the same error immediately instead."""
+    try:
+        import caiman  # noqa: F401
+        from caiman.motion_correction import MotionCorrect  # noqa: F401
+    except ImportError as e:
+        raise _caiman_missing_error(e)
+
+
 def run_normcorre(tiff_paths, pw_rigid, progress_cb=None, scratch_dir=None):
     """Priority 3 (last resort): motion-correct raw TIFFs with CaImAn's NoRMCorre.
 
@@ -542,18 +722,7 @@ def run_normcorre(tiff_paths, pw_rigid, progress_cb=None, scratch_dir=None):
         import caiman as cm
         from caiman.motion_correction import MotionCorrect
     except ImportError as e:
-        raise RuntimeError(
-            "CaImAn is not installed, so the raw-TIFF fallback can't run.\n\n"
-            "CaImAn's compiled dependencies mean mamba/conda is the supported install "
-            "path (plain pip is not):\n"
-            "  conda install -n base -c conda-forge mamba\n"
-            "  mamba create -n caiman caiman\n"
-            "  conda activate caiman\n\n"
-            "If you have a reg_tif/ export instead, you don't need CaImAn at all — "
-            "double-check the status bar after Load Data confirms "
-            "'reg_tif found (N file(s))' before running the analysis.\n\n"
-            f"(underlying error: {e})"
-        )
+        raise _caiman_missing_error(e)
 
     if progress_cb:
         progress_cb("Running NoRMCorre motion correction (this can take a while)...")
@@ -747,6 +916,12 @@ def load_registered_movie(plane_dir, ops, max_frames, pw_rigid, progress_cb=None
     if mov is not None:
         return mov
 
+    # No reg_tif -> everything past this point is working toward a NormCorre
+    # run, which needs CaImAn. Check now, before wasting the user's time on
+    # auto-resolve or (worse) a raw-TIFF folder picker dialog that leads
+    # nowhere -- see _require_caiman_for_normcorre's docstring.
+    _require_caiman_for_normcorre()
+
     tiff_paths = _resolve_raw_tiffs(plane_dir, ops)
     if not tiff_paths and ask_raw_dir is not None:
         d = ask_raw_dir()
@@ -784,6 +959,11 @@ def load_registered_movie_manual(raw_tiffs, max_frames, pw_rigid, skip_mc, save_
 
     if skip_mc:
         return load_tiffs_direct(raw_tiffs, max_frames, frame_start=frame_start)
+
+    # No reg_tif and motion correction wasn't skipped -> heading for
+    # NormCorre, which needs CaImAn. Same early check as
+    # load_registered_movie -- see _require_caiman_for_normcorre's docstring.
+    _require_caiman_for_normcorre()
 
     arr, note_suffix = _normcorre_then_maybe_save(
         raw_tiffs, max_frames, pw_rigid, save_mc, source_dir, progress_cb=progress_cb,
@@ -1307,7 +1487,11 @@ def photon_flux_per_cell(F, gain_true, fs, baseline_pct=None):
     estimate per cell, not a mean that's pulled up by activity transients."""
     if not np.isfinite(gain_true) or gain_true <= 0:
         return np.full(F.shape[0], np.nan)
-    Fc = F.astype(float)
+    # copy=False: F is only read here (percentile/mean), never mutated, so
+    # there's no need to force a duplicate allocation when F is already
+    # float64 -- see load_suite2p_traces's docstring for why this matters
+    # on large (multi-session-concatenated) Suite2p recordings.
+    Fc = F.astype(np.float64, copy=False)
     if baseline_pct is not None:
         photons_per_frame = np.percentile(Fc, baseline_pct, axis=1) / gain_true
     else:
@@ -52486,9 +52670,34 @@ class KurtosisChecker:
             if os.path.exists(f_path):
                 fneu_p = os.path.join(d, "Fneu.npy")
                 ops_p  = os.path.join(d, "ops.npy")
+                crop_note = ""
                 try:
-                    F_raw    = np.load(f_path).astype(float)
-                    Fneu_raw = np.load(fneu_p).astype(float) if os.path.exists(fneu_p) else None
+                    # float32, not float64: Suite2p's own F.npy is usually
+                    # float32 on disk anyway, and kurtosis/SNR/percentile
+                    # don't need double precision for ADU-range fluorescence
+                    # values -- halving memory footprint here is a bigger,
+                    # more broadly-useful win than only handling the
+                    # symptom via cropping below. copy=False on top of that
+                    # avoids a redundant full-size duplicate allocation
+                    # when F.npy/Fneu.npy already happen to be float32.
+                    F_raw    = np.load(f_path).astype(np.float32, copy=False)
+                    Fneu_raw = np.load(fneu_p).astype(np.float32, copy=False) if os.path.exists(fneu_p) else None
+                except MemoryError:
+                    # Recording is too large even at float32 -- offer to
+                    # crop to however many leading frames actually fit in
+                    # memory right now (see _crop_fallback_npy's docstring;
+                    # this is exactly what Filip's Ubuntu MemoryError hit).
+                    cropped = _crop_fallback_npy(
+                        f_path, fneu_p if os.path.exists(fneu_p) else None,
+                        kind_label="Suite2p recording")
+                    if cropped is None:
+                        return
+                    F_raw, Fneu_raw, n_total, n_used = cropped
+                    crop_note = (f"  ·  CROPPED to first {n_used}/{n_total} "
+                                 f"frames (full recording too large for memory)")
+                except Exception as e:
+                    messagebox.showerror("Error", str(e)); return
+                try:
                     if os.path.exists(ops_p):
                         ops = np.load(ops_p, allow_pickle=True).item()
                         fs  = self._try_fs(ops)
@@ -52512,22 +52721,34 @@ class KurtosisChecker:
                 cell_note = f"  [iscell: {n}]" if cell_mask is not None else ""
                 self.status_var.set(
                     f"Suite2p: {n} cells × {t} frames{note}{cell_note}  ·  fs={self.fs_var.get()} Hz"
-                    f"  [{os.path.relpath(f_path, folder)}]")
+                    f"  [{os.path.relpath(f_path, folder)}]{crop_note}")
                 self.plot(); return
 
         # Priority 2: any .npy at root level
         npy_files = [f for f in os.listdir(folder) if f.endswith(".npy")]
         if npy_files:
             path = os.path.join(folder, npy_files[0])
+            crop_note = ""
             try:
-                arr = np.load(path, allow_pickle=False).astype(float)
+                arr = np.load(path, allow_pickle=False).astype(np.float32, copy=False)
+            except MemoryError:
+                cropped = _crop_fallback_npy(path, orient_by_size=True)
+                if cropped is None:
+                    return
+                arr, _, n_total, n_used = cropped
+                crop_note = (f"  ·  CROPPED to first {n_used}/{n_total} "
+                             f"frames (full recording too large for memory)")
             except Exception as e:
                 messagebox.showerror("Error", str(e)); return
-            arr = self._orient(arr, npy_files[0])
-            if arr is None: return
+            if not crop_note:
+                # _crop_fallback_npy already returns arr oriented as
+                # (cells, frames) -- only need to ask about orientation on
+                # the normal (non-cropped) path.
+                arr = self._orient(arr, npy_files[0])
+                if arr is None: return
             self.F = arr; self.Fneu = None; self.data_type = "npy"
             self.status_var.set(
-                f"NumPy: {arr.shape[0]} cells × {arr.shape[1]} frames  ·  {npy_files[0]}")
+                f"NumPy: {arr.shape[0]} cells × {arr.shape[1]} frames  ·  {npy_files[0]}{crop_note}")
             self.plot(); return
 
         # Priority 3: Fall.mat or first .mat
@@ -52850,9 +53071,24 @@ class KurtosisChecker:
                 break
         if f_path is None:
             messagebox.showerror("Not found", "F.npy not found."); return
+        crop_note = ""
         try:
-            self.F    = np.load(f_path).astype(float)
-            self.Fneu = np.load(fneu_path).astype(float) if fneu_path else None
+            # float32 (not float64): halves memory footprint for the
+            # common case, and copy=False skips a redundant duplicate
+            # allocation when the source is already float32 -- see
+            # _load_folder's Priority-1 branch for the full rationale.
+            self.F    = np.load(f_path).astype(np.float32, copy=False)
+            self.Fneu = np.load(fneu_path).astype(np.float32, copy=False) if fneu_path else None
+        except MemoryError:
+            cropped = _crop_fallback_npy(f_path, fneu_path, kind_label="Suite2p recording")
+            if cropped is None:
+                return
+            self.F, self.Fneu, n_total, n_used = cropped
+            crop_note = (f"  ·  CROPPED to first {n_used}/{n_total} "
+                         f"frames (full recording too large for memory)")
+        except Exception as e:
+            messagebox.showerror("Error", str(e)); return
+        try:
             if ops_path:
                 ops = np.load(ops_path, allow_pickle=True).item()
                 fs  = self._try_fs(ops)
@@ -52863,21 +53099,30 @@ class KurtosisChecker:
         n, t = self.F.shape
         note = " + Fneu" if self.Fneu is not None else ""
         self.status_var.set(
-            f"Suite2p: {n} cells × {t} frames{note}  ·  fs = {self.fs_var.get()} Hz")
+            f"Suite2p: {n} cells × {t} frames{note}  ·  fs = {self.fs_var.get()} Hz{crop_note}")
 
     def load_npy(self, path=None):
         if path is None:
             path = filedialog.askopenfilename(title="NumPy file",
                                               filetypes=[("NumPy", "*.npy"), ("All", "*.*")])
         if not path: return
+        crop_note = ""
         try:
-            arr = np.load(path, allow_pickle=False).astype(float)
+            arr = np.load(path, allow_pickle=False).astype(np.float32, copy=False)
+        except MemoryError:
+            cropped = _crop_fallback_npy(path, orient_by_size=True)
+            if cropped is None:
+                return
+            arr, _, n_total, n_used = cropped
+            crop_note = (f"  ·  CROPPED to first {n_used}/{n_total} "
+                         f"frames (full recording too large for memory)")
         except Exception as e:
             messagebox.showerror("Error", str(e)); return
-        arr = self._orient(arr, os.path.basename(path))
-        if arr is None: return
+        if not crop_note:
+            arr = self._orient(arr, os.path.basename(path))
+            if arr is None: return
         self.F = arr; self.Fneu = None; self.data_type = "npy"
-        self.status_var.set(f"NumPy: {arr.shape[0]} cells × {arr.shape[1]} frames")
+        self.status_var.set(f"NumPy: {arr.shape[0]} cells × {arr.shape[1]} frames{crop_note}")
 
     def load_mat(self, path=None):
         if path is None:
@@ -52901,7 +53146,13 @@ class KurtosisChecker:
             def to2d(k):
                 if k not in mat: return None
                 try:
-                    v = np.array(mat[k]).astype(float)
+                    # dtype= in the same np.array() call (rather than a
+                    # separate .astype(float) after) does the copy and the
+                    # dtype conversion in one pass instead of two. float32,
+                    # not float64, for the same reason as the other
+                    # Kurtosis-tab loaders (halves memory; plenty of
+                    # precision for these traces).
+                    v = np.array(mat[k], dtype=np.float32)
                     if hdf5: v = v.T
                     return v if v.ndim == 2 else None
                 except Exception:
@@ -53002,16 +53253,90 @@ class KurtosisChecker:
         self.root.wait_window(win)
         return result[0]
 
-    # ── kurtosis plotting (unchanged) ────────────────────────────────────
+    # ── kurtosis plotting ────────────────────────────────────────────────
 
     def plot(self):
         if self.F is None:
             messagebox.showwarning("No data", "Load data first."); return
 
         self._splash_active = False
+        try:
+            self._plot_inner()
+        except MemoryError:
+            # Loading self.F/self.Fneu succeeded, but processing them here
+            # (the working copy below, dff, kurtosis/SNR, boxcar filter)
+            # didn't -- can happen right at the edge of available RAM even
+            # after the load itself fit. Same "too long to load into
+            # memory -- offer to crop" fallback as the loaders, just
+            # operating on the already-resident arrays (no disk re-read
+            # needed) instead of an mmap.
+            self._recover_plot_memory_error()
 
-        # Pre-process
-        F = self.F.copy().astype(float)
+    def _recover_plot_memory_error(self):
+        """See plot()'s docstring/comment. Crops self.F/self.Fneu to the
+        largest leading-frame window that _plot_inner can actually finish
+        processing, confirms with the user, then re-plots on the cropped
+        data. Declining or the machine not having enough memory even for
+        a tiny crop both leave self.F/self.Fneu untouched (whatever was
+        already loaded stays loaded; the plot just doesn't update)."""
+        n_frames_total = self.F.shape[1]
+
+        def try_process(n):
+            """Probe: temporarily swap in an n-frame crop and run it
+            through the real _plot_inner workload (not just a bare array
+            allocation) -- always restored via `finally`, whether the
+            probe succeeds or raises, so self.F/self.Fneu are only ever
+            actually left cropped once, explicitly, after the user
+            confirms below."""
+            F_s = np.array(self.F[:, :n], dtype=np.float32)
+            Fneu_s = np.array(self.Fneu[:, :n], dtype=np.float32) if self.Fneu is not None else None
+            old_F, old_Fneu = self.F, self.Fneu
+            self.F, self.Fneu = F_s, Fneu_s
+            try:
+                self._plot_inner()
+            finally:
+                self.F, self.Fneu = old_F, old_Fneu
+            return F_s, Fneu_s
+
+        result, n_used = _find_largest_frame_crop_that_fits(try_process, n_frames_total)
+        if result is None:
+            messagebox.showerror(
+                "Out of memory",
+                "Ran out of memory analyzing this recording, and even a "
+                "small cropped window couldn't be processed either -- "
+                "this machine may be low on available RAM for other "
+                "reasons right now. Try closing other applications.")
+            return
+        F, Fneu = result
+        proceed = messagebox.askyesno(
+            "Recording too large for memory",
+            f"Ran out of memory analyzing all {n_frames_total} frames.\n\n"
+            f"It fits if cropped to the first {n_used} frames "
+            f"({100 * n_used / n_frames_total:.0f}% of the recording).\n\n"
+            f"Keep this crop and continue? Kurtosis/SNR will only reflect "
+            f"those frames.")
+        if not proceed:
+            return
+        self.F, self.Fneu = F, Fneu
+        self.status_var.set(
+            self.status_var.get() +
+            f"  ·  CROPPED to first {n_used}/{n_frames_total} frames (ran out of memory)")
+        self._plot_inner()
+
+    def _plot_inner(self):
+        # Pre-process. astype(..., copy=True) makes exactly ONE independent,
+        # mutable copy of self.F (needed since F gets modified in place
+        # below) -- the previous `self.F.copy().astype(float)` made TWO
+        # (an explicit .copy(), then another copy from .astype's own
+        # default copy=True, with both the original self.F AND the first
+        # .copy() transiently alive at once). On a large multi-session-
+        # concatenated Suite2p recording (Filip's Ubuntu MemoryError:
+        # 1.47 GiB for a (256, 773000) float64 array) that redundant extra
+        # copy is real, avoidable memory pressure on top of everything
+        # load_suite2p_traces already had to fix for the same reason.
+        # float32 (not float64): halves memory footprint outright, and
+        # kurtosis/SNR/percentile don't need double precision here.
+        F = self.F.astype(np.float32, copy=True)
         if (self.data_type in ("suite2p", "mat")
                 and self.do_neuropil.get() and self.Fneu is not None):
             F -= self.neuropil_coeff.get() * self.Fneu
@@ -53019,7 +53344,11 @@ class KurtosisChecker:
             pct = float(np.clip(self.dff_pct.get(), 1, 99))
             f0  = np.percentile(F, pct, axis=1, keepdims=True)
             f0  = np.where(np.abs(f0) < 1e-6, 1e-6, f0)
-            F   = (F - f0) / np.abs(f0)
+            # In place (F -= ...; F /= ...) instead of F = (F - f0) / ...,
+            # which would allocate yet another full-size array for the
+            # subtraction result before dividing -- same reasoning as above.
+            F -= f0
+            F /= np.abs(f0)
         fs  = max(0.1, float(self.fs_var.get()))
         sec = max(0.0, float(self.boxcar_sec.get()))
         bc  = max(1, round(sec * fs))
@@ -53261,13 +53590,13 @@ class KurtosisChecker:
                     "know where the FOV border is for the exclusion "
                     "distance.")
                 return
-            F = np.load(os.path.join(plane_dir, "F.npy")).astype(float)
+            F = np.load(os.path.join(plane_dir, "F.npy")).astype(np.float64, copy=False)
             fneu_p = os.path.join(plane_dir, "Fneu.npy")
             if not os.path.exists(fneu_p):
                 messagebox.showerror("Not found", "Fneu.npy not found -- "
                                       "needed for the neuropil sweep.")
                 return
-            Fneu = np.load(fneu_p).astype(float)
+            Fneu = np.load(fneu_p).astype(np.float64, copy=False)
             stat_p = os.path.join(plane_dir, "stat.npy")
             if not os.path.exists(stat_p):
                 messagebox.showerror("Not found", "stat.npy not found -- "
