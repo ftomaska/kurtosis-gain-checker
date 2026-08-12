@@ -31,7 +31,7 @@ pip install numpy scipy matplotlib pillow tifffile
 python kurtosis_checker.py
 ```
 
-That's everything you need if you already have registered TIFFs saved (see Case 1 below). CaImAn is an optional, heavier dependency only needed if Suite2p's `reg_tif` export is missing (Case 2), if a Raw Movie needs motion correction, or if you choose CNMF segmentation. `h5py` is optional, only needed if you're loading a `.mat` movie saved in MATLAB's v7.3/HDF5 format.
+That's everything you need if you already have registered TIFFs saved (see Case 1 below). CaImAn is an optional, heavier dependency only needed if Suite2p's `reg_tif` export is missing (Case 2), if a Raw Movie needs motion correction, or if you choose CNMF segmentation. If `reg_tif` is missing and CaImAn/the raw TIFFs aren't available either, you can point the tool at Suite2p's own `data.bin` instead (see *Case 2b* below) — no extra dependency needed for that path. `h5py` is optional, only needed if you're loading a `.mat` movie saved in MATLAB's v7.3/HDF5 format.
 
 ## Interface
 
@@ -63,7 +63,7 @@ If you ran Suite2p with the `reg_tif` option enabled, your plane folder has a `r
    - Right panel: per-cell photon flux histogram (median)
 
 **Notes:**
-- Suite2p's own `data.bin` binary is never used as a fallback, even if present — it's a scratch/working file Suite2p can overwrite on a later run. If there's no `reg_tif` export, the tool goes straight to Case 2.
+- Suite2p's own `data.bin` binary is never used *automatically*, even if present — it's a scratch/working file Suite2p can overwrite on a later run (e.g. a subsequent re-run, or when processing other planes), so it isn't a guaranteed match for the currently-loaded `F.npy`. If there's no `reg_tif` export, the tool goes straight to Case 2. Only if Case 2 turns out not to be available (see *Case 2b*) will you be asked whether to use `data.bin` instead — and only after an explicit confirmation dialog.
 - File matching inside `reg_tif/` is case-insensitive and doesn't require `chan0` in the filename. If a `reg_tif/` folder exists but has no readable TIFFs inside it, the tool raises an error listing that folder's contents. If you have multiple channels maybe copy them out to a separate file. Or email me. If this video gets 10 likes I will add the channel selection option.
 
 ### Case 2 (optional) — You don't have motion-corrected TIFFs saved
@@ -87,6 +87,16 @@ Once CaImAn is installed:
 3. NoRMCorre runs (rigid by default; enable **piecewise-rigid** in the sidebar's MOTION CORRECTION card for non-rigid correction), then the PTC analysis proceeds as in Case 1.
 
 **Saving the motion-corrected movie:** the **"Save motion-corrected TIFF (reg_tif)"** setting (checked by default) writes the NormCorre output as `reg_tif/file000_chan0.tif`-style chunks next to the source data, matching Suite2p's own naming convention. Next time you load the same folder, the tool finds this `reg_tif/` export and uses it directly.
+
+### Case 2b (fallback) — No `reg_tif`, and NormCorre isn't available either
+
+If there's no `reg_tif` export AND raw-TIFF motion correction isn't an option right now — CaImAn isn't installed, or the raw acquisition TIFFs can't be located automatically and you don't have (or don't want to point at) a raw-TIFF folder — the tool offers one more option before giving up: Suite2p's own `data.bin`, the registered binary Suite2p itself writes into the plane folder during its own run.
+
+This is opt-in every time, never automatic. When offered, a dialog explains the risk plainly: `data.bin` is a scratch/working file that Suite2p can silently overwrite on a later run, so it's only trustworthy if you're confident nothing has re-run Suite2p on that folder since the `F.npy` you're using was produced. You then either confirm the auto-detected `data.bin` next to `ops.npy` (or pointed at by `ops['reg_file']`), or browse to a different one — e.g. a copy you saved off before a re-run.
+
+Frame shape (`Ly`/`Lx`) is read from `ops.npy` (required — `data.bin` is a headerless raw binary), but the frame *count* is derived from the file's own size rather than trusted from `ops['nframes']`, since `ops.npy` can be just as stale as `data.bin` if the folder was copied or moved. If the two disagree, that mismatch is called out in the run's source note rather than silently picking one.
+
+`data.bin` loaded this way is treated exactly like a `reg_tif` export downstream — same PTC fit, same segmentation options (CNMF / Manual ROIs / Skip) if there's no `F.npy` — the only difference is the results panel and export files label its source as `data_bin` with an "UNVERIFIED" note, as a standing reminder of the staleness risk above.
 
 **Cell segmentation when there's no `F.npy`:** any time there's no `F.npy` available for the loaded dataset — Case 2, the Raw Movie flow below, or the no-Suite2p fallback further down — the tool asks how to fill the photon-flux panel, with three choices: run CaImAn **CNMF** on the registered movie to detect cells and extract traces automatically; draw **Manual ROIs** yourself; or **Skip** and leave the flux panel empty (the gain estimate itself doesn't need cell traces).
 
@@ -144,6 +154,7 @@ Gain Estimation mode is deliberately conservative about RAM as it kept crashing 
 | Edge margin (px) | 4 | Crops this many pixels off every edge of each frame before computing anything, to exclude blanking/vignetting artifacts near the frame border (see *PTC method notes* below). Matches the Lees et al. 2025 reference protocol's own default; set to 0 to disable cropping entirely. |
 | Exclude cell ROIs | off | Restrict the PTC fit to background/non-cell pixels only |
 | NormCorre: piecewise-rigid | off | Use non-rigid motion correction instead of rigid (Case 2 only) |
+| Use data.bin (Case 2b, opt-in) | -- | Offered only when `reg_tif` is missing and NormCorre isn't available; always requires an explicit confirmation dialog, never used silently |
 | Skip motion correction | off | Manual-TIFF mode only — skip NormCorre if the TIFF is already registered |
 | Save motion-corrected TIFF (reg_tif) | on | After NormCorre runs, save the result as `reg_tif/` chunks next to the source so future runs skip motion correction entirely |
 | CNMF cell radius (px) | 6 | Expected cell radius (`gSig`) passed to CaImAn CNMF, used only when it's offered to fill an empty flux panel after a fresh NormCorre run |

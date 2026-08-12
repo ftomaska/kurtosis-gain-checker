@@ -20,14 +20,23 @@ Three modes, toggled from the top bar:
                 1. reg_tif/   — Suite2p's saved registered TIFF stack
                 2. raw acquisition TIFFs, motion-corrected on the fly with
                    NoRMCorre (via CaImAn)
+                3. data.bin   — Suite2p's own registered binary, but ONLY
+                   if the user explicitly opts in when asked (never tried
+                   automatically -- see NOTE below)
 
-              NOTE: Suite2p's own registered binary (data.bin) is
-              deliberately NOT used as a fallback — it's a scratch/working
-              file that Suite2p can overwrite (e.g. on a subsequent re-run
-              or when processing other planes), so it isn't a trustworthy
-              record of the exact registered frames that produced F.npy.
-              If reg_tif wasn't exported, we re-derive a registered movie
-              from the raw TIFFs via NormCorre instead of trusting data.bin.
+              NOTE: Suite2p's own registered binary (data.bin) is a
+              scratch/working file that Suite2p can overwrite (e.g. on a
+              subsequent re-run or when processing other planes), so it
+              isn't a guaranteed-trustworthy record of the exact registered
+              frames that produced F.npy. It is therefore never used
+              automatically: if reg_tif wasn't exported, the tool's default
+              is still to re-derive a registered movie from the raw TIFFs
+              via NormCorre. But when that's not an option (no CaImAn
+              installed, or the raw TIFFs can't be located on this
+              machine), the tool now asks whether to use data.bin instead
+              -- found automatically next to ops.npy or pointed at
+              manually -- with an explicit warning about the staleness
+              risk above. It's opt-in every time, never a silent fallback.
 
               IMPORTANT: the registered movie is only ever loaded when you
               click "Run Analysis" in Gain Estimation mode — never on
@@ -675,6 +684,9 @@ def _caiman_missing_error(e):
         "If you have a reg_tif/ export instead, you don't need CaImAn at all — "
         "double-check the status bar after Load Data confirms "
         "'reg_tif found (N file(s))' before running the analysis.\n\n"
+        "If you loaded a Suite2p folder (not a manually-selected TIFF), you'll "
+        "also be offered Suite2p's own data.bin as a fallback -- opt-in only, "
+        "since it's a scratch file that can be stale.\n\n"
         f"(underlying error: {e})"
     )
 
@@ -887,15 +899,107 @@ def load_tiffs_direct(paths, max_frames, frame_start=None):
                             f"frames [{start}:{end}) read, NOT motion-corrected")
 
 
+def _resolve_data_bin_candidate(plane_dir, ops):
+    """Best-effort guess at Suite2p's own registered binary for this plane,
+    used only to pre-fill the confirmation dialog offered when there's no
+    reg_tif export (see load_registered_movie / _ask_data_bin_blocking) --
+    never read from or trusted without that explicit confirmation.
+
+    Checked in order: ops['reg_file'] (Suite2p's own recorded path for it
+    -- may be stale if this folder was copied/moved to a different
+    machine), then the conventional plane_dir/data.bin. Returns a path if
+    something exists there on disk, else None; doesn't validate size/shape
+    here, that's load_data_bin's job."""
+    reg_file = ops.get("reg_file")
+    if reg_file and os.path.isfile(str(reg_file)):
+        return str(reg_file)
+    default = os.path.join(plane_dir, "data.bin")
+    if os.path.isfile(default):
+        return default
+    return None
+
+
+def load_data_bin(path, ops, max_frames, frame_start=None):
+    """Load a contiguous frame window from Suite2p's own registered binary
+    (data.bin), as a manual, user-confirmed alternative to reg_tif/NormCorre
+    when there's no usable reg_tif export -- see load_registered_movie and
+    _ask_data_bin_blocking. Deliberately NOT wired in as an automatic
+    fallback: data.bin is Suite2p's scratch/working file and can be
+    silently overwritten by a later Suite2p run (e.g. on a subsequent
+    re-run, or when processing other planes), so it isn't a guaranteed-
+    trustworthy record of the exact frames that produced F.npy. This
+    function only ever runs after the user has explicitly picked/confirmed
+    a data.bin path themselves.
+
+    Ly/Lx come from ops.npy (required -- data.bin is a headerless raw
+    binary, so there's no way to recover frame shape from the file alone).
+    Frame count is derived from the file's own size divided by one frame's
+    byte count, NOT trusted from ops['nframes'] -- ops.npy can be just as
+    stale as data.bin if the folder was copied/moved, whereas file size is
+    ground truth for what's actually readable back out. If ops does carry
+    an nframes and it disagrees with the file-size-derived count, that
+    mismatch is surfaced in the returned note as a heads-up, not an error.
+
+    Suite2p always stores its registered binary as int16 (see suite2p's
+    io.BinaryFile), regardless of the original acquisition dtype, so that's
+    the dtype used here unconditionally."""
+    Ly, Lx = ops.get("Ly"), ops.get("Lx")
+    if not Ly or not Lx:
+        raise RuntimeError(
+            "ops.npy has no Ly/Lx -- can't interpret data.bin's raw frame "
+            "shape without it."
+        )
+    Ly, Lx = int(Ly), int(Lx)
+    frame_bytes = Ly * Lx * np.dtype(np.int16).itemsize
+    filesize = os.path.getsize(path)
+    if filesize < frame_bytes:
+        raise RuntimeError(
+            f"{path} is smaller than one {Lx}x{Ly} int16 frame "
+            f"({frame_bytes} bytes) -- not a readable data.bin for this ops.npy."
+        )
+    if filesize % frame_bytes != 0:
+        raise RuntimeError(
+            f"{path}'s size ({filesize} bytes) isn't an exact multiple of one "
+            f"{Lx}x{Ly} int16 frame ({frame_bytes} bytes) -- it likely doesn't "
+            f"match this ops.npy's Ly/Lx (e.g. a different plane, or a "
+            f"differently-cropped/binned run)."
+        )
+    n_frames_file = filesize // frame_bytes
+
+    nframes_note = ""
+    ops_nframes = ops.get("nframes")
+    if ops_nframes and int(ops_nframes) != n_frames_file:
+        nframes_note = (f"; NOTE: ops.npy says nframes={int(ops_nframes)} but "
+                         f"the file size implies {n_frames_file} -- one of them "
+                         f"is stale, using the file-size-derived count")
+
+    start, end = contiguous_window(n_frames_file, max_frames, start=frame_start)
+    mm = np.memmap(path, dtype=np.int16, mode="r", shape=(n_frames_file, Ly, Lx))
+    arr = np.array(mm[start:end])  # copy just the needed window, then drop the memmap
+    del mm
+
+    return RegisteredMovie(
+        arr, "data_bin",
+        f"data.bin ({path}), {n_frames_file} frame(s) total (file-size-derived), "
+        f"read frames [{start}:{end}) -- UNVERIFIED: Suite2p's data.bin is a "
+        f"scratch/working file and may not match this F.npy if Suite2p has "
+        f"re-run since{nframes_note}"
+    )
+
+
 def load_registered_movie(plane_dir, ops, max_frames, pw_rigid, progress_cb=None,
-                           ask_raw_dir=None, save_mc=False,
+                           ask_raw_dir=None, ask_data_bin=None, save_mc=False,
                            on_normcorre_start=None, on_normcorre_done=None, frame_start=None,
                            scratch_dir=None):
-    """Try reg_tif -> raw tiff + NormCorre, in order.
+    """Try reg_tif -> raw tiff + NormCorre -> (opt-in only) data.bin, in order.
 
-    Suite2p's own data.bin is intentionally never used here — it's a
+    Suite2p's own data.bin is never used automatically here -- it's a
     scratch file Suite2p can overwrite on a later run, so it isn't a
-    reliable record of the frames that produced the loaded F.npy.
+    guaranteed-reliable record of the frames that produced the loaded
+    F.npy. It's only used at all if `ask_data_bin` is given AND the raw-
+    TIFF/NormCorre route isn't available (CaImAn missing, or the raw TIFFs
+    can't be located) AND the user explicitly confirms it via that
+    callback -- see _ask_data_bin_blocking for the confirmation dialog.
 
     Note: if a reg_tif/ folder exists but contains no readable TIFFs,
     load_reg_tif raises rather than silently falling through to NormCorre —
@@ -916,23 +1020,41 @@ def load_registered_movie(plane_dir, ops, max_frames, pw_rigid, progress_cb=None
     if mov is not None:
         return mov
 
-    # No reg_tif -> everything past this point is working toward a NormCorre
-    # run, which needs CaImAn. Check now, before wasting the user's time on
-    # auto-resolve or (worse) a raw-TIFF folder picker dialog that leads
-    # nowhere -- see _require_caiman_for_normcorre's docstring.
-    _require_caiman_for_normcorre()
+    # No reg_tif -> the default plan is still raw-TIFF NormCorre, which
+    # needs CaImAn. If that's not installed, offer data.bin as a manual,
+    # explicitly-confirmed alternative before giving up -- rather than
+    # just failing outright the way this used to. Still opt-in only: no
+    # callback, or a decline, falls straight through to the original
+    # CaImAn-required error below.
+    caiman_available = True
+    caiman_err_msg = None
+    try:
+        _require_caiman_for_normcorre()
+    except RuntimeError as caiman_err:
+        caiman_available = False
+        caiman_err_msg = str(caiman_err)  # exception object itself is unbound after this except block
 
-    tiff_paths = _resolve_raw_tiffs(plane_dir, ops)
-    if not tiff_paths and ask_raw_dir is not None:
+    tiff_paths = _resolve_raw_tiffs(plane_dir, ops) if caiman_available else None
+    if caiman_available and not tiff_paths and ask_raw_dir is not None:
         d = ask_raw_dir()
         if d:
             tiff_paths = sorted(glob.glob(os.path.join(d, "*.tif")) + glob.glob(os.path.join(d, "*.tiff")))
-    if not tiff_paths:
+
+    if not caiman_available or not tiff_paths:
+        if ask_data_bin is not None:
+            candidate = _resolve_data_bin_candidate(plane_dir, ops)
+            data_bin_path = ask_data_bin(candidate)
+            if data_bin_path:
+                return load_data_bin(data_bin_path, ops, max_frames, frame_start=frame_start)
+            data_bin_hint = "You were offered data.bin as a fallback but didn't provide/confirm one."
+        else:
+            data_bin_hint = "Suite2p's data.bin is not used as a fallback unless you explicitly provide it."
+        if not caiman_available:
+            raise RuntimeError(f"{caiman_err_msg}\n\n{data_bin_hint}")
         raise RuntimeError(
             "No reg_tif export was found, and the raw acquisition TIFFs could not be "
             "located automatically (ops paths don't resolve on this machine). "
-            "Suite2p's data.bin is deliberately not used as a fallback since it can be "
-            "overwritten by later runs."
+            f"{data_bin_hint}"
         )
 
     arr, note_suffix = _normcorre_then_maybe_save(
@@ -53560,7 +53682,8 @@ class KurtosisChecker:
         # hint can never say "found" while Run Analysis then falls back anyway.
         n_reg_files = len(_find_reg_tif_files(reg_dir)) if os.path.isdir(reg_dir) else 0
         src_hint = (f"reg_tif found ({n_reg_files} file(s))" if n_reg_files else
-                    "no usable reg_tif — will need NormCorre on raw TIFFs")
+                    "no usable reg_tif — will need NormCorre on raw TIFFs "
+                    "(or you'll be offered data.bin if that's unavailable)")
         self.status_var.set(f"Loaded: {plane_dir}  ·  {n_cells} cells  ·  "
                               f"fs={self.fs_var.get()} Hz  ·  {src_hint}  ·  click Run Analysis")
         self._draw_gain_splash()
@@ -54104,6 +54227,76 @@ class KurtosisChecker:
         event.wait()
         return result.get("answer")
 
+    def _ask_data_bin_blocking(self, candidate):
+        """Called from load_registered_movie when there's no reg_tif export
+        AND the raw-TIFF/NormCorre route isn't available (CaImAn missing,
+        or the raw TIFFs couldn't be located) -- offers Suite2p's own
+        data.bin as a manual, explicitly-confirmed last resort. Blocks the
+        worker thread until answered, same main-thread-marshal pattern as
+        _ask_yesno_blocking.
+
+        data.bin is deliberately never used without this confirmation: it's
+        Suite2p's scratch/working binary and can be silently overwritten by
+        a later Suite2p run, so it isn't a guaranteed match for the F.npy
+        that's currently loaded -- see load_data_bin's docstring.
+
+        `candidate`: an auto-detected data.bin path (ops['reg_file'] or
+        plane_dir/data.bin), or None if nothing was found automatically --
+        either way the user gets a chance to browse for a different file
+        instead.
+
+        Returns the data.bin path to use, or None to let the caller raise
+        its normal "couldn't find a registered movie" error instead."""
+        result = {}
+        event = threading.Event()
+        def _ask():
+            path = candidate
+            if candidate:
+                use_it = messagebox.askyesno(
+                    "Use data.bin instead?",
+                    f"No reg_tif export was found, and raw-TIFF motion "
+                    f"correction isn't available right now.\n\n"
+                    f"Suite2p's registered binary looks present:\n\n"
+                    f"{candidate}\n\n"
+                    f"data.bin is a scratch/working file -- Suite2p can "
+                    f"silently overwrite it on a later run, so only use it "
+                    f"if you're confident it still matches this F.npy (e.g. "
+                    f"you haven't re-run Suite2p on this folder since).\n\n"
+                    f"Use it as the registered movie?")
+                if not use_it:
+                    path = None
+                    browse = messagebox.askyesno(
+                        "Pick a different data.bin?",
+                        "Point at a different data.bin file instead?")
+                    if browse:
+                        p = filedialog.askopenfilename(
+                            title="Select data.bin",
+                            filetypes=[("Suite2p binary", "*.bin"), ("All", "*.*")])
+                        path = p or None
+            else:
+                browse = messagebox.askyesno(
+                    "No reg_tif -- provide data.bin?",
+                    "No reg_tif export was found, and raw-TIFF motion "
+                    "correction isn't available right now (CaImAn missing, "
+                    "or the raw TIFFs couldn't be located).\n\n"
+                    "If you have Suite2p's data.bin (its registered binary) "
+                    "saved somewhere, you can point the tool at it directly "
+                    "instead.\n\n"
+                    "Note: data.bin is a scratch file and isn't guaranteed "
+                    "to match this F.npy -- only use it if you're confident "
+                    "it does.\n\n"
+                    "Locate a data.bin file now?")
+                if browse:
+                    p = filedialog.askopenfilename(
+                        title="Select data.bin",
+                        filetypes=[("Suite2p binary", "*.bin"), ("All", "*.*")])
+                    path = p or None
+            result["path"] = path
+            event.set()
+        self.root.after(0, _ask)
+        event.wait()
+        return result.get("path")
+
     def _draw_manual_rois_blocking(self, mean_img):
         """Shows the manual polygon-ROI drawing tool (ManualROIDrawer) and
         blocks this (worker) thread until the user finishes (Done/Cancel/
@@ -54206,6 +54399,7 @@ class KurtosisChecker:
                 movie = load_registered_movie(
                     self.g_plane_dir, self.g_ops, max_frames, pw_rigid,
                     progress_cb=self._gain_progress, ask_raw_dir=self._ask_raw_dir,
+                    ask_data_bin=self._ask_data_bin_blocking,
                     save_mc=save_mc,
                     on_normcorre_start=self._motion_overlay_start,
                     on_normcorre_done=self._motion_overlay_stop,
@@ -54246,7 +54440,7 @@ class KurtosisChecker:
                 self._gain_progress("Movie loaded — showing mean projection "
                                      "for a cell-size check...")
                 self._show_mean_projection_blocking(movie.array)
-                movie_desc = ("the registered movie" if movie.source == "reg_tif"
+                movie_desc = ("the registered movie" if movie.source in ("reg_tif", "data_bin")
                                else "the motion-corrected movie")
                 seg_choice = self._ask_choice_blocking(
                     "Run cell segmentation?",
