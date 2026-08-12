@@ -16,27 +16,25 @@ Three modes, toggled from the top bar:
               recover true gain (ADU/photon) after ENF correction, then
               converted to per-cell photon flux using F.npy.
 
-              Registered-movie source, in priority order:
+              Registered-movie source:
                 1. reg_tif/   — Suite2p's saved registered TIFF stack
-                2. raw acquisition TIFFs, motion-corrected on the fly with
-                   NoRMCorre (via CaImAn)
-                3. data.bin   — Suite2p's own registered binary, but ONLY
-                   if the user explicitly opts in when asked (never tried
-                   automatically -- see NOTE below)
+                   (used automatically if present)
+                2 or 3, user's choice each time reg_tif is missing:
+                   - data.bin — Suite2p's own registered binary
+                   - raw acquisition TIFFs, motion-corrected on the fly
+                     with NoRMCorre (via CaImAn)
 
               NOTE: Suite2p's own registered binary (data.bin) is a
               scratch/working file that Suite2p can overwrite (e.g. on a
               subsequent re-run or when processing other planes), so it
               isn't a guaranteed-trustworthy record of the exact registered
               frames that produced F.npy. It is therefore never used
-              automatically: if reg_tif wasn't exported, the tool's default
-              is still to re-derive a registered movie from the raw TIFFs
-              via NormCorre. But when that's not an option (no CaImAn
-              installed, or the raw TIFFs can't be located on this
-              machine), the tool now asks whether to use data.bin instead
-              -- found automatically next to ops.npy or pointed at
-              manually -- with an explicit warning about the staleness
-              risk above. It's opt-in every time, never a silent fallback.
+              automatically -- as soon as reg_tif is missing, a dialog
+              asks whether to use data.bin (found automatically next to
+              ops.npy, or pointed at manually) or run NormCorre on the raw
+              TIFFs instead, with an explicit warning about the staleness
+              risk above. This choice is asked every time, regardless of
+              whether CaImAn/NormCorre would have worked anyway.
 
               IMPORTANT: the registered movie is only ever loaded when you
               click "Run Analysis" in Gain Estimation mode — never on
@@ -684,9 +682,10 @@ def _caiman_missing_error(e):
         "If you have a reg_tif/ export instead, you don't need CaImAn at all — "
         "double-check the status bar after Load Data confirms "
         "'reg_tif found (N file(s))' before running the analysis.\n\n"
-        "If you loaded a Suite2p folder (not a manually-selected TIFF), you'll "
-        "also be offered Suite2p's own data.bin as a fallback -- opt-in only, "
-        "since it's a scratch file that can be stale.\n\n"
+        "If you loaded a Suite2p folder (not a manually-selected TIFF), you should "
+        "have already been asked whether to use Suite2p's own data.bin instead -- "
+        "if you picked NormCorre there, pick data.bin next time to skip CaImAn "
+        "entirely.\n\n"
         f"(underlying error: {e})"
     )
 
@@ -991,15 +990,18 @@ def load_registered_movie(plane_dir, ops, max_frames, pw_rigid, progress_cb=None
                            ask_raw_dir=None, ask_data_bin=None, save_mc=False,
                            on_normcorre_start=None, on_normcorre_done=None, frame_start=None,
                            scratch_dir=None):
-    """Try reg_tif -> raw tiff + NormCorre -> (opt-in only) data.bin, in order.
+    """Try reg_tif -> (opt-in) data.bin -> raw tiff + NormCorre, in order.
 
-    Suite2p's own data.bin is never used automatically here -- it's a
-    scratch file Suite2p can overwrite on a later run, so it isn't a
-    guaranteed-reliable record of the frames that produced the loaded
-    F.npy. It's only used at all if `ask_data_bin` is given AND the raw-
-    TIFF/NormCorre route isn't available (CaImAn missing, or the raw TIFFs
-    can't be located) AND the user explicitly confirms it via that
-    callback -- see _ask_data_bin_blocking for the confirmation dialog.
+    Suite2p's own data.bin is never used automatically -- it's a scratch
+    file Suite2p can overwrite on a later run, so it isn't a guaranteed-
+    reliable record of the frames that produced the loaded F.npy. But as
+    soon as reg_tif is missing, and BEFORE committing to a NormCorre run
+    (which needs CaImAn and can take a while), the tool now asks up front
+    whether to use data.bin instead -- via `ask_data_bin`, if given --
+    every single time, regardless of whether CaImAn/NormCorre would have
+    worked anyway. See _ask_data_bin_blocking for the confirmation
+    dialog. Declining (or no `ask_data_bin` callback at all) falls
+    straight through to the original raw-TIFF/NormCorre path, unchanged.
 
     Note: if a reg_tif/ folder exists but contains no readable TIFFs,
     load_reg_tif raises rather than silently falling through to NormCorre —
@@ -1020,41 +1022,37 @@ def load_registered_movie(plane_dir, ops, max_frames, pw_rigid, progress_cb=None
     if mov is not None:
         return mov
 
-    # No reg_tif -> the default plan is still raw-TIFF NormCorre, which
-    # needs CaImAn. If that's not installed, offer data.bin as a manual,
-    # explicitly-confirmed alternative before giving up -- rather than
-    # just failing outright the way this used to. Still opt-in only: no
-    # callback, or a decline, falls straight through to the original
-    # CaImAn-required error below.
-    caiman_available = True
-    caiman_err_msg = None
-    try:
-        _require_caiman_for_normcorre()
-    except RuntimeError as caiman_err:
-        caiman_available = False
-        caiman_err_msg = str(caiman_err)  # exception object itself is unbound after this except block
+    # No reg_tif -> ask up front, every time, whether to use data.bin
+    # instead of NormCorre -- not just as a last resort when NormCorre
+    # can't run at all. Still opt-in: declining (or no ask_data_bin
+    # callback) falls straight through to the normal CaImAn/raw-TIFF path
+    # below, unchanged.
+    if ask_data_bin is not None:
+        candidate = _resolve_data_bin_candidate(plane_dir, ops)
+        data_bin_path = ask_data_bin(candidate)
+        if data_bin_path:
+            return load_data_bin(data_bin_path, ops, max_frames, frame_start=frame_start)
 
-    tiff_paths = _resolve_raw_tiffs(plane_dir, ops) if caiman_available else None
-    if caiman_available and not tiff_paths and ask_raw_dir is not None:
+    # Declined (or not offered) -> default plan is raw-TIFF NormCorre,
+    # which needs CaImAn. Check now, before wasting the user's time on
+    # auto-resolve or (worse) a raw-TIFF folder picker dialog that leads
+    # nowhere -- see _require_caiman_for_normcorre's docstring.
+    _require_caiman_for_normcorre()
+
+    tiff_paths = _resolve_raw_tiffs(plane_dir, ops)
+    if not tiff_paths and ask_raw_dir is not None:
         d = ask_raw_dir()
         if d:
             tiff_paths = sorted(glob.glob(os.path.join(d, "*.tif")) + glob.glob(os.path.join(d, "*.tiff")))
-
-    if not caiman_available or not tiff_paths:
-        if ask_data_bin is not None:
-            candidate = _resolve_data_bin_candidate(plane_dir, ops)
-            data_bin_path = ask_data_bin(candidate)
-            if data_bin_path:
-                return load_data_bin(data_bin_path, ops, max_frames, frame_start=frame_start)
-            data_bin_hint = "You were offered data.bin as a fallback but didn't provide/confirm one."
-        else:
-            data_bin_hint = "Suite2p's data.bin is not used as a fallback unless you explicitly provide it."
-        if not caiman_available:
-            raise RuntimeError(f"{caiman_err_msg}\n\n{data_bin_hint}")
+    if not tiff_paths:
         raise RuntimeError(
             "No reg_tif export was found, and the raw acquisition TIFFs could not be "
             "located automatically (ops paths don't resolve on this machine). "
-            f"{data_bin_hint}"
+            "Suite2p's data.bin was offered earlier and declined/not provided."
+            if ask_data_bin is not None else
+            "No reg_tif export was found, and the raw acquisition TIFFs could not be "
+            "located automatically (ops paths don't resolve on this machine). "
+            "Suite2p's data.bin is not used as a fallback unless you explicitly provide it."
         )
 
     arr, note_suffix = _normcorre_then_maybe_save(
@@ -53682,8 +53680,8 @@ class KurtosisChecker:
         # hint can never say "found" while Run Analysis then falls back anyway.
         n_reg_files = len(_find_reg_tif_files(reg_dir)) if os.path.isdir(reg_dir) else 0
         src_hint = (f"reg_tif found ({n_reg_files} file(s))" if n_reg_files else
-                    "no usable reg_tif — will need NormCorre on raw TIFFs "
-                    "(or you'll be offered data.bin if that's unavailable)")
+                    "no usable reg_tif — you'll be asked data.bin vs. NormCorre "
+                    "at Run Analysis")
         self.status_var.set(f"Loaded: {plane_dir}  ·  {n_cells} cells  ·  "
                               f"fs={self.fs_var.get()} Hz  ·  {src_hint}  ·  click Run Analysis")
         self._draw_gain_splash()
@@ -54228,12 +54226,14 @@ class KurtosisChecker:
         return result.get("answer")
 
     def _ask_data_bin_blocking(self, candidate):
-        """Called from load_registered_movie when there's no reg_tif export
-        AND the raw-TIFF/NormCorre route isn't available (CaImAn missing,
-        or the raw TIFFs couldn't be located) -- offers Suite2p's own
-        data.bin as a manual, explicitly-confirmed last resort. Blocks the
-        worker thread until answered, same main-thread-marshal pattern as
-        _ask_yesno_blocking.
+        """Called from load_registered_movie the moment there's no reg_tif
+        export -- BEFORE any CaImAn/NormCorre attempt, every time, not just
+        as a last resort. Puts up a single "no reg_tif -- data.bin or
+        NormCorre?" choice dialog and blocks the worker thread until
+        answered, same main-thread-marshal pattern as _ask_choice_blocking
+        (built directly on _pick_option_dialog rather than routing through
+        _ask_choice_blocking, since that method's own root.after/event.wait
+        pair would deadlock if nested inside this one).
 
         data.bin is deliberately never used without this confirmation: it's
         Suite2p's scratch/working binary and can be silently overwritten by
@@ -54242,51 +54242,33 @@ class KurtosisChecker:
 
         `candidate`: an auto-detected data.bin path (ops['reg_file'] or
         plane_dir/data.bin), or None if nothing was found automatically --
-        either way the user gets a chance to browse for a different file
-        instead.
+        picking "Use data.bin" with no candidate opens a file browser
+        instead of assuming a path.
 
-        Returns the data.bin path to use, or None to let the caller raise
-        its normal "couldn't find a registered movie" error instead."""
+        Returns the data.bin path to use, or None if the user picked
+        "Run NormCorre" (or closed the dialog) -- letting
+        load_registered_movie fall through to its normal CaImAn/raw-TIFF
+        path unchanged."""
         result = {}
         event = threading.Event()
         def _ask():
-            path = candidate
-            if candidate:
-                use_it = messagebox.askyesno(
-                    "Use data.bin instead?",
-                    f"No reg_tif export was found, and raw-TIFF motion "
-                    f"correction isn't available right now.\n\n"
-                    f"Suite2p's registered binary looks present:\n\n"
-                    f"{candidate}\n\n"
-                    f"data.bin is a scratch/working file -- Suite2p can "
-                    f"silently overwrite it on a later run, so only use it "
-                    f"if you're confident it still matches this F.npy (e.g. "
-                    f"you haven't re-run Suite2p on this folder since).\n\n"
-                    f"Use it as the registered movie?")
-                if not use_it:
-                    path = None
-                    browse = messagebox.askyesno(
-                        "Pick a different data.bin?",
-                        "Point at a different data.bin file instead?")
-                    if browse:
-                        p = filedialog.askopenfilename(
-                            title="Select data.bin",
-                            filetypes=[("Suite2p binary", "*.bin"), ("All", "*.*")])
-                        path = p or None
-            else:
-                browse = messagebox.askyesno(
-                    "No reg_tif -- provide data.bin?",
-                    "No reg_tif export was found, and raw-TIFF motion "
-                    "correction isn't available right now (CaImAn missing, "
-                    "or the raw TIFFs couldn't be located).\n\n"
-                    "If you have Suite2p's data.bin (its registered binary) "
-                    "saved somewhere, you can point the tool at it directly "
-                    "instead.\n\n"
-                    "Note: data.bin is a scratch file and isn't guaranteed "
-                    "to match this F.npy -- only use it if you're confident "
-                    "it does.\n\n"
-                    "Locate a data.bin file now?")
-                if browse:
+            path = None
+            msg = ("No reg_tif export was found for this recording.\n\n"
+                   + (f"Suite2p's registered binary looks present:\n{candidate}\n\n"
+                      if candidate else "") +
+                   "Do you have data.bin for it, or should this run raw-TIFF "
+                   "motion correction with NormCorre instead?\n\n"
+                   "data.bin is a scratch/working file -- Suite2p can "
+                   "silently overwrite it on a later run, so only use it if "
+                   "you're confident it still matches this F.npy (e.g. you "
+                   "haven't re-run Suite2p on this folder since).")
+            choice = self._pick_option_dialog(
+                "No reg_tif -- data.bin or NormCorre?", msg,
+                ["Use data.bin", "Run NormCorre"])
+            if choice == "Use data.bin":
+                if candidate:
+                    path = candidate
+                else:
                     p = filedialog.askopenfilename(
                         title="Select data.bin",
                         filetypes=[("Suite2p binary", "*.bin"), ("All", "*.*")])
