@@ -51902,11 +51902,13 @@ def neuropil_recording_stats(F, Fneu, fs, spks=None):
                 relative to mean F
       np_to_F   mean Fneu / mean F
 
-    With spks (Suite2p's OASIS output, same rows as F), display only (the
-    simulation does not run OASIS, so these are not used for matching):
+    With spks (Suite2p's OASIS output, same rows as F):
       event_rate   frames with spks > 2 x F noise SD, per second
       ring_ratio   event-triggered Fneu response / F response (how much of
-                   a cell's own transient shows up in its neuropil ring)
+                   a cell's own transient shows up in its neuropil ring) --
+                   used for matching; strongly moves the best spike-train alpha
+      (event_rate is shown only: OASIS undercounts, and the simulation has
+      no OASIS step to calibrate that against)
     """
     F = np.asarray(F, dtype=float)
     Fneu = np.asarray(Fneu, dtype=float)
@@ -51994,33 +51996,45 @@ def suggest_alpha_ranges(sweep, rec_stats, calib):
             a_min = float(alphas[j] + 0.5 * (y0 - y2) / den * (alphas[1] - alphas[0]))
     at_edge = j == 0 or j == len(alphas) - 1
 
+    # distance to each simulated condition: log ratio for scale-like statistics,
+    # difference / scale for the rest (ring_ratio can be ~0 or negative)
     conds = calib.get("conditions", [])
-    best_c, best_d = None, float("inf")
     keys = calib.get("match_on", ["np_fluct", "noise_F"])
+    lin_scale = calib.get("match_scale", {"ring_ratio": 0.3})
+    dists = []
     for c in conds:
         d2, n = 0.0, 0
         for k in keys:
             a, b = rec_stats.get(k), c.get("stats", {}).get(k)
-            if a is None or b is None or not (a > 0 and b > 0):
+            if a is None or b is None or not (np.isfinite(a) and np.isfinite(b)):
                 continue
-            d2 += math.log(a / b) ** 2
+            if k in lin_scale:
+                d2 += ((a - b) / lin_scale[k]) ** 2
+            elif a > 0 and b > 0:
+                d2 += math.log(a / b) ** 2
+            else:
+                continue
             n += 1
-        d = math.sqrt(d2) if n else float("inf")
-        if d < best_d or best_c is None:
-            best_c, best_d = c, d
-    if best_c is None:
+        dists.append(math.sqrt(d2) if n else float("inf"))
+    if not conds or not np.isfinite(min(dists)):
         return None
-
-    out = {"alpha_min": a_min, "alpha_min_at_edge": at_edge, "condition": best_c.get("name", "?"),
+    # pool every condition about as close as the nearest one: conditions the
+    # statistics cannot tell apart (e.g. firing rate, contamination) all count
+    tol = float(calib.get("pool_tol", 0.15))
+    d_best = min(dists)
+    pool = [c for c, d in zip(conds, dists) if d <= d_best + tol]
+    best_d = d_best
+    out = {"alpha_min": a_min, "alpha_min_at_edge": at_edge,
+           "condition": ", ".join(c.get("name", "?") for c in pool),
            "distance": best_d, "provisional": bool(calib.get("provisional", True)),
            "source": calib.get("_path", ""), "goals": {}}
     for g in ALPHA_GOALS:
-        o = best_c.get("offsets", {}).get(g)
-        if not o:
-            continue
-        lo = [v for v in o.get("lo", []) if v is not None]
-        hi = [v for v in o.get("hi", []) if v is not None]
-        be = [v for v in o.get("best", []) if v is not None]
+        lo, hi, be = [], [], []
+        for c in pool:
+            o = c.get("offsets", {}).get(g) or {}
+            lo += [v for v in o.get("lo", []) if v is not None]
+            hi += [v for v in o.get("hi", []) if v is not None]
+            be += [v for v in o.get("best", []) if v is not None]
         if not lo or not hi or not be:
             continue
         rng = (max(0.0, a_min + min(lo)), max(0.0, a_min + max(hi)))
@@ -55111,7 +55125,7 @@ class KurtosisChecker:
         if "event_rate" in st:
             L.append((f"OASIS events/s (spks > 2 noise SD)  {st['event_rate']:.2f}", TEXT_MAIN, 8, "normal"))
             L.append((f"own transient in ring (Fneu/F response)  {st['ring_ratio']:.2f}", TEXT_MAIN, 8, "normal"))
-            L.append(("  (spike-based statistics: shown only, not used for matching)", TEXT_DIM, 7, "normal"))
+            L.append(("  (ring ratio is used for matching; event rate is shown only)", TEXT_DIM, 7, "normal"))
         else:
             L.append(("no spks.npy: spike-based statistics skipped", TEXT_DIM, 7.5, "normal"))
         y = 1.0

@@ -96,7 +96,15 @@ def condition(in_path, out_path, name):
     Ns = [np.asarray(f, float) for f in np.atleast_1d(I["Fneu"])]
     al = np.atleast_1d(R["alphas"]).astype(float)
     nL = len(Fs)
-    st = neuropil_recording_stats(Fs[0], Ns[0], hz)
+    # ring_ratio needs spikes: use the true spikes as an idealised spks array
+    # (every spike passes the app's event threshold); level 1 = independent cells
+    spk = np.zeros_like(Fs[0])
+    if "spikeTimes" in I:
+        for i, ts in enumerate(np.atleast_1d(I["spikeTimes"])[0]):
+            fr = np.floor(np.atleast_1d(ts).astype(float) * hz).astype(int)
+            fr = fr[(fr >= 0) & (fr < spk.shape[1])]
+            np.add.at(spk[i], fr, 1e9)
+    st = neuropil_recording_stats(Fs[0], Ns[0], hz, spk if spk.any() else None)
     rsc = [float(v) for v in np.atleast_1d(R.get("spkCorrTrueSubset", I.get("spkCorr")))]
     offs = {g: {"best": [], "lo": [], "hi": []} for g in ["spike_train", "precision", "recall", "correlation"]}
     amins = []
@@ -124,7 +132,7 @@ def condition(in_path, out_path, name):
         offs["correlation"]["hi"].append(round(hi - amin, 3))
     cT = np.atleast_1d(I["cTrue"]).astype(float) if "cTrue" in I else None
     return {"name": name,
-            "stats": {k: round(float(st[k]), 4) for k in ["np_fluct", "noise_F", "np_to_F"]},
+            "stats": {k: round(float(st[k]), 4) for k in ["np_fluct", "noise_F", "np_to_F", "ring_ratio"] if k in st},
             "rsc": [round(v, 4) for v in rsc],
             "alpha_min": [round(v, 3) for v in amins],
             "c_true_median": None if cT is None else round(float(np.median(cT)), 3),
@@ -159,7 +167,7 @@ def main():
            "provisional": bool(a.provisional or len(conds) < 2),
            "description": "alpha offsets (alpha - alpha_min) from Allen-calibrated simulations scored "
                           "with OMSI against ground-truth spikes; see tools/build_alpha_calibration.py",
-           "match_on": ["np_fluct", "noise_F"],
+           "match_on": ["np_fluct", "noise_F", "ring_ratio"],
            "tol": TOL, "tol_corr": TOL_CORR,
            "conditions": conds}
     with open(a.out, "w") as fh:
