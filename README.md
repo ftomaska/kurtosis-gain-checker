@@ -4,7 +4,7 @@ A desktop tool for two-photon calcium imaging QC, built around Suite2p output. I
 
 - **Kurtosis** — sorts and visualizes ROI traces by kurtosis or SNR to let the user assess whether one or the other can sort their data better
 - **Gain Estimation** — runs a photon-transfer-curve analysis on a Suite2p recording to estimate PMT/camera gain (ADU/photon) and convert each cell's fluorescence to photons/cell/s. Option to use raw recordings that can be motion corrected (requires caiman package) and segmented.
-- **Neuropil Sweep** — Suite2p only. Sweeps the neuropil-subtraction coefficient alpha (`Fcorr = rawF - alpha*Fneu`) and plots the mean ± SEM pairwise cell-cell correlation at each alpha, to help pick a good alpha for your recording.
+- **Neuropil Sweep** — Suite2p only. Sweeps the neuropil-subtraction coefficient alpha (`Fcorr = rawF - alpha*Fneu`), plots the mean ± SEM pairwise cell-cell correlation at each alpha, and suggests alpha ranges for spike-train accuracy, precision, recall and true pairwise correlation from a ground-truth simulation.
 
 ## At a Glance
 
@@ -181,13 +181,23 @@ The summary row records each detail file's name, so a given condition's summary 
 
 The third tab, Suite2p-only (needs `F.npy`, `Fneu.npy`, `stat.npy`, and `iscell.npy` in the same folder — no registered movie, NormCorre, or CaImAn involved at all). Click **📁 Suite2p Folder** in its sidebar's LOAD card, then **Run Analysis**.
 
-**What it does:** sweeps the neuropil-subtraction coefficient alpha across a configurable range (default 0–2, step 0.05) in `Fcorr = rawF - alpha*Fneu`, and at each alpha computes the mean ± SEM of the off-diagonal pairwise Pearson correlation between cells (only cells with `iscell == 1`). The plot marks the alpha whose mean correlation is closest to zero with a dashed line, as a starting-point suggestion.
+**What it does:** sweeps the neuropil-subtraction coefficient alpha across a configurable range (default 0–2, step 0.05) in `Fcorr = rawF - alpha*Fneu`, and at each alpha computes the mean ± SEM of the off-diagonal pairwise Pearson correlation between cells (only cells with `iscell == 1`). The dashed line marks the minimum of that curve, which serves as the anchor for the suggested ranges below (not as a recommendation itself).
 
 **Exclusion distance (default 4px):** cells whose ROI mask comes within this many pixels of the FOV border are dropped from the sweep entirely. Distance is the exact nearest-pixel (edge-to-edge) gap between the ROI's `stat.npy` pixel mask and the frame edge (using `ops.npy`'s `Ly`/`Lx`), not centroid-to-centroid — cells right at the edge of the field of view can have a clipped/incomplete neuropil ring, biasing `Fneu` the same way at every alpha.
 
 **Cell filter (optional):** the **"Filter by kurtosis"** checkbox restricts the sweep to cells with Pearson kurtosis (`fisher=False`, normal ≈ 3) above a threshold (default 5), computed on the raw, un-subtracted trace before anything else runs.
 
 The sidebar's alpha range/step and exclusion-distance fields, and the kurtosis-filter checkbox/threshold, are the only settings — see `neuropil_alpha_sweep`, `build_border_exclusion_mask`, and `roi_border_distance` in `kurtosis_checker.py` for the implementation.
+
+**Suggested alpha ranges.** The alpha at the minimum of the sweep is *not* recommended: it assumes the cells' real activity is uncorrelated with the neuropil, so it is pushed up whenever the population is correlated, and by each cell's own light leaking into its neuropil ring. It is still useful as an anchor: adding contamination k moves the minimum and every optimal alpha by exactly k (F + k·Fneu − alpha·Fneu = F − (alpha − k)·Fneu), so the distance from the minimum to an optimum does not depend on the unknown contamination. The tab reports, for four goals, a range of alphas measured from the minimum using offsets from a ground-truth simulation (Allen Huang et al. 2021–calibrated traces, OMSI spike inference, scored against the true spikes):
+
+- **Spike-train accuracy** — COSMIC-style triangular-kernel correlation (0.5 s half-width) between inferred and true spikes
+- **Precision** and **Recall** — spike matching within ±100 ms
+- **True pairwise correlation** — mean pairwise correlation of inferred spike counts (1 s bins) equal to the truth
+
+The bright bar is the spread of the best alpha across the simulated correlation levels (the recording's true correlation is unknown); the pale bar is the near-optimal band (within 5% of best; within 0.02 of the true correlation for the last goal).
+
+The tab also reports recording statistics (median over cells): neuropil fluctuation size (SD of Fneu/median after 1 s smoothing), noise SD / mean F, mean Fneu / mean F, and — if `spks.npy` is present — OASIS event rate and how much of a cell's own transient appears in its ring. The first two pick the closest simulated condition in `alpha_calibration.json` (place it next to `kurtosis_checker.py`; build it with `tools/build_alpha_calibration.py` from the simulation grid). Without that file the built-in table covers the baseline simulation only and the suggestions are marked **provisional**. The spike-based statistics are shown but not used for matching yet.
 
 ## PTC method notes (vs. the Lees et al. 2025 reference protocol)
 

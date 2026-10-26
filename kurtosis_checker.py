@@ -60,7 +60,11 @@ Three modes, toggled from the top bar:
               kurtosis (same convention as the Kurtosis tab) above a
               threshold (default 5), to focus on clearly active cells.
               See neuropil_alpha_sweep/build_border_exclusion_mask/
-              roi_border_distance for the implementation.
+              roi_border_distance for the implementation. Also reports
+              recording statistics and suggested alpha ranges per goal
+              (spike-train accuracy, precision, recall, true pairwise
+              correlation), measured from the sweep minimum with offsets
+              from a ground-truth simulation -- see suggest_alpha_ranges.
 
 Fall.mat: reads F, Fneu, ops.fs automatically (kurtosis mode).
 
@@ -73,7 +77,7 @@ Optional (only for the raw-TIFF NormCorre fallback in gain mode): caiman
 # Bump this on every change so a running instance's window title can be checked
 # against what's actually in this file -- handy when the app runs on a machine
 # separate from wherever this source file is being edited.
-APP_VERSION = "2026-07-17.20"
+APP_VERSION = "2026-10-26.1"
 
 import os
 import sys
@@ -51767,6 +51771,7 @@ def neuropil_alpha_sweep(F, Fneu, stat, alphas, exclude_px, Ly, Lx,
     F = np.asarray(F, dtype=float)
     Fneu = np.asarray(Fneu, dtype=float)
     stat = list(stat)
+    kept_idx = np.arange(F.shape[0])   # rows of the input that survive both filters
 
     if kurtosis_thresh is not None:
         kurt = stats.kurtosis(F, axis=1, fisher=False)
@@ -51774,6 +51779,7 @@ def neuropil_alpha_sweep(F, Fneu, stat, alphas, exclude_px, Ly, Lx,
         F = F[keep]
         Fneu = Fneu[keep]
         stat = [s for s, k in zip(stat, keep) if k]
+        kept_idx = kept_idx[keep]
 
     if progress_cb:
         progress_cb(f"Excluding cells within {exclude_px:.0f}px of the "
@@ -51784,6 +51790,7 @@ def neuropil_alpha_sweep(F, Fneu, stat, alphas, exclude_px, Ly, Lx,
     F = F[keep2]
     Fneu = Fneu[keep2]
     stat = [s for s, k in zip(stat, keep2) if k]
+    kept_idx = kept_idx[keep2]
 
     n_cells = F.shape[0]
     if n_cells < 2:
@@ -51822,7 +51829,204 @@ def neuropil_alpha_sweep(F, Fneu, stat, alphas, exclude_px, Ly, Lx,
         "exclude_px": float(exclude_px),
         "n_excluded_border": n_excluded_border,
         "kurtosis_thresh": kurtosis_thresh,
+        "kept_idx": kept_idx,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Suggested alpha ranges (Neuropil Sweep tab)
+#
+# The minimum of the sweep curve (alpha_min) is NOT the right alpha: it
+# assumes the cells' real activity is uncorrelated with the neuropil, so it
+# overshoots whenever the population is correlated (and because each cell's
+# own light leaks into its ring). What it IS good for is an anchor: adding
+# contamination k moves alpha_min and every optimal alpha by exactly k
+# (F + k*Fneu - alpha*Fneu = F - (alpha - k)*Fneu), so "optimum - alpha_min"
+# does not depend on the unknown contamination. Those offsets come from a
+# ground-truth simulation (Allen Huang et al. 2021 calibrated, OMSI spike
+# inference, scored against the true spikes) and are stored per simulated
+# condition in alpha_calibration.json (built by tools/build_alpha_calibration.py);
+# the condition closest to this recording's measured statistics is used.
+# The true population correlation is unknown, so each suggested range spans
+# all simulated correlation levels.
+# ─────────────────────────────────────────────────────────────────────────
+
+ALPHA_CALIB_FILENAME = "alpha_calibration.json"
+
+# goal key -> (label, how the near-optimal band was defined in the simulation)
+ALPHA_GOALS = {
+    "spike_train": ("Spike-train accuracy", "COSMIC-style triangular corr. (0.5 s) within 5% of best"),
+    "precision":   ("Precision",            "within 5% of best"),
+    "recall":      ("Recall",               "within 5% of best"),
+    "correlation": ("True pairwise corr.",  "inferred corr. (1 s bins) within 0.02 of the truth"),
+}
+
+# Fallback when no alpha_calibration.json sits next to this script: the
+# baseline simulation only (one condition), so the match to a recording's
+# statistics is not used yet. Offsets are alpha - alpha_min.
+ALPHA_CALIBRATION_DEFAULT = {'version': '2026-10-26',
+ 'provisional': True,
+ 'description': 'BUILT-IN DEFAULT: baseline simulation only (6 Allen GCaMP6s 2x recordings, 5 '
+                'correlation levels, OMSI). Replace with alpha_calibration.json built from the '
+                'condition grid.',
+ 'match_on': ['np_fluct', 'noise_F'],
+ 'tol': 0.05,
+ 'tol_corr': 0.02,
+ 'conditions': [{'name': 'baseline',
+                 'stats': {'np_fluct': 0.1458, 'noise_F': 0.0925, 'np_to_F': 0.8402},
+                 'rsc': [0.0005, 0.0237, 0.0493, 0.0986, 0.1975],
+                 'alpha_min': [1.04, 1.15, 1.21, 1.27, 1.36],
+                 'c_true_median': None,
+                 'n_cells': 100,
+                 'offsets': {'spike_train': {'best': [-0.24, -0.45, -0.51, -0.67, -0.86],
+                                             'lo': [-0.74, -0.85, -1.01, -1.17, -1.36],
+                                             'hi': [-0.04, -0.25, -0.31, -0.37, -0.36]},
+                             'precision': {'best': [-0.04, -0.05, -0.21, -0.27, -0.36],
+                                           'lo': [-0.34, -0.45, -0.61, -0.57, -0.96],
+                                           'hi': [0.16, 0.05, -0.01, -0.07, -0.16]},
+                             'recall': {'best': [-1.04, -1.15, -1.11, -1.27, -1.36],
+                                        'lo': [-1.04, -1.15, -1.21, -1.27, -1.36],
+                                        'hi': [-0.94, -0.95, -0.91, -1.07, -1.06]},
+                             'correlation': {'best': [0.06, -0.156, -0.244, -0.351, -0.49],
+                                             'lo': [-0.14, -0.25, -0.31, -0.37, -0.46],
+                                             'hi': [0.26, 0.35, -0.21, -0.37, -0.46]}}}]}
+
+
+def neuropil_recording_stats(F, Fneu, fs, spks=None):
+    """Recording statistics used to pick the closest simulated condition
+    (and shown in the Neuropil Sweep tab). Medians over cells.
+
+      np_fluct  SD of Fneu/median(Fneu) after 1 s smoothing: how big the
+                slow neuropil fluctuation is relative to its baseline
+      noise_F   frame-to-frame noise SD of F (median |diff| / 0.6745 / sqrt2)
+                relative to mean F
+      np_to_F   mean Fneu / mean F
+
+    With spks (Suite2p's OASIS output, same rows as F), display only (the
+    simulation does not run OASIS, so these are not used for matching):
+      event_rate   frames with spks > 2 x F noise SD, per second
+      ring_ratio   event-triggered Fneu response / F response (how much of
+                   a cell's own transient shows up in its neuropil ring)
+    """
+    F = np.asarray(F, dtype=float)
+    Fneu = np.asarray(Fneu, dtype=float)
+    fs = float(fs) if fs else 30.0
+    w = max(1, int(round(fs)))
+    out = {"n_cells": int(F.shape[0]), "fs": fs}
+
+    med_np = np.median(Fneu, axis=1, keepdims=True)
+    med_np[med_np == 0] = np.nan
+    rel = Fneu / med_np
+    sm = uniform_filter1d(rel, size=w, axis=1, mode="nearest")
+    half = w // 2
+    if sm.shape[1] > 2 * half + 2:
+        sm = sm[:, half:sm.shape[1] - half]
+    out["np_fluct"] = float(np.nanmedian(np.nanstd(sm, axis=1)))
+
+    def _noise(X):
+        return np.median(np.abs(np.diff(X, axis=1)), axis=1) / 0.6745 / math.sqrt(2)
+    mF = np.mean(F, axis=1)
+    mN = np.mean(Fneu, axis=1)
+    sdF = _noise(F)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        out["noise_F"] = float(np.nanmedian(sdF / mF))
+        out["np_to_F"] = float(np.nanmedian(mN / mF))
+
+    if spks is not None:
+        spks = np.asarray(spks, dtype=float)
+        T = F.shape[1]
+        pre, post = max(1, int(round(0.5 * fs))), max(1, int(round(0.5 * fs)))
+        rates, ratios = [], []
+        for i in range(F.shape[0]):
+            ev = np.flatnonzero(spks[i] > 2.0 * sdF[i])
+            rates.append(len(ev) / (T / fs))
+            ev = ev[(ev >= pre) & (ev < T - post)]
+            if len(ev) < 5:
+                continue
+            dF = np.array([F[i, e:e + post].mean() - F[i, e - pre:e].mean() for e in ev])
+            dN = np.array([Fneu[i, e:e + post].mean() - Fneu[i, e - pre:e].mean() for e in ev])
+            if np.mean(dF) > 0:
+                ratios.append(np.mean(dN) / np.mean(dF))
+        out["event_rate"] = float(np.median(rates)) if rates else float("nan")
+        out["ring_ratio"] = float(np.median(ratios)) if ratios else float("nan")
+    return out
+
+
+def load_alpha_calibration():
+    """alpha_calibration.json next to this script if present, else the
+    built-in baseline table."""
+    import json
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), ALPHA_CALIB_FILENAME)
+    if os.path.exists(p):
+        try:
+            with open(p) as fh:
+                cal = json.load(fh)
+            cal["_path"] = p
+            return cal
+        except Exception:
+            traceback.print_exc()
+    cal = dict(ALPHA_CALIBRATION_DEFAULT)
+    cal["_path"] = "built-in (baseline simulation only)"
+    return cal
+
+
+def suggest_alpha_ranges(sweep, rec_stats, calib):
+    """Suggested alpha ranges per goal for one recording.
+
+    sweep: neuropil_alpha_sweep result (alphas, mean_corr).
+    rec_stats: neuropil_recording_stats of the same cells.
+    calib: load_alpha_calibration().
+
+    Returns dict with alpha_min, the matched condition name and distance,
+    and per goal: range (lo, hi) = alpha_min + the union of the simulated
+    near-optimal bands over all correlation levels, and best (lo, hi) =
+    the spread of the simulated best alphas. Clipped to >= 0."""
+    alphas = np.asarray(sweep["alphas"], dtype=float)
+    mc = np.asarray(sweep["mean_corr"], dtype=float)
+    if not np.isfinite(mc).any():
+        return None
+    j = int(np.nanargmin(mc))
+    a_min = float(alphas[j])
+    if 0 < j < len(alphas) - 1 and np.all(np.isfinite(mc[j - 1:j + 2])):
+        y0, y1, y2 = mc[j - 1], mc[j], mc[j + 1]      # parabolic refinement of the minimum
+        den = y0 - 2 * y1 + y2
+        if den > 0:
+            a_min = float(alphas[j] + 0.5 * (y0 - y2) / den * (alphas[1] - alphas[0]))
+    at_edge = j == 0 or j == len(alphas) - 1
+
+    conds = calib.get("conditions", [])
+    best_c, best_d = None, float("inf")
+    keys = calib.get("match_on", ["np_fluct", "noise_F"])
+    for c in conds:
+        d2, n = 0.0, 0
+        for k in keys:
+            a, b = rec_stats.get(k), c.get("stats", {}).get(k)
+            if a is None or b is None or not (a > 0 and b > 0):
+                continue
+            d2 += math.log(a / b) ** 2
+            n += 1
+        d = math.sqrt(d2) if n else float("inf")
+        if d < best_d or best_c is None:
+            best_c, best_d = c, d
+    if best_c is None:
+        return None
+
+    out = {"alpha_min": a_min, "alpha_min_at_edge": at_edge, "condition": best_c.get("name", "?"),
+           "distance": best_d, "provisional": bool(calib.get("provisional", True)),
+           "source": calib.get("_path", ""), "goals": {}}
+    for g in ALPHA_GOALS:
+        o = best_c.get("offsets", {}).get(g)
+        if not o:
+            continue
+        lo = [v for v in o.get("lo", []) if v is not None]
+        hi = [v for v in o.get("hi", []) if v is not None]
+        be = [v for v in o.get("best", []) if v is not None]
+        if not lo or not hi or not be:
+            continue
+        rng = (max(0.0, a_min + min(lo)), max(0.0, a_min + max(hi)))
+        bst = (max(0.0, a_min + min(be)), max(0.0, a_min + max(be)))
+        out["goals"][g] = {"range": rng, "best": bst}
+    return out
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -51874,6 +52078,8 @@ class KurtosisChecker:
         self.np_F    = None
         self.np_Fneu = None
         self.np_stat = None
+        self.np_spks = None  # Suite2p OASIS spks.npy (optional; display-only stats)
+        self.np_fs = None    # frame rate (Hz), from ops.npy
         self.np_Ly = None    # frame height (px), from ops.npy -- where the
         self.np_Lx = None    # FOV border actually is, for the exclusion distance
         self.np_results = None
@@ -53725,6 +53931,12 @@ class KurtosisChecker:
                                       "distance.")
                 return
             stat = np.load(stat_p, allow_pickle=True)
+            spks_p = os.path.join(plane_dir, "spks.npy")
+            spks = (np.load(spks_p).astype(np.float64, copy=False)
+                    if os.path.exists(spks_p) else None)
+            if spks is not None and spks.shape != F.shape:
+                spks = None
+            fs = float(ops.get("fs", 0) or 0) or None
             iscell_p = os.path.join(plane_dir, "iscell.npy")
             if os.path.exists(iscell_p):
                 iscell = np.load(iscell_p)
@@ -53732,6 +53944,8 @@ class KurtosisChecker:
                 F = F[mask]
                 Fneu = Fneu[mask]
                 stat = stat[mask]
+                if spks is not None:
+                    spks = spks[mask]
             else:
                 messagebox.showwarning(
                     "No iscell.npy",
@@ -53742,6 +53956,7 @@ class KurtosisChecker:
 
         self.np_plane_dir = plane_dir
         self.np_F, self.np_Fneu, self.np_stat = F, Fneu, list(stat)
+        self.np_spks, self.np_fs = spks, fs
         self.np_Ly, self.np_Lx = Ly, Lx
         self.np_results = None
         n_cells, n_frames = F.shape
@@ -54780,6 +54995,15 @@ class KurtosisChecker:
                 self.np_Ly, self.np_Lx,
                 kurtosis_thresh=kurt_thresh, progress_cb=self._gain_progress)
             result["plane_dir"] = self.np_plane_dir
+            # recording statistics on the same cells, and suggested alpha
+            # ranges from the ground-truth calibration (see suggest_alpha_ranges)
+            self._gain_progress("Computing recording statistics...")
+            k = result["kept_idx"]
+            spks = self.np_spks[k] if self.np_spks is not None else None
+            fs = self.np_fs or 30.0
+            result["fs_assumed"] = self.np_fs is None
+            result["rec_stats"] = neuropil_recording_stats(self.np_F[k], self.np_Fneu[k], fs, spks)
+            result["suggest"] = suggest_alpha_ranges(result, result["rec_stats"], load_alpha_calibration())
             self.np_results = result
             self.root.after(0, self._render_neuropil_results)
         except Exception as e:
@@ -54791,36 +55015,37 @@ class KurtosisChecker:
             self._progress_stop()
 
     def _render_neuropil_results(self):
+        """Sweep curve (top left), suggested alpha ranges per goal as bars on
+        the same alpha axis (bottom left), and the recording statistics plus
+        the matched simulated condition (right). See suggest_alpha_ranges."""
         r = self.np_results
+        sug = r.get("suggest")
+        st = r.get("rec_stats") or {}
 
         self.fig.clear()
-        ax = self.fig.add_axes([0.10, 0.12, 0.85, 0.78])
-        ax.set_facecolor(BG_DARK)
-        for s in ax.spines.values(): s.set_color("#555")
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-        ax.tick_params(colors=TEXT_MAIN, labelsize=8)
+        def _style(ax):
+            ax.set_facecolor(BG_DARK)
+            for sp in ax.spines.values(): sp.set_color("#555")
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            ax.tick_params(colors=TEXT_MAIN, labelsize=8)
+        ax = self.fig.add_axes([0.11, 0.36, 0.52, 0.56]); _style(ax)
+        axb = self.fig.add_axes([0.11, 0.08, 0.52, 0.20], sharex=ax); _style(axb)
 
         alphas = r["alphas"]
         mean_c = r["mean_corr"]
         sem_c = r["sem_corr"]
-        finite = np.isfinite(mean_c)
         ax.fill_between(alphas, mean_c - sem_c, mean_c + sem_c,
                          color=C_INCL, alpha=0.25, zorder=1)
         ax.plot(alphas, mean_c, color=C_INCL, lw=2, zorder=2, marker="o", ms=3)
         ax.axhline(0, color="#555", lw=1, ls=":", zorder=0)
-
-        if finite.any():
-            best_i = np.nanargmin(np.abs(mean_c))
-            ax.axvline(alphas[best_i], color=C_FLOOR, lw=1.2, ls="--", alpha=0.8, zorder=1)
-            ax.text(0.98, 0.95,
-                    f"alpha ≈ {alphas[best_i]:.2f}\n(closest to zero mean corr.)",
-                    transform=ax.transAxes, ha="right", va="top",
-                    color=TEXT_BRIGHT, fontsize=8,
-                    bbox=dict(facecolor=BG_MID, edgecolor="#555", boxstyle="round,pad=0.4"))
-
-        ax.set_xlabel("alpha   (Fcorr = rawF − alpha·Fneu)", color=TEXT_DIM, fontsize=9)
+        if sug:
+            for a_ in (ax, axb):
+                a_.axvline(sug["alpha_min"], color=TEXT_DIM, lw=1.0, ls="--", zorder=1)
+            ax.text(sug["alpha_min"], ax.get_ylim()[1], "  min. corr.\n  (biased high)",
+                    color=TEXT_MAIN, fontsize=7, ha="left", va="top")
         ax.set_ylabel("Mean pairwise correlation\n(off-diagonal, ± SEM)", color=TEXT_DIM, fontsize=9)
+        ax.tick_params(labelbottom=False)
         filt_note = (f"kurtosis > {r['kurtosis_thresh']:.1f}"
                      if r.get("kurtosis_thresh") is not None else "no kurtosis filter")
         n_excl = r.get("n_excluded_border", 0)
@@ -54828,12 +55053,83 @@ class KurtosisChecker:
                      f"border exclusion={r['exclude_px']:.0f}px ({n_excl} dropped)  ·  {filt_note}",
                      color=TEXT_BRIGHT, fontsize=10, pad=8)
 
+        # suggested ranges: light bar = near-optimal band (union over the
+        # simulated correlation levels), bright bar = spread of the best alphas
+        goal_col = {"spike_train": C_TOP, "precision": "#9b59b6",
+                    "recall": C_MID, "correlation": C_HIST}
+        goals = list(ALPHA_GOALS)
+        if sug:
+            for gi, g in enumerate(goals):
+                y = len(goals) - gi
+                if g not in sug["goals"]:
+                    continue
+                lo, hi = sug["goals"][g]["range"]
+                b0, b1 = sug["goals"][g]["best"]
+                axb.plot([lo, hi], [y, y], color=goal_col[g], lw=6, alpha=0.35, solid_capstyle="butt")
+                axb.plot([b0, max(b1, b0 + 0.01)], [y, y], color=goal_col[g], lw=6, solid_capstyle="butt")
+        axb.set_yticks(range(len(goals), 0, -1))
+        axb.set_yticklabels([ALPHA_GOALS[g][0] for g in goals], fontsize=8)
+        for t, g in zip(axb.get_yticklabels(), goals):
+            t.set_color(goal_col[g])
+        axb.set_ylim(0.4, len(goals) + 0.6)
+        axb.set_xlim(min(alphas[0], 0), alphas[-1])
+        axb.set_xlabel("alpha   (Fcorr = rawF − alpha·Fneu)", color=TEXT_DIM, fontsize=9)
+
+        # right: statistics and suggestions as text
+        axt = self.fig.add_axes([0.67, 0.08, 0.31, 0.84]); axt.axis("off")
+        L = []
+        L.append(("Suggested alpha", TEXT_BRIGHT, 10, "bold"))
+        if not sug:
+            L.append(("(no suggestion: sweep has no finite values)", TEXT_MAIN, 8, "normal"))
+        else:
+            edge = "  (at sweep edge — widen the range)" if sug["alpha_min_at_edge"] else ""
+            L.append((f"min. correlation at alpha = {sug['alpha_min']:.2f}{edge}", TEXT_MAIN, 8, "normal"))
+            L.append(("Do not use that value: it is pushed up by real shared", TEXT_DIM, 7.5, "normal"))
+            L.append(("activity and by each cell's own light in its ring.", TEXT_DIM, 7.5, "normal"))
+            L.append(("", TEXT_MAIN, 4, "normal"))
+            for g in goals:
+                if g not in sug["goals"]:
+                    continue
+                lo, hi = sug["goals"][g]["range"]
+                b0, b1 = sug["goals"][g]["best"]
+                L.append((f"{ALPHA_GOALS[g][0]}:  best {b0:.2f}–{b1:.2f}   (ok {lo:.2f}–{hi:.2f})",
+                          goal_col[g], 8.5, "bold"))
+            L.append(("Bright bar: best alpha across simulated correlation", TEXT_DIM, 7.5, "normal"))
+            L.append(("levels (true correlation unknown). Pale: near-optimal.", TEXT_DIM, 7.5, "normal"))
+            L.append(("", TEXT_MAIN, 4, "normal"))
+            prov = "PROVISIONAL — " if sug["provisional"] else ""
+            L.append((f"{prov}calibration: {sug['condition']}", C_FLOOR if sug["provisional"] else TEXT_MAIN, 8, "bold"))
+            L.append((f"  (distance {sug['distance']:.2f} in log stats; source: {os.path.basename(str(sug['source']))})",
+                      TEXT_DIM, 7, "normal"))
+        L.append(("", TEXT_MAIN, 6, "normal"))
+        L.append(("Recording statistics (median over cells)", TEXT_BRIGHT, 9, "bold"))
+        fs_note = " (ops.fs missing — 30 Hz assumed)" if r.get("fs_assumed") else ""
+        L.append((f"frame rate  {st.get('fs', float('nan')):.1f} Hz{fs_note}", TEXT_MAIN, 8, "normal"))
+        L.append((f"neuropil fluctuation (SD of Fneu/median, 1 s)  {st.get('np_fluct', float('nan')):.3f}", TEXT_MAIN, 8, "normal"))
+        L.append((f"noise SD / mean F  {st.get('noise_F', float('nan')):.3f}", TEXT_MAIN, 8, "normal"))
+        L.append((f"mean Fneu / mean F  {st.get('np_to_F', float('nan')):.2f}", TEXT_MAIN, 8, "normal"))
+        if "event_rate" in st:
+            L.append((f"OASIS events/s (spks > 2 noise SD)  {st['event_rate']:.2f}", TEXT_MAIN, 8, "normal"))
+            L.append((f"own transient in ring (Fneu/F response)  {st['ring_ratio']:.2f}", TEXT_MAIN, 8, "normal"))
+            L.append(("  (spike-based statistics: shown only, not used for matching)", TEXT_DIM, 7, "normal"))
+        else:
+            L.append(("no spks.npy: spike-based statistics skipped", TEXT_DIM, 7.5, "normal"))
+        y = 1.0
+        for txt, c, fsz, wt in L:
+            axt.text(0.0, y, txt, color=c, fontsize=fsz, fontweight=wt, va="top", ha="left",
+                     transform=axt.transAxes)
+            y -= 0.006 + fsz * 0.0036
+
         self.canvas.draw()
 
         alpha_span = f"{alphas[0]:.2f}–{alphas[-1]:.2f}" if len(alphas) else "n/a"
+        st_txt = ""
+        if sug and "spike_train" in sug["goals"]:
+            b0, b1 = sug["goals"]["spike_train"]["best"]
+            st_txt = f"  ·  spike-train alpha {b0:.2f}–{b1:.2f}"
         self.status_var.set(
             f"Done  ·  {r['n_cells']} cells  ·  {r['n_pairs']} pairs  ·  "
-            f"alpha {alpha_span}  ·  {r.get('plane_dir', '')}")
+            f"alpha {alpha_span}{st_txt}  ·  {r.get('plane_dir', '')}")
 
     def _draw_neuropil_splash(self):
         """Neuropil-sweep-tab splash, shown before any sweep has run yet.
