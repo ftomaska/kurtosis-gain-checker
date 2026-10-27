@@ -77,7 +77,7 @@ Optional (only for the raw-TIFF NormCorre fallback in gain mode): caiman
 # Bump this on every change so a running instance's window title can be checked
 # against what's actually in this file -- handy when the app runs on a machine
 # separate from wherever this source file is being edited.
-APP_VERSION = "2026-10-27.2"
+APP_VERSION = "2026-10-27.3"
 
 import os
 import sys
@@ -52097,7 +52097,7 @@ def pick_kurtosis_examples(F, pcts=(90, 50, 10)):
 
 
 def draw_neuropil_examples(fig, F, Fneu, alpha, fs, rows, kurt, roi_ids=None, spks=None,
-                           window_s=60.0, labels=("high", "mid", "low")):
+                           window_s=60.0, labels=("high", "mid", "low"), rect=None, clear=True):
     """Neuropil Sweep examples: for each chosen cell (row), raw F and Fneu
     (left) and F - alpha*Fneu (right) over the same window. Dashed line on the
     right: baseline F0 of the subtracted trace (8th percentile over the whole
@@ -52112,22 +52112,30 @@ def draw_neuropil_examples(fig, F, Fneu, alpha, fs, rows, kurt, roi_ids=None, sp
     n_w = min(T, int(round(window_s * fs)))
     pk = int(np.argmax(F[rows[0]] - np.median(F[rows[0]])))
     i0 = int(np.clip(pk - n_w // 3, 0, T - n_w)); sl = slice(i0, i0 + n_w)
-    fig.clear()
+    if clear:
+        fig.clear()
+    X0, Y0, W, H = rect if rect is not None else (0.0, 0.0, 1.0, 0.97)
     nR = len(rows)
+    rh = H / nR
     for k, r in enumerate(rows):
         f, fn = F[r], Fneu[r]
         y = f - alpha * fn
         F0 = float(np.sort(y)[max(0, int(round(0.08 * T)) - 1)])
         sd = np.median(np.abs(np.diff(f))) / 0.6745 / math.sqrt(2)
         for c in range(2):
-            ax = fig.add_axes([0.07 + c * 0.47, 0.08 + (nR - 1 - k) * (0.86 / nR), 0.42, 0.86 / nR - 0.07])
+            ax = fig.add_axes([X0 + W * (0.07 + c * 0.48), Y0 + (nR - 1 - k) * rh + 0.30 * rh / 2 + 0.02 * H,
+                               W * 0.42, rh * 0.62])
             ax.set_facecolor(BG_DARK)
             for sp_ in ax.spines.values(): sp_.set_color("#555")
             ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
             ax.tick_params(colors=TEXT_MAIN, labelsize=7)
             if c == 0:
-                ax.plot(t[sl], fn[sl], color="#888888", lw=0.7, label="Fneu")
-                ax.plot(t[sl], f[sl], color=TEXT_BRIGHT, lw=0.7, label="raw F")
+                # Fneu shifted down so it sits just below raw F (same AU scale)
+                fw, nw = f[sl], fn[sl]
+                off = (np.min(fw) - 0.04 * np.ptp(fw)) - np.max(nw)
+                off = min(off, 0.0)
+                ax.plot(t[sl], nw + off, color="#888888", lw=0.7, label="Fneu (offset)")
+                ax.plot(t[sl], fw, color=TEXT_BRIGHT, lw=0.7, label="raw F")
                 rid = f"ROI {roi_ids[r]}" if roi_ids is not None else f"cell {r}"
                 ax.set_title(f"{labels[k]} kurtosis  ·  {rid}  ·  kurtosis {kurt[r]:.1f}",
                              color=TEXT_BRIGHT, fontsize=8, loc="left")
@@ -52148,10 +52156,91 @@ def draw_neuropil_examples(fig, F, Fneu, alpha, fs, rows, kurt, roi_ids=None, sp
                     ax.set_ylim(yl[0], top + 1.4 * h)
             if k == nR - 1:
                 ax.set_xlabel("Time (s)", color=TEXT_DIM, fontsize=8)
-    fig.text(0.07, 0.975, "left: raw F (white), Fneu (grey)   ·   right: neuropil-subtracted   ·   "
-             "green ticks: OASIS events (spks > 2 noise SD)" if spks is not None else
-             "left: raw F (white), Fneu (grey)   ·   right: neuropil-subtracted",
-             color=TEXT_DIM, fontsize=7.5, va="top")
+    fig.text(X0 + W * 0.07, Y0 + H + 0.005, "left: raw F (white), Fneu (grey, shifted down; same scale)   ·   right: neuropil-subtracted"
+             + ("   ·   green ticks: OASIS events (spks > 2 noise SD)" if spks is not None else ""),
+             color=TEXT_DIM, fontsize=7, va="bottom")
+
+
+CALIB_COND_LABELS = {
+    "baseline": "baseline", "contam_x0.7": "contamination ×0.7", "contam_x1.3": "contamination ×1.3",
+    "neuropil_x0.5": "neuropil ×0.5", "neuropil_x2": "neuropil ×2", "noise_x0.5": "noise ×0.5",
+    "noise_x2": "noise ×2", "rate_x0.5": "firing rate ×0.5", "rate_x2": "firing rate ×2",
+    "ownlight_x0": "own light in ring ×0", "ownlight_x2": "own light in ring ×2"}
+CALIB_LEVEL_COLORS = ["#8c8c8c", "#3a8fd9", "#36b04a", "#ff8c1a", "#e5484d"]
+
+
+def draw_calibration_summary(fig, calib, matched=(), sel_alpha=None, user_alpha_min=None, rect=None):
+    """Best alpha per simulated condition (rows) and goal (panels), one dot per
+    correlation level; grey band = 10-90th percentile over all, line = median.
+    Rows matched to the loaded recording are highlighted. Absolute alphas: they
+    depend on contamination, so they apply to optics like the Allen recordings
+    the simulation is built on; the recording's own suggestion is the shaded
+    interval on the sweep."""
+    X0, Y0, W, H = rect if rect is not None else (0.0, 0.0, 1.0, 1.0)
+    conds = calib.get("conditions", [])
+    order = [n for n in CALIB_COND_LABELS if any(c["name"] == n for c in conds)] + \
+            [c["name"] for c in conds if c["name"] not in CALIB_COND_LABELS]
+    byname = {c["name"]: c for c in conds}
+    goals = [("spike_train", "Spike-train corr."), ("precision", "Precision"), ("recall", "Recall"),
+             ("correlation", "True correlation"), ("_min", "Min. fluorescence corr.")]
+    nK, nG = len(order), len(goals)
+    x_left = X0 + W * 0.17; pw = W * 0.80 / nG
+    for gi, (g, title) in enumerate(goals):
+        ax = fig.add_axes([x_left + gi * pw + pw * 0.06, Y0 + H * 0.10, pw * 0.86, H * 0.78])
+        ax.set_facecolor(BG_DARK)
+        for sp_ in ax.spines.values(): sp_.set_color("#555")
+        ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
+        ax.tick_params(colors=TEXT_MAIN, labelsize=7)
+        vals = []
+        for k, n in enumerate(order):
+            c = byname[n]; y = nK - k
+            if n in matched:
+                ax.axhspan(y - 0.45, y + 0.45, color="#ffffff", alpha=0.07, lw=0, zorder=0)
+            v = []
+            for l, am in enumerate(c["alpha_min"]):
+                if g == "_min":
+                    v.append(am)
+                else:
+                    o = c["offsets"][g]["best"][l]
+                    v.append(None if o is None else am + o)
+            pts = [(l, x) for l, x in enumerate(v) if x is not None]
+            if pts:
+                xs = [x for _, x in pts]
+                ax.plot([min(xs), max(xs)], [y, y], color="#777", lw=0.6, zorder=1)
+                for l, x in pts:
+                    ax.plot(x, y, "o", ms=3.5, mfc=CALIB_LEVEL_COLORS[l % 5], mec="none", zorder=2)
+                vals += xs
+        if vals:
+            q10, q50, q90 = np.percentile(vals, [10, 50, 90])
+            ax.axvspan(q10, q90, color="#ffffff", alpha=0.06, lw=0, zorder=0)
+            ax.axvline(q50, color=TEXT_BRIGHT, lw=1.2, zorder=1)
+        if user_alpha_min is not None and g == "_min":
+            ax.axvline(user_alpha_min, color=TEXT_MAIN, lw=0.9, ls="--", zorder=3)
+        if sel_alpha is not None:
+            ax.axvline(sel_alpha, color=TEXT_BRIGHT, lw=0.9, ls=":", zorder=3)
+        ax.set_ylim(0.4, nK + 0.6); ax.set_xlim(0, 2.1); ax.set_xticks([0, 0.5, 1, 1.5, 2])
+        ax.set_yticks(range(1, nK + 1))
+        if gi == 0:
+            ax.set_yticklabels([CALIB_COND_LABELS.get(n, n) for n in order][::-1], fontsize=7.5)
+            for t, n in zip(ax.get_yticklabels(), order[::-1]):
+                t.set_color(TEXT_BRIGHT if n in matched else TEXT_MAIN)
+                if n in matched: t.set_fontweight("bold")
+        else:
+            ax.set_yticklabels([])
+        ax.set_title(title, color=TEXT_BRIGHT, fontsize=8)
+        ax.set_xlabel("best alpha", color=TEXT_DIM, fontsize=7.5)
+    rsc = None
+    if conds:
+        rsc = conds[0].get("rsc")
+    if rsc:
+        for l, v in enumerate(rsc):
+            fig.text(x_left + l * W * 0.11, Y0 + H * 0.965, f"r_sc = {max(v, 0):.2f}",
+                     color=CALIB_LEVEL_COLORS[l % 5], fontsize=7.5)
+    fig.text(X0 + W * 0.01, Y0 + H * 0.005,
+             "Simulation (Allen-calibrated, OMSI, scored against true spikes). Dots: correlation levels; "
+             "white line: median; grey: 10–90%. Bold rows: conditions matched to your recording. "
+             "Dotted: selected alpha; dashed: your min.-corr. alpha. Absolute alphas — they shift with contamination.",
+             color=TEXT_DIM, fontsize=7, va="bottom")
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -52976,10 +53065,18 @@ class KurtosisChecker:
                            bg=CARD_BG, fg=TEXT_BRIGHT, selectcolor=CARD_BG,
                            activebackground=CARD_BG, font=(FONT_FAMILY, 10), anchor="w",
                            command=self._rerender_neuropil_if_done).pack(fill=tk.X)
-        tk.Label(goal_body, text="Click the sweep to see example cells "
-                 "(high / mid / low kurtosis) at that alpha.",
+        tk.Label(goal_body, text="Click the sweep (or use ← →) to choose "
+                 "alpha; example cells (high / mid / low kurtosis) update on "
+                 "the right.",
                  bg=CARD_BG, fg=TEXT_DIM, font=(FONT_FAMILY, 8),
-                 wraplength=210, justify="left").pack(anchor="w", pady=(6, 0))
+                 wraplength=210, justify="left").pack(anchor="w", pady=(6, 4))
+        step_row = tk.Frame(goal_body, bg=CARD_BG); step_row.pack(fill=tk.X, pady=(0, 4))
+        self._lbtn(step_row, "◀ alpha", lambda: self._step_neuropil_alpha(-1),
+                   side=tk.LEFT, padx=(0, 4), font_size=10)
+        self._lbtn(step_row, "alpha ▶", lambda: self._step_neuropil_alpha(1),
+                   side=tk.LEFT, padx=0, font_size=10)
+        self._lbtn(goal_body, "Calibration & details…", self._show_neuropil_details,
+                   side=tk.TOP, padx=0, fill=tk.X, font_size=10)
 
         # ── Run Analysis (primary action, bottom of the sidebar) ────────
         run_frame = tk.Frame(ip, bg=BG_MID)
@@ -53284,6 +53381,11 @@ class KurtosisChecker:
         # No toolbar — removed intentionally
         # Neuropil Sweep: clicking the sweep picks an alpha step (examples window)
         self.canvas.mpl_connect("button_press_event", self._on_neuropil_click)
+        # arrow keys step alpha -- but not while typing in an entry field
+        self.root.bind("<Left>", lambda e: None if isinstance(e.widget, tk.Entry)
+                       else self._step_neuropil_alpha(-1))
+        self.root.bind("<Right>", lambda e: None if isinstance(e.widget, tk.Entry)
+                       else self._step_neuropil_alpha(1))
 
         # Busy animation lives in the same main output area, swapped in for
         # the canvas by _progress_start/_progress_stop while an analysis is
@@ -55166,12 +55268,27 @@ class KurtosisChecker:
             self._progress_stop()
 
     def _render_neuropil_results(self):
-        """Sweep curve (top left), suggested alpha ranges per goal as bars on
-        the same alpha axis (bottom left), and the recording statistics plus
-        the matched simulated condition (right). See suggest_alpha_ranges."""
+        """Left: sweep curve, exact costs of each alpha (noise, F0 <= 0), and the
+        suggested ranges per goal, all on one alpha axis with the selected alpha
+        drawn through every panel. Right: example cells (high / mid / low
+        kurtosis) at the selected alpha. Details and the calibration summary
+        are in a separate window (sidebar button)."""
         r = self.np_results
         sug = r.get("suggest")
-        st = r.get("rec_stats") or {}
+        dg = r.get("diag")
+        alphas = np.asarray(r["alphas"], float)
+        mean_c = r["mean_corr"]; sem_c = r["sem_corr"]
+        goal_col = {"spike_train": C_TOP, "precision": "#9b59b6", "recall": C_MID, "correlation": C_HIST}
+        goals = list(ALPHA_GOALS)
+        g_sel = self.np_goal_var.get() if hasattr(self, "np_goal_var") else "spike_train"
+        if self.np_sel_alpha is None:                    # default: middle of the shaded best range
+            if sug and g_sel in sug["goals"]:
+                b0, b1 = sug["goals"][g_sel]["best"]; target = 0.5 * (b0 + b1)
+            else:
+                target = 0.0
+            self.np_sel_alpha = float(alphas[int(np.argmin(np.abs(alphas - target)))])
+        sel = self.np_sel_alpha
+        jsel = int(np.argmin(np.abs(alphas - sel)))
 
         self.fig.clear()
         def _style(ax):
@@ -55180,43 +55297,55 @@ class KurtosisChecker:
             ax.spines["top"].set_visible(False)
             ax.spines["right"].set_visible(False)
             ax.tick_params(colors=TEXT_MAIN, labelsize=8)
-        ax = self.fig.add_axes([0.11, 0.48, 0.52, 0.44]); _style(ax)
-        axd = self.fig.add_axes([0.11, 0.30, 0.52, 0.13], sharex=ax); _style(axd)
-        axb = self.fig.add_axes([0.11, 0.06, 0.52, 0.19], sharex=ax); _style(axb)
+        ax = self.fig.add_axes([0.07, 0.50, 0.42, 0.42]); _style(ax)
+        axd = self.fig.add_axes([0.07, 0.32, 0.42, 0.13], sharex=ax); _style(axd)
+        axb = self.fig.add_axes([0.07, 0.06, 0.42, 0.21], sharex=ax); _style(axb)
+        left = (ax, axd, axb)
 
-        alphas = r["alphas"]
-        mean_c = r["mean_corr"]
-        sem_c = r["sem_corr"]
-        ax.fill_between(alphas, mean_c - sem_c, mean_c + sem_c,
-                         color=C_INCL, alpha=0.25, zorder=1)
+        # data-derived ceiling: alphas above the sweep minimum were never best for
+        # spike trains or true correlation in the simulation, and above the F0
+        # ceiling dF/F is undefined for >= 10% of cells -- dim that part
+        ceil = None
+        if sug:
+            ceil = sug["alpha_min"]
+        if dg is not None and dg["alpha_f0_10"] is not None:
+            ceil = dg["alpha_f0_10"] if ceil is None else min(ceil, dg["alpha_f0_10"])
+        if ceil is not None:
+            for a_ in left:
+                a_.axvspan(ceil, alphas[-1], color="#000000", alpha=0.35, lw=0, zorder=0)
+
+        # sweep
+        ax.fill_between(alphas, mean_c - sem_c, mean_c + sem_c, color=C_INCL, alpha=0.25, zorder=1)
         ax.plot(alphas, mean_c, color=C_INCL, lw=2, zorder=2, marker="o", ms=3)
         ax.axhline(0, color="#555", lw=1, ls=":", zorder=0)
-        goal_col = {"spike_train": C_TOP, "precision": "#9b59b6",
-                    "recall": C_MID, "correlation": C_HIST}
-        g_sel = self.np_goal_var.get() if hasattr(self, "np_goal_var") else "spike_train"
         if sug and g_sel in sug["goals"]:
             lo, hi = sug["goals"][g_sel]["range"]
             b0, b1 = sug["goals"][g_sel]["best"]
-            ax.axvspan(lo, hi, color=goal_col[g_sel], alpha=0.08, lw=0, zorder=0)
-            ax.axvspan(b0, max(b1, b0 + 0.01), color=goal_col[g_sel], alpha=0.22, lw=0, zorder=0)
+            for a_ in left:
+                a_.axvspan(lo, hi, color=goal_col[g_sel], alpha=0.07, lw=0, zorder=0)
+                a_.axvspan(b0, max(b1, b0 + 0.01), color=goal_col[g_sel], alpha=0.18, lw=0, zorder=0)
             ax.text(0.01, 0.02, f"shaded: suggested alpha for {ALPHA_GOALS[g_sel][0].lower()}  "
                     f"(best {b0:.2f}–{b1:.2f}, near-optimal {lo:.2f}–{hi:.2f})",
                     transform=ax.transAxes, color=goal_col[g_sel], fontsize=8, va="bottom")
-        sel = getattr(self, "np_sel_alpha", None)
-        if sel is not None:
-            j = int(np.argmin(np.abs(alphas - sel)))
-            ax.plot([alphas[j]], [mean_c[j]], "o", ms=9, mfc="none", mec=TEXT_BRIGHT, mew=1.5, zorder=4)
-            ax.axvline(alphas[j], color=TEXT_BRIGHT, lw=0.8, ls=":", zorder=3)
-        ax.text(0.99, 0.02, "click to view example cells at an alpha", transform=ax.transAxes,
-                color=TEXT_DIM, fontsize=7.5, ha="right", va="bottom")
         if sug:
-            for a_ in (ax, axb):
+            for a_ in left:
                 a_.axvline(sug["alpha_min"], color=TEXT_DIM, lw=1.0, ls="--", zorder=1)
             ax.text(sug["alpha_min"], ax.get_ylim()[1], "  min. corr.\n  (biased high)",
                     color=TEXT_MAIN, fontsize=7, ha="left", va="top")
+        if ceil is not None:
+            ax.text(0.99, 0.98, "dimmed: above the data-derived ceiling", transform=ax.transAxes,
+                    color=TEXT_DIM, fontsize=7, ha="right", va="top")
+        ax.text(0.99, 0.02, "click (or ← →) to choose alpha", transform=ax.transAxes,
+                color=TEXT_DIM, fontsize=7.5, ha="right", va="bottom")
         ax.set_ylabel("Mean pairwise correlation\n(off-diagonal, ± SEM)", color=TEXT_DIM, fontsize=9)
-        # exact, model-free costs of each alpha: added noise and undefined dF/F
-        dg = r.get("diag")
+        ax.tick_params(labelbottom=False)
+        filt_note = (f"kurtosis > {r['kurtosis_thresh']:.1f}"
+                     if r.get("kurtosis_thresh") is not None else "no kurtosis filter")
+        ax.set_title(f"Neuropil sweep  ·  {r['n_cells']} cells, {r['n_pairs']} pairs  ·  "
+                     f"border {r['exclude_px']:.0f}px ({r.get('n_excluded_border', 0)} dropped)  ·  {filt_note}",
+                     color=TEXT_BRIGHT, fontsize=9.5, pad=8)
+
+        # exact costs of each alpha
         if dg is not None:
             da = dg["alphas"]
             axd.fill_between(da, dg["noise_ratio_q25"], dg["noise_ratio_q75"], color=TEXT_MAIN, alpha=0.15, lw=0)
@@ -55228,26 +55357,11 @@ class KurtosisChecker:
             axd2.tick_params(colors=C_BOT, labelsize=7)
             for sp_ in axd2.spines.values(): sp_.set_visible(False)
             axd2.set_ylabel("% cells\nF0 ≤ 0", color=C_BOT, fontsize=8)
-            if dg["alpha_f0_10"] is not None:
-                for a_ in (ax, axd, axb):
-                    a_.axvspan(dg["alpha_f0_10"], alphas[-1], color=C_BOT, alpha=0.06, lw=0, zorder=0)
-            axd.text(0.01, 0.95, "white: noise SD of F − alpha·Fneu relative to raw F (median, IQR)   ·   "
-                     "red: % of cells with baseline F0 ≤ 0 (red shading: ≥ 10%)",
+            axd.text(0.01, 0.95, "white: noise of F − alpha·Fneu vs raw F (median, IQR)  ·  red: % cells with F0 ≤ 0",
                      transform=axd.transAxes, color=TEXT_DIM, fontsize=7, va="top")
         axd.tick_params(labelbottom=False)
-        ax.tick_params(labelbottom=False)
-        filt_note = (f"kurtosis > {r['kurtosis_thresh']:.1f}"
-                     if r.get("kurtosis_thresh") is not None else "no kurtosis filter")
-        n_excl = r.get("n_excluded_border", 0)
-        ax.set_title(f"Neuropil sweep  ·  {r['n_cells']} cells, {r['n_pairs']} pairs  ·  "
-                     f"border exclusion={r['exclude_px']:.0f}px ({n_excl} dropped)  ·  {filt_note}",
-                     color=TEXT_BRIGHT, fontsize=10, pad=8)
 
-        # suggested ranges: light bar = near-optimal band (union over the
-        # simulated correlation levels), bright bar = spread of the best alphas
-        goal_col = {"spike_train": C_TOP, "precision": "#9b59b6",
-                    "recall": C_MID, "correlation": C_HIST}
-        goals = list(ALPHA_GOALS)
+        # suggested ranges per goal
         if sug:
             for gi, g in enumerate(goals):
                 y = len(goals) - gi
@@ -55264,143 +55378,139 @@ class KurtosisChecker:
         axb.set_ylim(0.4, len(goals) + 0.6)
         axb.set_xlim(min(alphas[0], 0), alphas[-1])
         axb.set_xlabel("alpha   (Fcorr = rawF − alpha·Fneu)", color=TEXT_DIM, fontsize=9)
-        self._np_axes = (ax, axd, axb)
+        axb.text(0.99, 1.02, "suggested per goal  ·  bright: best  ·  pale: near-optimal", transform=axb.transAxes,
+                 color=TEXT_DIM, fontsize=7, ha="right", va="bottom")
 
-        # right: statistics and suggestions as text
-        axt = self.fig.add_axes([0.67, 0.08, 0.31, 0.84]); axt.axis("off")
-        L = []
-        L.append(("Suggested alpha", TEXT_BRIGHT, 10, "bold"))
-        if not sug:
-            L.append(("(no suggestion: sweep has no finite values)", TEXT_MAIN, 8, "normal"))
-        else:
-            edge = "  (at sweep edge — widen the range)" if sug["alpha_min_at_edge"] else ""
-            L.append((f"min. correlation at alpha = {sug['alpha_min']:.2f}{edge}", TEXT_MAIN, 8, "normal"))
-            L.append(("Do not use that value: it is pushed up by real shared", TEXT_DIM, 7.5, "normal"))
-            L.append(("activity and by each cell's own light in its ring.", TEXT_DIM, 7.5, "normal"))
-            L.append(("", TEXT_MAIN, 4, "normal"))
-            for g in goals:
-                if g not in sug["goals"]:
-                    continue
-                lo, hi = sug["goals"][g]["range"]
-                b0, b1 = sug["goals"][g]["best"]
-                L.append((f"{ALPHA_GOALS[g][0]}:  best {b0:.2f}–{b1:.2f}   (ok {lo:.2f}–{hi:.2f})",
-                          goal_col[g], 8.5, "bold"))
-            L.append(("Bright: best over simulated correlation levels; pale: near-optimal.", TEXT_DIM, 7, "normal"))
-            L.append(("", TEXT_MAIN, 4, "normal"))
-            ab = sug.get("absolute")
-            if ab:
-                L.append(("Across all simulated recordings (Allen-like optics):", TEXT_BRIGHT, 8, "bold"))
-                for g in goals:
-                    if g in ab:
-                        a_ = ab[g]
-                        L.append((f"  {ALPHA_GOALS[g][0]}:  median {a_['median']:.2f}  (middle half {a_['q25']:.2f}–{a_['q75']:.2f})",
-                                  goal_col[g], 8, "normal"))
-                pz = ab.get("pooled_spike_precision_correlation")
-                if pz:
-                    L.append((f"  Single default (spike-train, precision, corr.):  {pz['median']:.2f}  ({pz['q25']:.2f}–{pz['q75']:.2f})",
-                              TEXT_MAIN, 8, "bold"))
-                L.append(("  Absolute values: shift with contamination, so only for similar optics.", TEXT_DIM, 7, "normal"))
-                L.append(("", TEXT_MAIN, 4, "normal"))
-            prov = "PROVISIONAL — " if sug["provisional"] else ""
-            L.append((f"{prov}calibration: {sug['condition']}", C_FLOOR if sug["provisional"] else TEXT_MAIN, 8, "bold"))
-            L.append((f"  (distance {sug['distance']:.2f} in log stats; source: {os.path.basename(str(sug['source']))})",
-                      TEXT_DIM, 7, "normal"))
-        dg = r.get("diag")
+        # selected alpha through every left panel
+        for a_ in left:
+            a_.axvline(alphas[jsel], color=TEXT_BRIGHT, lw=1.0, ls=":", zorder=5)
+        ax.plot([alphas[jsel]], [mean_c[jsel]], "o", ms=9, mfc="none", mec=TEXT_BRIGHT, mew=1.5, zorder=6)
+        self._np_axes = left
+
+        # right: header + example cells at the selected alpha
+        k = r["kept_idx"]
+        F, Fn = self.np_F[k], self.np_Fneu[k]
+        if "ex_rows" not in r:
+            r["ex_rows"], r["ex_kurt"] = pick_kurtosis_examples(F)
+        hdr = f"alpha = {alphas[jsel]:.2f}"
         if dg is not None:
-            L.append(("", TEXT_MAIN, 6, "normal"))
-            L.append(("Costs of each alpha (exact, from your data)", TEXT_BRIGHT, 9, "bold"))
-            c10, c50 = dg["alpha_f0_10"], dg["alpha_f0_50"]
-            L.append((f"F0 ≤ 0 in 10% of cells from alpha = {c10:.2f}" if c10 is not None
-                      else "F0 stays > 0 in 90% of cells over the whole sweep", C_BOT, 8, "normal"))
-            if c50 is not None:
-                L.append((f"F0 ≤ 0 in half the cells from alpha = {c50:.2f}  (dF/F undefined there)", C_BOT, 8, "normal"))
-            if sug:
-                jb = int(np.argmin(np.abs(dg["alphas"] - sug["alpha_min"])))
-                L.append((f"noise at the min.-corr. alpha: {dg['noise_ratio'][jb]:.2f}× raw F", TEXT_MAIN, 8, "normal"))
-        L.append(("", TEXT_MAIN, 6, "normal"))
-        L.append(("Recording statistics (median over cells)", TEXT_BRIGHT, 9, "bold"))
-        fs_note = " (ops.fs missing — 30 Hz assumed)" if r.get("fs_assumed") else ""
-        L.append((f"frame rate  {st.get('fs', float('nan')):.1f} Hz{fs_note}", TEXT_MAIN, 8, "normal"))
-        L.append((f"neuropil fluctuation (SD of Fneu/median, 1 s)  {st.get('np_fluct', float('nan')):.3f}", TEXT_MAIN, 8, "normal"))
-        L.append((f"noise SD / mean F  {st.get('noise_F', float('nan')):.3f}", TEXT_MAIN, 8, "normal"))
-        L.append((f"mean Fneu / mean F  {st.get('np_to_F', float('nan')):.2f}", TEXT_MAIN, 8, "normal"))
-        if "event_rate" in st:
-            L.append((f"OASIS events/s (spks > 2 noise SD)  {st['event_rate']:.2f}", TEXT_MAIN, 8, "normal"))
-            L.append((f"own transient in ring (Fneu/F response)  {st['ring_ratio']:.2f}", TEXT_MAIN, 8, "normal"))
-            L.append(("  (shown only; not used for matching yet)", TEXT_DIM, 7, "normal"))
-        else:
-            L.append(("no spks.npy: spike-based statistics skipped", TEXT_DIM, 7.5, "normal"))
-        y = 1.0
-        for txt, c, fsz, wt in L:
-            axt.text(0.0, y, txt, color=c, fontsize=fsz, fontweight=wt, va="top", ha="left",
-                     transform=axt.transAxes)
-            y -= 0.004 + fsz * 0.0031
-
+            hdr += (f"   ·   noise {dg['noise_ratio'][jsel]:.2f}× raw F   ·   "
+                    f"F0 ≤ 0 in {100 * dg['f0_nonpos'][jsel]:.0f}% of cells")
+        self.fig.text(0.56, 0.965, hdr, color=TEXT_BRIGHT, fontsize=10.5, fontweight="bold", va="top")
+        if sug:
+            inside = [ALPHA_GOALS[g][0].lower() for g in goals
+                      if g in sug["goals"] and sug["goals"][g]["best"][0] - 1e-9 <= alphas[jsel] <= sug["goals"][g]["best"][1] + 1e-9]
+            self.fig.text(0.56, 0.935, ("within the best range for: " + ", ".join(inside)) if inside
+                          else "outside every goal's best range", color=TEXT_MAIN, fontsize=8, va="top")
+        draw_neuropil_examples(self.fig, F, Fn, alphas[jsel], self.np_fs or 30.0, r["ex_rows"], r["ex_kurt"],
+                               roi_ids=(self.np_roi_ids[k] if self.np_roi_ids is not None else None),
+                               spks=(self.np_spks[k] if self.np_spks is not None else None),
+                               rect=(0.555, 0.05, 0.44, 0.84), clear=False)
         self.canvas.draw()
+        if self._np_ex_win is not None and self._np_ex_win["top"].winfo_exists():
+            self._show_neuropil_details()                # keep the details window in sync
 
         alpha_span = f"{alphas[0]:.2f}–{alphas[-1]:.2f}" if len(alphas) else "n/a"
-        st_txt = ""
-        if sug and "spike_train" in sug["goals"]:
-            b0, b1 = sug["goals"]["spike_train"]["best"]
-            st_txt = f"  ·  spike-train alpha {b0:.2f}–{b1:.2f}"
         self.status_var.set(
-            f"Done  ·  {r['n_cells']} cells  ·  {r['n_pairs']} pairs  ·  "
-            f"alpha {alpha_span}{st_txt}  ·  {r.get('plane_dir', '')}")
+            f"Done  ·  {r['n_cells']} cells  ·  {r['n_pairs']} pairs  ·  alpha {alpha_span}  ·  "
+            f"selected {alphas[jsel]:.2f}  ·  {r.get('plane_dir', '')}")
 
     def _rerender_neuropil_if_done(self):
         if getattr(self, "np_results", None) is not None and self.tab_var.get() == "neuropil":
             self._render_neuropil_results()
 
     def _on_neuropil_click(self, event):
-        """Click on the sweep (or the interval bars): select the nearest alpha
-        step and show high/mid/low-kurtosis example cells at that alpha."""
+        """Click on any left panel: select the nearest alpha step."""
         if (self.tab_var.get() != "neuropil" or self.np_results is None
-                or event.inaxes not in self._np_axes or event.xdata is None):
+                or event.inaxes is None or event.xdata is None):
+            return
+        axs = list(self._np_axes) + [a for a in self.fig.axes if a.get_shared_x_axes().joined(a, self._np_axes[0])]
+        if event.inaxes not in axs:
             return
         alphas = np.asarray(self.np_results["alphas"], float)
         self.np_sel_alpha = float(alphas[int(np.argmin(np.abs(alphas - event.xdata)))])
         self._render_neuropil_results()
-        self._show_neuropil_examples()
 
     def _step_neuropil_alpha(self, d):
+        if self.np_results is None or self.tab_var.get() != "neuropil":
+            return
         alphas = np.asarray(self.np_results["alphas"], float)
         j = int(np.argmin(np.abs(alphas - (self.np_sel_alpha or 0.0))))
-        j = int(np.clip(j + d, 0, len(alphas) - 1))
-        self.np_sel_alpha = float(alphas[j])
+        self.np_sel_alpha = float(alphas[int(np.clip(j + d, 0, len(alphas) - 1))])
         self._render_neuropil_results()
-        self._show_neuropil_examples()
 
-    def _show_neuropil_examples(self):
-        """One reusable window: raw F, Fneu and F - alpha*Fneu for the cells
-        at the 90th / 50th / 10th percentile of kurtosis (among the cells the
-        sweep used), with buttons to step alpha."""
+    def _neuropil_detail_lines(self):
+        """Text for the details window: suggestions, costs, statistics."""
+        r = self.np_results; sug = r.get("suggest"); st = r.get("rec_stats") or {}; dg = r.get("diag")
+        goal_col = {"spike_train": C_TOP, "precision": "#9b59b6", "recall": C_MID, "correlation": C_HIST}
+        L = [("Suggested alpha for this recording", TEXT_BRIGHT, 10, "bold")]
+        if not sug:
+            L.append(("(no suggestion: sweep has no finite values)", TEXT_MAIN, 8, "normal"))
+        else:
+            edge = "  (at sweep edge — widen the range)" if sug["alpha_min_at_edge"] else ""
+            L.append((f"min. correlation at alpha = {sug['alpha_min']:.2f}{edge} — biased high; used as anchor",
+                      TEXT_MAIN, 8, "normal"))
+            for g in ALPHA_GOALS:
+                if g in sug["goals"]:
+                    lo, hi = sug["goals"][g]["range"]; b0, b1 = sug["goals"][g]["best"]
+                    L.append((f"{ALPHA_GOALS[g][0]}:  best {b0:.2f}–{b1:.2f}   (ok {lo:.2f}–{hi:.2f})",
+                              goal_col[g], 8.5, "bold"))
+            prov = "PROVISIONAL — " if sug["provisional"] else ""
+            names = ", ".join(CALIB_COND_LABELS.get(n.strip(), n.strip()) for n in sug["condition"].split(","))
+            import textwrap
+            for i_, ln in enumerate(textwrap.wrap(f"{prov}matched simulated conditions: {names}", 78)):
+                L.append((("" if i_ == 0 else "   ") + ln, C_FLOOR if sug["provisional"] else TEXT_MAIN, 8, "normal"))
+            L.append(("", TEXT_MAIN, 5, "normal"))
+            ab = sug.get("absolute")
+            if ab and ab.get("pooled_spike_precision_correlation"):
+                pz = ab["pooled_spike_precision_correlation"]
+                L.append((f"Simulation-wide single default: {pz['median']:.2f} ({pz['q25']:.2f}–{pz['q75']:.2f}); "
+                          "absolute, Allen-like optics only", TEXT_MAIN, 8, "normal"))
+        if dg is not None:
+            L.append(("", TEXT_MAIN, 6, "normal"))
+            L.append(("Exact costs (from your data)", TEXT_BRIGHT, 9, "bold"))
+            c10, c50 = dg["alpha_f0_10"], dg["alpha_f0_50"]
+            L.append((f"F0 ≤ 0 in 10% of cells from alpha = {c10:.2f}" if c10 is not None
+                      else "F0 stays > 0 in 90% of cells over the whole sweep", C_BOT, 8, "normal"))
+            if c50 is not None:
+                L.append((f"F0 ≤ 0 in half the cells from alpha = {c50:.2f}", C_BOT, 8, "normal"))
+        L.append(("", TEXT_MAIN, 6, "normal"))
+        L.append(("Recording statistics (median over cells)", TEXT_BRIGHT, 9, "bold"))
+        fs_note = " (ops.fs missing — 30 Hz assumed)" if r.get("fs_assumed") else ""
+        L.append((f"frame rate  {st.get('fs', float('nan')):.1f} Hz{fs_note}", TEXT_MAIN, 8, "normal"))
+        L.append((f"neuropil fluctuation (SD of Fneu/median, 1 s)  {st.get('np_fluct', float('nan')):.3f}   — used for matching", TEXT_MAIN, 8, "normal"))
+        L.append((f"noise SD / mean F  {st.get('noise_F', float('nan')):.3f}   — used for matching", TEXT_MAIN, 8, "normal"))
+        L.append((f"mean Fneu / mean F  {st.get('np_to_F', float('nan')):.2f}", TEXT_MAIN, 8, "normal"))
+        if "event_rate" in st:
+            L.append((f"OASIS events/s (spks > 2 noise SD)  {st['event_rate']:.2f}", TEXT_MAIN, 8, "normal"))
+            L.append((f"own transient in ring (Fneu/F response)  {st['ring_ratio']:.2f}   — shown only", TEXT_MAIN, 8, "normal"))
+        return L
+
+    def _show_neuropil_details(self):
+        """Window with the calibration summary (left) and the details text
+        (right). Reused; follows the selected alpha."""
         r = self.np_results
-        k = r["kept_idx"]
-        F, Fn = self.np_F[k], self.np_Fneu[k]
-        spks = self.np_spks[k] if self.np_spks is not None else None
-        rid = self.np_roi_ids[k] if self.np_roi_ids is not None else None
-        if "ex_rows" not in r:
-            r["ex_rows"], r["ex_kurt"] = pick_kurtosis_examples(F)
+        if r is None:
+            return
         w = self._np_ex_win
         if w is None or not w["top"].winfo_exists():
             top = tk.Toplevel(self.root); top.configure(bg=BG_DARK)
-            top.geometry("1300x760")
-            bar = tk.Frame(top, bg=BG_MID); bar.pack(fill=tk.X)
-            tk.Button(bar, text="◀  smaller alpha", command=lambda: self._step_neuropil_alpha(-1),
-                      bg=GREY_BTN, fg=TEXT_BRIGHT, relief="flat").pack(side=tk.LEFT, padx=6, pady=4)
-            lbl = tk.Label(bar, text="", bg=BG_MID, fg=TEXT_BRIGHT, font=(FONT_FAMILY, 11))
-            lbl.pack(side=tk.LEFT, padx=10)
-            tk.Button(bar, text="larger alpha  ▶", command=lambda: self._step_neuropil_alpha(1),
-                      bg=GREY_BTN, fg=TEXT_BRIGHT, relief="flat").pack(side=tk.LEFT, padx=6, pady=4)
+            top.geometry("1500x640"); top.title("Alpha calibration and details")
             fig = Figure(facecolor=BG_DARK)
             can = FigureCanvasTkAgg(fig, master=top)
             can.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-            w = self._np_ex_win = {"top": top, "fig": fig, "canvas": can, "label": lbl}
-        a = self.np_sel_alpha
-        w["top"].title(f"Neuropil examples — alpha = {a:.2f}")
-        w["label"].config(text=f"alpha = {a:.2f}")
-        draw_neuropil_examples(w["fig"], F, Fn, a, self.np_fs or 30.0, r["ex_rows"], r["ex_kurt"],
-                               roi_ids=rid, spks=spks)
+            w = self._np_ex_win = {"top": top, "fig": fig, "canvas": can}
+        fig = w["fig"]; fig.clear()
+        sug = r.get("suggest") or {}
+        matched = [n.strip() for n in sug.get("condition", "").split(",") if n.strip()]
+        draw_calibration_summary(fig, load_alpha_calibration(), matched=matched, sel_alpha=self.np_sel_alpha,
+                                 user_alpha_min=sug.get("alpha_min"), rect=(0.0, 0.03, 0.66, 0.95))
+        axt = fig.add_axes([0.68, 0.05, 0.31, 0.90]); axt.axis("off")
+        y = 1.0
+        for txt, c, fsz, wt in self._neuropil_detail_lines():
+            axt.text(0.0, y, txt, color=c, fontsize=fsz, fontweight=wt, va="top", ha="left",
+                     transform=axt.transAxes, wrap=True)
+            y -= 0.006 + fsz * 0.0042
         w["canvas"].draw_idle()
         w["top"].lift()
 
