@@ -4,8 +4,7 @@
  "description": "alpha offsets (alpha - alpha_min) from Allen-calibrated simulations scored with OMSI against ground-truth spikes; see tools/build_alpha_calibration.py",
  "match_on": [
   "np_fluct",
-  "noise_F",
-  "ring_ratio"
+  "noise_F"
  ],
  "tol": 0.05,
  "tol_corr_abs": 0.01,

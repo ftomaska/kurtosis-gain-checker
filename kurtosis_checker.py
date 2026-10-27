@@ -77,7 +77,7 @@ Optional (only for the raw-TIFF NormCorre fallback in gain mode): caiman
 # Bump this on every change so a running instance's window title can be checked
 # against what's actually in this file -- handy when the app runs on a machine
 # separate from wherever this source file is being edited.
-APP_VERSION = "2026-10-27.1"
+APP_VERSION = "2026-10-27.2"
 
 import os
 import sys
@@ -51855,6 +51855,11 @@ def neuropil_alpha_sweep(F, Fneu, stat, alphas, exclude_px, Ly, Lx,
 # ─────────────────────────────────────────────────────────────────────────
 
 ALPHA_CALIB_FILENAME = "alpha_calibration.json"
+# statistics used to pick the closest simulated condition. ring_ratio is
+# computed and shown, but tabled for matching until it has been checked
+# against OASIS-detected events on real recordings (the calibration used the
+# true spikes).
+MATCH_KEYS = ("np_fluct", "noise_F")
 
 # goal key -> (label, how the near-optimal band was defined in the simulation)
 ALPHA_GOALS = {
@@ -51909,7 +51914,8 @@ def neuropil_recording_stats(F, Fneu, fs, spks=None):
       event_rate   frames with spks > 2 x F noise SD, per second
       ring_ratio   event-triggered Fneu response / F response (how much of
                    a cell's own transient shows up in its neuropil ring) --
-                   used for matching; strongly moves the best spike-train alpha
+                   strongly moves the best spike-train alpha; shown, but not used for
+                   matching until validated with OASIS events on real data
       (event_rate is shown only: OASIS undercounts, and the simulation has
       no OASIS step to calibrate that against)
     """
@@ -51957,6 +51963,35 @@ def neuropil_recording_stats(F, Fneu, fs, spks=None):
     return out
 
 
+def neuropil_alpha_diagnostics(F, Fneu, alphas):
+    """Two exact, model-free consequences of each alpha (no simulation):
+
+      noise_ratio[a]  median over cells of the frame-to-frame noise SD of
+                      F - a*Fneu divided by that of F (robust: median |diff|).
+                      Subtracting adds the ring's own noise; this is its cost.
+      f0_nonpos[a]    fraction of cells whose baseline F0 (8th percentile of
+                      F - a*Fneu) is <= 0 -- past that, dF/F (and any
+                      F0-normalised spike inference) is undefined.
+    Also the alphas at which 10% and 50% of cells reach F0 <= 0."""
+    F = np.asarray(F, float); Fneu = np.asarray(Fneu, float)
+    alphas = np.asarray(alphas, float)
+    dF = np.diff(F, axis=1); dN = np.diff(Fneu, axis=1)
+    sd0 = np.median(np.abs(dF), axis=1)
+    sd0[sd0 == 0] = np.nan
+    nr = np.full(len(alphas), np.nan); nr_lo = nr.copy(); nr_hi = nr.copy(); f0 = nr.copy()
+    k8 = max(0, int(round(0.08 * F.shape[1])) - 1)
+    for i, a in enumerate(alphas):
+        r = np.median(np.abs(dF - a * dN), axis=1) / sd0
+        nr[i] = np.nanmedian(r); nr_lo[i], nr_hi[i] = np.nanpercentile(r, [25, 75])
+        b8 = np.partition(F - a * Fneu, k8, axis=1)[:, k8]
+        f0[i] = float(np.mean(b8 <= 0))
+    def first_at(frac):
+        j = np.flatnonzero(f0 >= frac)
+        return float(alphas[j[0]]) if len(j) else None
+    return {"alphas": alphas, "noise_ratio": nr, "noise_ratio_q25": nr_lo, "noise_ratio_q75": nr_hi,
+            "f0_nonpos": f0, "alpha_f0_10": first_at(0.10), "alpha_f0_50": first_at(0.50)}
+
+
 def load_alpha_calibration():
     """alpha_calibration.json next to this script if present, else the
     built-in baseline table."""
@@ -52002,7 +52037,7 @@ def suggest_alpha_ranges(sweep, rec_stats, calib):
     # distance to each simulated condition: log ratio for scale-like statistics,
     # difference / scale for the rest (ring_ratio can be ~0 or negative)
     conds = calib.get("conditions", [])
-    keys = calib.get("match_on", ["np_fluct", "noise_F"])
+    keys = [k_ for k_ in calib.get("match_on", ["np_fluct", "noise_F"]) if k_ in MATCH_KEYS]
     lin_scale = calib.get("match_scale", {"ring_ratio": 0.3})
     dists = []
     for c in conds:
@@ -55116,6 +55151,8 @@ class KurtosisChecker:
             fs = self.np_fs or 30.0
             result["fs_assumed"] = self.np_fs is None
             result["rec_stats"] = neuropil_recording_stats(self.np_F[k], self.np_Fneu[k], fs, spks)
+            self._gain_progress("Computing noise cost and F0 ceiling...")
+            result["diag"] = neuropil_alpha_diagnostics(self.np_F[k], self.np_Fneu[k], result["alphas"])
             result["suggest"] = suggest_alpha_ranges(result, result["rec_stats"], load_alpha_calibration())
             self.np_sel_alpha = None
             self.np_results = result
@@ -55143,8 +55180,9 @@ class KurtosisChecker:
             ax.spines["top"].set_visible(False)
             ax.spines["right"].set_visible(False)
             ax.tick_params(colors=TEXT_MAIN, labelsize=8)
-        ax = self.fig.add_axes([0.11, 0.36, 0.52, 0.56]); _style(ax)
-        axb = self.fig.add_axes([0.11, 0.08, 0.52, 0.20], sharex=ax); _style(axb)
+        ax = self.fig.add_axes([0.11, 0.48, 0.52, 0.44]); _style(ax)
+        axd = self.fig.add_axes([0.11, 0.30, 0.52, 0.13], sharex=ax); _style(axd)
+        axb = self.fig.add_axes([0.11, 0.06, 0.52, 0.19], sharex=ax); _style(axb)
 
         alphas = r["alphas"]
         mean_c = r["mean_corr"]
@@ -55177,6 +55215,26 @@ class KurtosisChecker:
             ax.text(sug["alpha_min"], ax.get_ylim()[1], "  min. corr.\n  (biased high)",
                     color=TEXT_MAIN, fontsize=7, ha="left", va="top")
         ax.set_ylabel("Mean pairwise correlation\n(off-diagonal, ± SEM)", color=TEXT_DIM, fontsize=9)
+        # exact, model-free costs of each alpha: added noise and undefined dF/F
+        dg = r.get("diag")
+        if dg is not None:
+            da = dg["alphas"]
+            axd.fill_between(da, dg["noise_ratio_q25"], dg["noise_ratio_q75"], color=TEXT_MAIN, alpha=0.15, lw=0)
+            axd.plot(da, dg["noise_ratio"], color=TEXT_BRIGHT, lw=1.4)
+            axd.set_ylabel("noise vs\nraw F (×)", color=TEXT_DIM, fontsize=8)
+            axd2 = axd.twinx()
+            axd2.plot(da, 100 * dg["f0_nonpos"], color=C_BOT, lw=1.4)
+            axd2.set_ylim(-3, 103); axd2.set_yticks([0, 50, 100])
+            axd2.tick_params(colors=C_BOT, labelsize=7)
+            for sp_ in axd2.spines.values(): sp_.set_visible(False)
+            axd2.set_ylabel("% cells\nF0 ≤ 0", color=C_BOT, fontsize=8)
+            if dg["alpha_f0_10"] is not None:
+                for a_ in (ax, axd, axb):
+                    a_.axvspan(dg["alpha_f0_10"], alphas[-1], color=C_BOT, alpha=0.06, lw=0, zorder=0)
+            axd.text(0.01, 0.95, "white: noise SD of F − alpha·Fneu relative to raw F (median, IQR)   ·   "
+                     "red: % of cells with baseline F0 ≤ 0 (red shading: ≥ 10%)",
+                     transform=axd.transAxes, color=TEXT_DIM, fontsize=7, va="top")
+        axd.tick_params(labelbottom=False)
         ax.tick_params(labelbottom=False)
         filt_note = (f"kurtosis > {r['kurtosis_thresh']:.1f}"
                      if r.get("kurtosis_thresh") is not None else "no kurtosis filter")
@@ -55206,7 +55264,7 @@ class KurtosisChecker:
         axb.set_ylim(0.4, len(goals) + 0.6)
         axb.set_xlim(min(alphas[0], 0), alphas[-1])
         axb.set_xlabel("alpha   (Fcorr = rawF − alpha·Fneu)", color=TEXT_DIM, fontsize=9)
-        self._np_axes = (ax, axb)
+        self._np_axes = (ax, axd, axb)
 
         # right: statistics and suggestions as text
         axt = self.fig.add_axes([0.67, 0.08, 0.31, 0.84]); axt.axis("off")
@@ -55227,8 +55285,7 @@ class KurtosisChecker:
                 b0, b1 = sug["goals"][g]["best"]
                 L.append((f"{ALPHA_GOALS[g][0]}:  best {b0:.2f}–{b1:.2f}   (ok {lo:.2f}–{hi:.2f})",
                           goal_col[g], 8.5, "bold"))
-            L.append(("Bright bar: best alpha across simulated correlation", TEXT_DIM, 7.5, "normal"))
-            L.append(("levels (true correlation unknown). Pale: near-optimal.", TEXT_DIM, 7.5, "normal"))
+            L.append(("Bright: best over simulated correlation levels; pale: near-optimal.", TEXT_DIM, 7, "normal"))
             L.append(("", TEXT_MAIN, 4, "normal"))
             ab = sug.get("absolute")
             if ab:
@@ -55248,6 +55305,18 @@ class KurtosisChecker:
             L.append((f"{prov}calibration: {sug['condition']}", C_FLOOR if sug["provisional"] else TEXT_MAIN, 8, "bold"))
             L.append((f"  (distance {sug['distance']:.2f} in log stats; source: {os.path.basename(str(sug['source']))})",
                       TEXT_DIM, 7, "normal"))
+        dg = r.get("diag")
+        if dg is not None:
+            L.append(("", TEXT_MAIN, 6, "normal"))
+            L.append(("Costs of each alpha (exact, from your data)", TEXT_BRIGHT, 9, "bold"))
+            c10, c50 = dg["alpha_f0_10"], dg["alpha_f0_50"]
+            L.append((f"F0 ≤ 0 in 10% of cells from alpha = {c10:.2f}" if c10 is not None
+                      else "F0 stays > 0 in 90% of cells over the whole sweep", C_BOT, 8, "normal"))
+            if c50 is not None:
+                L.append((f"F0 ≤ 0 in half the cells from alpha = {c50:.2f}  (dF/F undefined there)", C_BOT, 8, "normal"))
+            if sug:
+                jb = int(np.argmin(np.abs(dg["alphas"] - sug["alpha_min"])))
+                L.append((f"noise at the min.-corr. alpha: {dg['noise_ratio'][jb]:.2f}× raw F", TEXT_MAIN, 8, "normal"))
         L.append(("", TEXT_MAIN, 6, "normal"))
         L.append(("Recording statistics (median over cells)", TEXT_BRIGHT, 9, "bold"))
         fs_note = " (ops.fs missing — 30 Hz assumed)" if r.get("fs_assumed") else ""
@@ -55258,14 +55327,14 @@ class KurtosisChecker:
         if "event_rate" in st:
             L.append((f"OASIS events/s (spks > 2 noise SD)  {st['event_rate']:.2f}", TEXT_MAIN, 8, "normal"))
             L.append((f"own transient in ring (Fneu/F response)  {st['ring_ratio']:.2f}", TEXT_MAIN, 8, "normal"))
-            L.append(("  (ring ratio is used for matching; event rate is shown only)", TEXT_DIM, 7, "normal"))
+            L.append(("  (shown only; not used for matching yet)", TEXT_DIM, 7, "normal"))
         else:
             L.append(("no spks.npy: spike-based statistics skipped", TEXT_DIM, 7.5, "normal"))
         y = 1.0
         for txt, c, fsz, wt in L:
             axt.text(0.0, y, txt, color=c, fontsize=fsz, fontweight=wt, va="top", ha="left",
                      transform=axt.transAxes)
-            y -= 0.006 + fsz * 0.0036
+            y -= 0.004 + fsz * 0.0031
 
         self.canvas.draw()
 

@@ -194,7 +194,7 @@ def main():
            "provisional": bool(a.provisional or len(conds) < 2),
            "description": "alpha offsets (alpha - alpha_min) from Allen-calibrated simulations scored "
                           "with OMSI against ground-truth spikes; see tools/build_alpha_calibration.py",
-           "match_on": ["np_fluct", "noise_F", "ring_ratio"],
+           "match_on": ["np_fluct", "noise_F"],   # ring_ratio stored but tabled for matching
            "tol": TOL, "tol_corr_abs": TOL_CORR_ABS, "tol_corr_rel": TOL_CORR_REL,
            "absolute_summary": absolute_summary(conds),
            "conditions": conds}
