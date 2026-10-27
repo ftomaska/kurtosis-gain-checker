@@ -77,7 +77,7 @@ Optional (only for the raw-TIFF NormCorre fallback in gain mode): caiman
 # Bump this on every change so a running instance's window title can be checked
 # against what's actually in this file -- handy when the app runs on a machine
 # separate from wherever this source file is being edited.
-APP_VERSION = "2026-10-26.2"
+APP_VERSION = "2026-10-27.1"
 
 import os
 import sys
@@ -52047,6 +52047,78 @@ def suggest_alpha_ranges(sweep, rec_stats, calib):
     return out
 
 
+def pick_kurtosis_examples(F, pcts=(90, 50, 10)):
+    """Rows of F whose Pearson kurtosis (fisher=False, raw trace) is closest
+    to the given percentiles -- high / mid / low kurtosis examples.
+    Returns (rows, kurtosis of all rows)."""
+    kurt = stats.kurtosis(np.asarray(F, float), axis=1, fisher=False)
+    rows = []
+    for p in pcts:
+        target = np.nanpercentile(kurt, p)
+        order = np.argsort(np.abs(kurt - target))
+        r = next((int(i) for i in order if int(i) not in rows), int(order[0]))
+        rows.append(r)
+    return rows, kurt
+
+
+def draw_neuropil_examples(fig, F, Fneu, alpha, fs, rows, kurt, roi_ids=None, spks=None,
+                           window_s=60.0, labels=("high", "mid", "low")):
+    """Neuropil Sweep examples: for each chosen cell (row), raw F and Fneu
+    (left) and F - alpha*Fneu (right) over the same window. Dashed line on the
+    right: baseline F0 of the subtracted trace (8th percentile over the whole
+    recording -- what a dF/F would divide by), its value printed, red if <= 0.
+    Ticks: Suite2p/OASIS spks above 2 x the frame-to-frame noise SD of F.
+    The window is centred on the largest transient of the first (high-
+    kurtosis) cell so all rows share the same time span."""
+    F = np.asarray(F, float); Fneu = np.asarray(Fneu, float)
+    fs = float(fs) if fs else 30.0
+    T = F.shape[1]
+    t = np.arange(T) / fs
+    n_w = min(T, int(round(window_s * fs)))
+    pk = int(np.argmax(F[rows[0]] - np.median(F[rows[0]])))
+    i0 = int(np.clip(pk - n_w // 3, 0, T - n_w)); sl = slice(i0, i0 + n_w)
+    fig.clear()
+    nR = len(rows)
+    for k, r in enumerate(rows):
+        f, fn = F[r], Fneu[r]
+        y = f - alpha * fn
+        F0 = float(np.sort(y)[max(0, int(round(0.08 * T)) - 1)])
+        sd = np.median(np.abs(np.diff(f))) / 0.6745 / math.sqrt(2)
+        for c in range(2):
+            ax = fig.add_axes([0.07 + c * 0.47, 0.08 + (nR - 1 - k) * (0.86 / nR), 0.42, 0.86 / nR - 0.07])
+            ax.set_facecolor(BG_DARK)
+            for sp_ in ax.spines.values(): sp_.set_color("#555")
+            ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
+            ax.tick_params(colors=TEXT_MAIN, labelsize=7)
+            if c == 0:
+                ax.plot(t[sl], fn[sl], color="#888888", lw=0.7, label="Fneu")
+                ax.plot(t[sl], f[sl], color=TEXT_BRIGHT, lw=0.7, label="raw F")
+                rid = f"ROI {roi_ids[r]}" if roi_ids is not None else f"cell {r}"
+                ax.set_title(f"{labels[k]} kurtosis  ·  {rid}  ·  kurtosis {kurt[r]:.1f}",
+                             color=TEXT_BRIGHT, fontsize=8, loc="left")
+                if k == 0:
+                    ax.legend(loc="upper right", fontsize=7, frameon=False, labelcolor=TEXT_MAIN)
+                yl = ax.get_ylim()
+            else:
+                ax.plot(t[sl], y[sl], color=C_INCL, lw=0.7)
+                ax.axhline(F0, color=TEXT_DIM, lw=0.9, ls="--")
+                ax.set_title(f"F − {alpha:.2f}·Fneu   ·   F0 = {F0:.0f}",
+                             color=(C_BOT if F0 <= 0 else TEXT_BRIGHT), fontsize=8, loc="left")
+                yl = ax.get_ylim()
+            if spks is not None:
+                ev = np.flatnonzero(np.asarray(spks[r], float)[sl] > 2.0 * sd)
+                if len(ev):
+                    top = yl[1]; h = 0.06 * (yl[1] - yl[0])
+                    ax.vlines(t[sl][ev], top, top + h, color=C_TOP, lw=0.6)
+                    ax.set_ylim(yl[0], top + 1.4 * h)
+            if k == nR - 1:
+                ax.set_xlabel("Time (s)", color=TEXT_DIM, fontsize=8)
+    fig.text(0.07, 0.975, "left: raw F (white), Fneu (grey)   ·   right: neuropil-subtracted   ·   "
+             "green ticks: OASIS events (spks > 2 noise SD)" if spks is not None else
+             "left: raw F (white), Fneu (grey)   ·   right: neuropil-subtracted",
+             color=TEXT_DIM, fontsize=7.5, va="top")
+
+
 # ═════════════════════════════════════════════════════════════════════════
 # Main app
 # ═════════════════════════════════════════════════════════════════════════
@@ -52097,6 +52169,10 @@ class KurtosisChecker:
         self.np_Fneu = None
         self.np_stat = None
         self.np_spks = None  # Suite2p OASIS spks.npy (optional; display-only stats)
+        self.np_roi_ids = None   # Suite2p ROI index of each loaded row (after iscell)
+        self.np_sel_alpha = None # alpha step clicked on the sweep (examples window)
+        self._np_ex_win = None   # examples Toplevel (reused)
+        self._np_axes = ()       # axes of the sweep view that accept clicks
         self.np_fs = None    # frame rate (Hz), from ops.npy
         self.np_Ly = None    # frame height (px), from ops.npy -- where the
         self.np_Lx = None    # FOV border actually is, for the exclusion distance
@@ -52857,6 +52933,19 @@ class KurtosisChecker:
                                      "'Filter by kurtosis' above is "
                                      "checked.")
 
+        # ── Suggested interval: which goal is shaded on the sweep ────────
+        self.np_goal_var = tk.StringVar(value="spike_train")
+        goal_body = self._sidebar_card("SHADED INTERVAL", parent=ip)
+        for g, (lbl, _) in ALPHA_GOALS.items():
+            tk.Radiobutton(goal_body, text=lbl, variable=self.np_goal_var, value=g,
+                           bg=CARD_BG, fg=TEXT_BRIGHT, selectcolor=CARD_BG,
+                           activebackground=CARD_BG, font=(FONT_FAMILY, 10), anchor="w",
+                           command=self._rerender_neuropil_if_done).pack(fill=tk.X)
+        tk.Label(goal_body, text="Click the sweep to see example cells "
+                 "(high / mid / low kurtosis) at that alpha.",
+                 bg=CARD_BG, fg=TEXT_DIM, font=(FONT_FAMILY, 8),
+                 wraplength=210, justify="left").pack(anchor="w", pady=(6, 0))
+
         # ── Run Analysis (primary action, bottom of the sidebar) ────────
         run_frame = tk.Frame(ip, bg=BG_MID)
         run_frame.pack(fill=tk.X, padx=12, pady=(4, 14))
@@ -53158,6 +53247,8 @@ class KurtosisChecker:
         self.canvas = FigureCanvasTkAgg(self.fig, master=self._main_area)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         # No toolbar — removed intentionally
+        # Neuropil Sweep: clicking the sweep picks an alpha step (examples window)
+        self.canvas.mpl_connect("button_press_event", self._on_neuropil_click)
 
         # Busy animation lives in the same main output area, swapped in for
         # the canvas by _progress_start/_progress_stop while an analysis is
@@ -53955,6 +54046,7 @@ class KurtosisChecker:
             if spks is not None and spks.shape != F.shape:
                 spks = None
             fs = float(ops.get("fs", 0) or 0) or None
+            roi_ids = np.arange(F.shape[0])
             iscell_p = os.path.join(plane_dir, "iscell.npy")
             if os.path.exists(iscell_p):
                 iscell = np.load(iscell_p)
@@ -53964,6 +54056,7 @@ class KurtosisChecker:
                 stat = stat[mask]
                 if spks is not None:
                     spks = spks[mask]
+                roi_ids = roi_ids[mask]
             else:
                 messagebox.showwarning(
                     "No iscell.npy",
@@ -53975,6 +54068,8 @@ class KurtosisChecker:
         self.np_plane_dir = plane_dir
         self.np_F, self.np_Fneu, self.np_stat = F, Fneu, list(stat)
         self.np_spks, self.np_fs = spks, fs
+        self.np_roi_ids = roi_ids
+        self.np_sel_alpha = None
         self.np_Ly, self.np_Lx = Ly, Lx
         self.np_results = None
         n_cells, n_frames = F.shape
@@ -55022,6 +55117,7 @@ class KurtosisChecker:
             result["fs_assumed"] = self.np_fs is None
             result["rec_stats"] = neuropil_recording_stats(self.np_F[k], self.np_Fneu[k], fs, spks)
             result["suggest"] = suggest_alpha_ranges(result, result["rec_stats"], load_alpha_calibration())
+            self.np_sel_alpha = None
             self.np_results = result
             self.root.after(0, self._render_neuropil_results)
         except Exception as e:
@@ -55057,6 +55153,24 @@ class KurtosisChecker:
                          color=C_INCL, alpha=0.25, zorder=1)
         ax.plot(alphas, mean_c, color=C_INCL, lw=2, zorder=2, marker="o", ms=3)
         ax.axhline(0, color="#555", lw=1, ls=":", zorder=0)
+        goal_col = {"spike_train": C_TOP, "precision": "#9b59b6",
+                    "recall": C_MID, "correlation": C_HIST}
+        g_sel = self.np_goal_var.get() if hasattr(self, "np_goal_var") else "spike_train"
+        if sug and g_sel in sug["goals"]:
+            lo, hi = sug["goals"][g_sel]["range"]
+            b0, b1 = sug["goals"][g_sel]["best"]
+            ax.axvspan(lo, hi, color=goal_col[g_sel], alpha=0.08, lw=0, zorder=0)
+            ax.axvspan(b0, max(b1, b0 + 0.01), color=goal_col[g_sel], alpha=0.22, lw=0, zorder=0)
+            ax.text(0.01, 0.02, f"shaded: suggested alpha for {ALPHA_GOALS[g_sel][0].lower()}  "
+                    f"(best {b0:.2f}–{b1:.2f}, near-optimal {lo:.2f}–{hi:.2f})",
+                    transform=ax.transAxes, color=goal_col[g_sel], fontsize=8, va="bottom")
+        sel = getattr(self, "np_sel_alpha", None)
+        if sel is not None:
+            j = int(np.argmin(np.abs(alphas - sel)))
+            ax.plot([alphas[j]], [mean_c[j]], "o", ms=9, mfc="none", mec=TEXT_BRIGHT, mew=1.5, zorder=4)
+            ax.axvline(alphas[j], color=TEXT_BRIGHT, lw=0.8, ls=":", zorder=3)
+        ax.text(0.99, 0.02, "click to view example cells at an alpha", transform=ax.transAxes,
+                color=TEXT_DIM, fontsize=7.5, ha="right", va="bottom")
         if sug:
             for a_ in (ax, axb):
                 a_.axvline(sug["alpha_min"], color=TEXT_DIM, lw=1.0, ls="--", zorder=1)
@@ -55092,6 +55206,7 @@ class KurtosisChecker:
         axb.set_ylim(0.4, len(goals) + 0.6)
         axb.set_xlim(min(alphas[0], 0), alphas[-1])
         axb.set_xlabel("alpha   (Fcorr = rawF − alpha·Fneu)", color=TEXT_DIM, fontsize=9)
+        self._np_axes = (ax, axb)
 
         # right: statistics and suggestions as text
         axt = self.fig.add_axes([0.67, 0.08, 0.31, 0.84]); axt.axis("off")
@@ -55162,6 +55277,63 @@ class KurtosisChecker:
         self.status_var.set(
             f"Done  ·  {r['n_cells']} cells  ·  {r['n_pairs']} pairs  ·  "
             f"alpha {alpha_span}{st_txt}  ·  {r.get('plane_dir', '')}")
+
+    def _rerender_neuropil_if_done(self):
+        if getattr(self, "np_results", None) is not None and self.tab_var.get() == "neuropil":
+            self._render_neuropil_results()
+
+    def _on_neuropil_click(self, event):
+        """Click on the sweep (or the interval bars): select the nearest alpha
+        step and show high/mid/low-kurtosis example cells at that alpha."""
+        if (self.tab_var.get() != "neuropil" or self.np_results is None
+                or event.inaxes not in self._np_axes or event.xdata is None):
+            return
+        alphas = np.asarray(self.np_results["alphas"], float)
+        self.np_sel_alpha = float(alphas[int(np.argmin(np.abs(alphas - event.xdata)))])
+        self._render_neuropil_results()
+        self._show_neuropil_examples()
+
+    def _step_neuropil_alpha(self, d):
+        alphas = np.asarray(self.np_results["alphas"], float)
+        j = int(np.argmin(np.abs(alphas - (self.np_sel_alpha or 0.0))))
+        j = int(np.clip(j + d, 0, len(alphas) - 1))
+        self.np_sel_alpha = float(alphas[j])
+        self._render_neuropil_results()
+        self._show_neuropil_examples()
+
+    def _show_neuropil_examples(self):
+        """One reusable window: raw F, Fneu and F - alpha*Fneu for the cells
+        at the 90th / 50th / 10th percentile of kurtosis (among the cells the
+        sweep used), with buttons to step alpha."""
+        r = self.np_results
+        k = r["kept_idx"]
+        F, Fn = self.np_F[k], self.np_Fneu[k]
+        spks = self.np_spks[k] if self.np_spks is not None else None
+        rid = self.np_roi_ids[k] if self.np_roi_ids is not None else None
+        if "ex_rows" not in r:
+            r["ex_rows"], r["ex_kurt"] = pick_kurtosis_examples(F)
+        w = self._np_ex_win
+        if w is None or not w["top"].winfo_exists():
+            top = tk.Toplevel(self.root); top.configure(bg=BG_DARK)
+            top.geometry("1300x760")
+            bar = tk.Frame(top, bg=BG_MID); bar.pack(fill=tk.X)
+            tk.Button(bar, text="◀  smaller alpha", command=lambda: self._step_neuropil_alpha(-1),
+                      bg=GREY_BTN, fg=TEXT_BRIGHT, relief="flat").pack(side=tk.LEFT, padx=6, pady=4)
+            lbl = tk.Label(bar, text="", bg=BG_MID, fg=TEXT_BRIGHT, font=(FONT_FAMILY, 11))
+            lbl.pack(side=tk.LEFT, padx=10)
+            tk.Button(bar, text="larger alpha  ▶", command=lambda: self._step_neuropil_alpha(1),
+                      bg=GREY_BTN, fg=TEXT_BRIGHT, relief="flat").pack(side=tk.LEFT, padx=6, pady=4)
+            fig = Figure(facecolor=BG_DARK)
+            can = FigureCanvasTkAgg(fig, master=top)
+            can.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+            w = self._np_ex_win = {"top": top, "fig": fig, "canvas": can, "label": lbl}
+        a = self.np_sel_alpha
+        w["top"].title(f"Neuropil examples — alpha = {a:.2f}")
+        w["label"].config(text=f"alpha = {a:.2f}")
+        draw_neuropil_examples(w["fig"], F, Fn, a, self.np_fs or 30.0, r["ex_rows"], r["ex_kurt"],
+                               roi_ids=rid, spks=spks)
+        w["canvas"].draw_idle()
+        w["top"].lift()
 
     def _draw_neuropil_splash(self):
         """Neuropil-sweep-tab splash, shown before any sweep has run yet.
