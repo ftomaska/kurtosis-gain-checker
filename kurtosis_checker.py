@@ -77,7 +77,7 @@ Optional (only for the raw-TIFF NormCorre fallback in gain mode): caiman
 # Bump this on every change so a running instance's window title can be checked
 # against what's actually in this file -- handy when the app runs on a machine
 # separate from wherever this source file is being edited.
-APP_VERSION = "2026-10-27.4"
+APP_VERSION = "2026-10-27.5"
 
 import os
 import sys
@@ -51806,13 +51806,25 @@ def neuropil_alpha_sweep(F, Fneu, stat, alphas, exclude_px, Ly, Lx,
     alphas = np.asarray(alphas, dtype=float)
     means = np.full(len(alphas), np.nan)
     sems = np.full(len(alphas), np.nan)
+    # Exact and fast: cov(F - a*Fneu) = Cff - a*(Cfn + Cfn') + a^2*Cnn, so three
+    # cell-by-cell products replace one full correlation matrix per alpha step.
+    if progress_cb:
+        progress_cb("Computing covariance matrices...")
+    Fc = F - F.mean(axis=1, keepdims=True)
+    Nc = Fneu - Fneu.mean(axis=1, keepdims=True)
+    Cff = Fc @ Fc.T
+    Cfn = Fc @ Nc.T
+    Cnn = Nc @ Nc.T
+    del Fc, Nc
+    Cfn_s = Cfn + Cfn.T
     for ai, alpha in enumerate(alphas):
-        if progress_cb and (ai % 5 == 0 or ai == len(alphas) - 1):
+        if progress_cb and (ai % 10 == 0 or ai == len(alphas) - 1):
             progress_cb(f"Sweeping alpha: {ai + 1}/{len(alphas)} "
                         f"(alpha={alpha:.2f})...")
-        Fcorr = F - alpha * Fneu
-        with np.errstate(invalid="ignore"):
-            R = np.corrcoef(Fcorr)
+        C = Cff - alpha * Cfn_s + (alpha * alpha) * Cnn
+        d = np.sqrt(np.clip(np.diag(C), 0, None))
+        with np.errstate(invalid="ignore", divide="ignore"):
+            R = C / np.outer(d, d)
         vals = R[iu]
         vals = vals[np.isfinite(vals)]
         if len(vals) == 0:
@@ -51954,8 +51966,12 @@ def neuropil_recording_stats(F, Fneu, fs, spks=None):
             ev = ev[(ev >= pre) & (ev < T - post)]
             if len(ev) < 5:
                 continue
-            dF = np.array([F[i, e:e + post].mean() - F[i, e - pre:e].mean() for e in ev])
-            dN = np.array([Fneu[i, e:e + post].mean() - Fneu[i, e - pre:e].mean() for e in ev])
+            if len(ev) > 300:                       # the 300 largest events are plenty
+                ev = np.sort(ev[np.argsort(spks[i, ev])[-300:]])
+            cF_ = np.concatenate(([0.0], np.cumsum(F[i])))
+            cN_ = np.concatenate(([0.0], np.cumsum(Fneu[i])))
+            dF = (cF_[ev + post] - cF_[ev]) / post - (cF_[ev] - cF_[ev - pre]) / pre
+            dN = (cN_[ev + post] - cN_[ev]) / post - (cN_[ev] - cN_[ev - pre]) / pre
             if np.mean(dF) > 0:
                 ratios.append(np.mean(dN) / np.mean(dF))
         out["event_rate"] = float(np.median(rates)) if rates else float("nan")
@@ -51963,33 +51979,54 @@ def neuropil_recording_stats(F, Fneu, fs, spks=None):
     return out
 
 
-def neuropil_alpha_diagnostics(F, Fneu, alphas):
-    """Two exact, model-free consequences of each alpha (no simulation):
+def neuropil_alpha_diagnostics(F, Fneu, alphas, max_cells=400, max_frames=30000, seed=0):
+    """Two model-free consequences of each alpha (no simulation):
 
       noise_ratio[a]  median over cells of the frame-to-frame noise SD of
-                      F - a*Fneu divided by that of F (robust: median |diff|).
+                      F - a*Fneu divided by that of F. Exact in closed form:
+                      var(dF - a*dN) = vF + a^2*vN - 2a*cFN, using frame
+                      differences with transients trimmed (|d| > 5 robust SD
+                      in either trace), so it measures noise, not signal.
                       Subtracting adds the ring's own noise; this is its cost.
       f0_nonpos[a]    fraction of cells whose baseline F0 (8th percentile of
                       F - a*Fneu) is <= 0 -- past that, dF/F (and any
                       F0-normalised spike inference) is undefined.
+    For speed, at most max_cells cells (random, fixed seed) and max_frames
+    frames (evenly strided) are used; percentiles are insensitive to that.
     Also the alphas at which 10% and 50% of cells reach F0 <= 0."""
     F = np.asarray(F, float); Fneu = np.asarray(Fneu, float)
     alphas = np.asarray(alphas, float)
+    n, T = F.shape
+    if n > max_cells:
+        idx = np.sort(np.random.default_rng(seed).choice(n, max_cells, replace=False))
+        F, Fneu = F[idx], Fneu[idx]
     dF = np.diff(F, axis=1); dN = np.diff(Fneu, axis=1)
-    sd0 = np.median(np.abs(dF), axis=1)
-    sd0[sd0 == 0] = np.nan
+    sF = np.median(np.abs(dF), axis=1, keepdims=True) / 0.6745
+    sN = np.median(np.abs(dN), axis=1, keepdims=True) / 0.6745
+    ok = (np.abs(dF) < 5 * sF) & (np.abs(dN) < 5 * sN)
+    m = ok.sum(axis=1)
+    dF0 = np.where(ok, dF, 0.0); dN0 = np.where(ok, dN, 0.0)
+    mF = dF0.sum(1) / m; mN = dN0.sum(1) / m
+    vF = (dF0 ** 2).sum(1) / m - mF ** 2
+    vN = (dN0 ** 2).sum(1) / m - mN ** 2
+    cFN = (dF0 * dN0).sum(1) / m - mF * mN
+    del dF, dN, dF0, dN0, ok
+    stride = max(1, int(np.ceil(T / max_frames)))
+    Fs, Ns = F[:, ::stride], Fneu[:, ::stride]
+    k8 = max(0, int(round(0.08 * Fs.shape[1])) - 1)
     nr = np.full(len(alphas), np.nan); nr_lo = nr.copy(); nr_hi = nr.copy(); f0 = nr.copy()
-    k8 = max(0, int(round(0.08 * F.shape[1])) - 1)
-    for i, a in enumerate(alphas):
-        r = np.median(np.abs(dF - a * dN), axis=1) / sd0
-        nr[i] = np.nanmedian(r); nr_lo[i], nr_hi[i] = np.nanpercentile(r, [25, 75])
-        b8 = np.partition(F - a * Fneu, k8, axis=1)[:, k8]
-        f0[i] = float(np.mean(b8 <= 0))
+    with np.errstate(invalid="ignore", divide="ignore"):
+        for i, a in enumerate(alphas):
+            r = np.sqrt(np.clip(vF + a * a * vN - 2 * a * cFN, 0, None) / vF)
+            nr[i] = np.nanmedian(r); nr_lo[i], nr_hi[i] = np.nanpercentile(r, [25, 75])
+            b8 = np.partition(Fs - a * Ns, k8, axis=1)[:, k8]
+            f0[i] = float(np.mean(b8 <= 0))
     def first_at(frac):
-        j = np.flatnonzero(f0 >= frac)
-        return float(alphas[j[0]]) if len(j) else None
+        j_ = np.flatnonzero(f0 >= frac)
+        return float(alphas[j_[0]]) if len(j_) else None
     return {"alphas": alphas, "noise_ratio": nr, "noise_ratio_q25": nr_lo, "noise_ratio_q75": nr_hi,
-            "f0_nonpos": f0, "alpha_f0_10": first_at(0.10), "alpha_f0_50": first_at(0.50)}
+            "f0_nonpos": f0, "alpha_f0_10": first_at(0.10), "alpha_f0_50": first_at(0.50),
+            "n_cells_used": int(F.shape[0]), "frame_stride": stride}
 
 
 def load_alpha_calibration():
