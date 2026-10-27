@@ -77,7 +77,7 @@ Optional (only for the raw-TIFF NormCorre fallback in gain mode): caiman
 # Bump this on every change so a running instance's window title can be checked
 # against what's actually in this file -- handy when the app runs on a machine
 # separate from wherever this source file is being edited.
-APP_VERSION = "2026-10-27.5"
+APP_VERSION = "2026-10-27.6"
 
 import os
 import sys
@@ -52119,15 +52119,34 @@ def suggest_alpha_ranges(sweep, rec_stats, calib):
     return out
 
 
-def pick_kurtosis_examples(F, pcts=(90, 50, 10)):
+def _oasis_events(F, spks):
+    """Frames where Suite2p/OASIS spks exceed 2 x the frame-to-frame noise SD
+    of F, per cell (list of index arrays)."""
+    F = np.asarray(F, float)
+    sd = np.median(np.abs(np.diff(F, axis=1)), axis=1) / 0.6745 / math.sqrt(2)
+    return [np.flatnonzero(np.asarray(spks[i], float) > 2.0 * sd[i]) for i in range(F.shape[0])]
+
+
+def pick_kurtosis_examples(F, pcts=(90, 50, 10), spks=None, min_events=5):
     """Rows of F whose Pearson kurtosis (fisher=False, raw trace) is closest
-    to the given percentiles -- high / mid / low kurtosis examples.
+    to the given percentiles -- high / mid / low kurtosis examples. With spks,
+    only cells with at least min_events OASIS events are eligible (falling
+    back to all cells if too few qualify), so every example shows events.
     Returns (rows, kurtosis of all rows)."""
     kurt = stats.kurtosis(np.asarray(F, float), axis=1, fisher=False)
+    elig = np.arange(F.shape[0])
+    if spks is not None:
+        nev = np.array([len(e) for e in _oasis_events(F, spks)])
+        for m in (min_events, 2, 1):
+            cand = np.flatnonzero(nev >= m)
+            if len(cand) >= len(pcts):
+                elig = cand
+                break
+    kk = kurt[elig]
     rows = []
     for p in pcts:
-        target = np.nanpercentile(kurt, p)
-        order = np.argsort(np.abs(kurt - target))
+        target = np.nanpercentile(kk, p)
+        order = elig[np.argsort(np.abs(kk - target))]
         r = next((int(i) for i in order if int(i) not in rows), int(order[0]))
         rows.append(r)
     return rows, kurt
@@ -52147,8 +52166,21 @@ def draw_neuropil_examples(fig, F, Fneu, alpha, fs, rows, kurt, roi_ids=None, sp
     T = F.shape[1]
     t = np.arange(T) / fs
     n_w = min(T, int(round(window_s * fs)))
-    pk = int(np.argmax(F[rows[0]] - np.median(F[rows[0]])))
-    i0 = int(np.clip(pk - n_w // 3, 0, T - n_w)); sl = slice(i0, i0 + n_w)
+    ev_all = _oasis_events(F[rows], spks[rows]) if spks is not None else [None] * len(rows)
+
+    def _window(k, r):
+        """each row's own window: the stretch with the most OASIS events,
+        else centred on the cell's largest transient"""
+        ev = ev_all[k]
+        if ev is not None and len(ev):
+            cnt = np.zeros(T); cnt[ev] = 1
+            cs = np.concatenate(([0.0], np.cumsum(cnt)))
+            starts = np.arange(0, T - n_w + 1, max(1, n_w // 20))
+            i0 = int(starts[np.argmax(cs[starts + n_w] - cs[starts])])
+        else:
+            pk = int(np.argmax(F[r] - np.median(F[r])))
+            i0 = int(np.clip(pk - n_w // 3, 0, T - n_w))
+        return slice(i0, i0 + n_w)
     if clear:
         fig.clear()
     X0, Y0, W, H = rect if rect is not None else (0.0, 0.0, 1.0, 0.97)
@@ -52156,6 +52188,7 @@ def draw_neuropil_examples(fig, F, Fneu, alpha, fs, rows, kurt, roi_ids=None, sp
     rh = H / nR
     for k, r in enumerate(rows):
         f, fn = F[r], Fneu[r]
+        sl = _window(k, r)
         y = f - alpha * fn
         F0 = float(np.sort(y)[max(0, int(round(0.08 * T)) - 1)])
         sd = np.median(np.abs(np.diff(f))) / 0.6745 / math.sqrt(2)
@@ -52186,7 +52219,7 @@ def draw_neuropil_examples(fig, F, Fneu, alpha, fs, rows, kurt, roi_ids=None, sp
                              color=(C_BOT if F0 <= 0 else TEXT_BRIGHT), fontsize=8, loc="left")
                 yl = ax.get_ylim()
             if spks is not None:
-                ev = np.flatnonzero(np.asarray(spks[r], float)[sl] > 2.0 * sd)
+                ev = ev_all[k]; ev = ev[(ev >= sl.start) & (ev < sl.stop)] - sl.start
                 if len(ev):
                     top = yl[1]; h = 0.06 * (yl[1] - yl[0])
                     ax.vlines(t[sl][ev], top, top + h, color=C_TOP, lw=0.6)
@@ -55449,7 +55482,8 @@ class KurtosisChecker:
         k = r["kept_idx"]
         F, Fn = self.np_F[k], self.np_Fneu[k]
         if "ex_rows" not in r:
-            r["ex_rows"], r["ex_kurt"] = pick_kurtosis_examples(F)
+            r["ex_rows"], r["ex_kurt"] = pick_kurtosis_examples(
+                F, spks=(self.np_spks[k] if self.np_spks is not None else None))
         hdr = f"alpha = {alphas[jsel]:.2f}"
         if dg is not None:
             hdr += (f"   ·   noise {dg['noise_ratio'][jsel]:.2f}× raw F   ·   "
