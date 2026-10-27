@@ -77,7 +77,7 @@ Optional (only for the raw-TIFF NormCorre fallback in gain mode): caiman
 # Bump this on every change so a running instance's window title can be checked
 # against what's actually in this file -- handy when the app runs on a machine
 # separate from wherever this source file is being edited.
-APP_VERSION = "2026-10-27.6"
+APP_VERSION = "2026-10-27.7"
 
 import os
 import sys
@@ -52153,7 +52153,7 @@ def pick_kurtosis_examples(F, pcts=(90, 50, 10), spks=None, min_events=5):
 
 
 def draw_neuropil_examples(fig, F, Fneu, alpha, fs, rows, kurt, roi_ids=None, spks=None,
-                           window_s=60.0, labels=("high", "mid", "low"), rect=None, clear=True):
+                           window_s=200.0, labels=("high", "mid", "low"), rect=None, clear=True):
     """Neuropil Sweep examples: for each chosen cell (row), raw F and Fneu
     (left) and F - alpha*Fneu (right) over the same window. Dashed line on the
     right: baseline F0 of the subtracted trace (8th percentile over the whole
@@ -52204,16 +52204,15 @@ def draw_neuropil_examples(fig, F, Fneu, alpha, fs, rows, kurt, roi_ids=None, sp
                 fw, nw = f[sl], fn[sl]
                 off = (np.min(fw) - 0.04 * np.ptp(fw)) - np.max(nw)
                 off = min(off, 0.0)
-                ax.plot(t[sl], nw + off, color="#888888", lw=0.7, label="Fneu (offset)")
-                ax.plot(t[sl], fw, color=TEXT_BRIGHT, lw=0.7, label="raw F")
+                lw_ = 0.7 if n_w < 90 * fs else 0.45
+                ax.plot(t[sl], nw + off, color="#888888", lw=lw_, label="Fneu (offset)")
+                ax.plot(t[sl], fw, color=TEXT_BRIGHT, lw=lw_, label="raw F")
                 rid = f"ROI {roi_ids[r]}" if roi_ids is not None else f"cell {r}"
                 ax.set_title(f"{labels[k]} kurtosis  ·  {rid}  ·  kurtosis {kurt[r]:.1f}",
                              color=TEXT_BRIGHT, fontsize=8, loc="left")
-                if k == 0:
-                    ax.legend(loc="upper right", fontsize=7, frameon=False, labelcolor=TEXT_MAIN)
                 yl = ax.get_ylim()
             else:
-                ax.plot(t[sl], y[sl], color=C_INCL, lw=0.7)
+                ax.plot(t[sl], y[sl], color=C_INCL, lw=(0.7 if n_w < 90 * fs else 0.45))
                 ax.axhline(F0, color=TEXT_DIM, lw=0.9, ls="--")
                 ax.set_title(f"F − {alpha:.2f}·Fneu   ·   F0 = {F0:.0f}",
                              color=(C_BOT if F0 <= 0 else TEXT_BRIGHT), fontsize=8, loc="left")
@@ -52222,7 +52221,7 @@ def draw_neuropil_examples(fig, F, Fneu, alpha, fs, rows, kurt, roi_ids=None, sp
                 ev = ev_all[k]; ev = ev[(ev >= sl.start) & (ev < sl.stop)] - sl.start
                 if len(ev):
                     top = yl[1]; h = 0.06 * (yl[1] - yl[0])
-                    ax.vlines(t[sl][ev], top, top + h, color=C_TOP, lw=0.6)
+                    ax.vlines(t[sl][ev], top, top + h, color=C_TOP, lw=(0.6 if n_w < 90 * fs else 0.4))
                     ax.set_ylim(yl[0], top + 1.4 * h)
             if k == nR - 1:
                 ax.set_xlabel("Time (s)", color=TEXT_DIM, fontsize=8)
@@ -53143,6 +53142,11 @@ class KurtosisChecker:
                  "the right.",
                  bg=CARD_BG, fg=TEXT_DIM, font=(FONT_FAMILY, 8),
                  wraplength=210, justify="left").pack(anchor="w", pady=(6, 4))
+        self.np_ex_window_var = tk.DoubleVar(value=200.0)
+        self._sidebar_row(goal_body, "Example length", self.np_ex_window_var, suffix="s",
+                           help_text="Length of the example traces on the right "
+                                     "(each cell's stretch with the most OASIS "
+                                     "events). Applies at the next alpha change.")
         step_row = tk.Frame(goal_body, bg=CARD_BG); step_row.pack(fill=tk.X, pady=(0, 4))
         self._lbtn(step_row, "◀ alpha", lambda: self._step_neuropil_alpha(-1),
                    side=tk.LEFT, padx=(0, 4), font_size=10)
@@ -55497,6 +55501,7 @@ class KurtosisChecker:
         draw_neuropil_examples(self.fig, F, Fn, alphas[jsel], self.np_fs or 30.0, r["ex_rows"], r["ex_kurt"],
                                roi_ids=(self.np_roi_ids[k] if self.np_roi_ids is not None else None),
                                spks=(self.np_spks[k] if self.np_spks is not None else None),
+                               window_s=self._np_example_window_s(),
                                rect=(0.555, 0.05, 0.44, 0.84), clear=False)
         self.canvas.draw()
         if self._np_ex_win is not None and self._np_ex_win["top"].winfo_exists():
@@ -55506,6 +55511,13 @@ class KurtosisChecker:
         self.status_var.set(
             f"Done  ·  {r['n_cells']} cells  ·  {r['n_pairs']} pairs  ·  alpha {alpha_span}  ·  "
             f"selected {alphas[jsel]:.2f}  ·  {r.get('plane_dir', '')}")
+
+    def _np_example_window_s(self):
+        try:
+            v = float(self.np_ex_window_var.get())
+        except Exception:
+            v = 200.0
+        return v if v > 1 else 200.0
 
     def _rerender_neuropil_if_done(self):
         if getattr(self, "np_results", None) is not None and self.tab_var.get() == "neuropil":
