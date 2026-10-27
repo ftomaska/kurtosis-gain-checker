@@ -11,7 +11,8 @@ F - alpha*Fneu, computed exactly as the app does):
   precision    same for precision
   recall       same for recall
   correlation  alpha where the inferred mean pairwise spike-count correlation
-               (1 s bins) equals the truth; band = within 0.02 of it
+               (1 s bins) equals the truth; band = within max(0.01, 25%) of it
+               (the independent population is skipped: there is no crossing)
 and the recording statistics the app matches on (neuropil_recording_stats,
 imported from kurtosis_checker.py so the estimator is identical).
 
@@ -47,7 +48,8 @@ except ImportError:                       # headless machine: stub what the app 
     sys.modules.setdefault("PIL.ImageTk", _Stub("PIL.ImageTk"))
 from kurtosis_checker import neuropil_recording_stats  # noqa: E402
 
-TOL, TOL_CORR = 0.05, 0.02
+TOL = 0.05
+TOL_CORR_ABS, TOL_CORR_REL = 0.01, 0.25   # inferred within max(0.01, 25% of truth)
 FINE = np.round(np.arange(0, 3.0001, 0.01), 2)
 
 
@@ -121,12 +123,16 @@ def condition(in_path, out_path, name):
             offs[g]["hi"].append(round(hi - amin, 3))
         yi = np.asarray(R["spkCorrInferred"], float)[l]
         yt = float(np.atleast_1d(R["spkCorrTrueSubset"])[l])
+        if yt < 0.005:                      # independent population: nothing to match
+            for k_ in ("best", "lo", "hi"):
+                offs["correlation"][k_].append(None)
+            continue
         e = np.abs(yi - yt)
         a = first_crossing(al, yi, yt)
         j = int(np.argmin(e)) if a is None else int(np.argmin(np.abs(al - a)))
         if a is None:
             a = float(al[j])
-        lo, hi = band(al, e, e <= TOL_CORR, j)
+        lo, hi = band(al, e, e <= max(TOL_CORR_ABS, TOL_CORR_REL * yt), j)
         offs["correlation"]["best"].append(round(a - amin, 3))
         offs["correlation"]["lo"].append(round(lo - amin, 3))
         offs["correlation"]["hi"].append(round(hi - amin, 3))
@@ -138,6 +144,27 @@ def condition(in_path, out_path, name):
             "c_true_median": None if cT is None else round(float(np.median(cT)), 3),
             "n_cells": int(Fs[0].shape[0]),
             "offsets": offs}
+
+
+def absolute_summary(conds):
+    """Simulation-wide best alpha per goal (absolute, not relative to alpha_min),
+    over every condition x population: median and middle half. Valid for
+    contamination like the Allen 2x GCaMP6s recordings that set the simulation."""
+    out, pool = {}, []
+    for g in ["spike_train", "precision", "recall", "correlation"]:
+        v = [a + o for c in conds for a, o in zip(c["alpha_min"], c["offsets"][g]["best"]) if o is not None]
+        v = np.asarray(v, float)
+        out[g] = {"median": round(float(np.median(v)), 2),
+                  "q25": round(float(np.percentile(v, 25)), 2), "q75": round(float(np.percentile(v, 75)), 2),
+                  "n": int(len(v))}
+        if g != "recall":
+            pool += list(v)
+    pool = np.asarray(pool, float)
+    out["pooled_spike_precision_correlation"] = {
+        "median": round(float(np.median(pool)), 2),
+        "q25": round(float(np.percentile(pool, 25)), 2), "q75": round(float(np.percentile(pool, 75)), 2),
+        "n": int(len(pool))}
+    return out
 
 
 def main():
@@ -168,7 +195,8 @@ def main():
            "description": "alpha offsets (alpha - alpha_min) from Allen-calibrated simulations scored "
                           "with OMSI against ground-truth spikes; see tools/build_alpha_calibration.py",
            "match_on": ["np_fluct", "noise_F", "ring_ratio"],
-           "tol": TOL, "tol_corr": TOL_CORR,
+           "tol": TOL, "tol_corr_abs": TOL_CORR_ABS, "tol_corr_rel": TOL_CORR_REL,
+           "absolute_summary": absolute_summary(conds),
            "conditions": conds}
     with open(a.out, "w") as fh:
         json.dump(cal, fh, indent=1)

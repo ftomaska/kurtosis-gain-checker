@@ -77,7 +77,7 @@ Optional (only for the raw-TIFF NormCorre fallback in gain mode): caiman
 # Bump this on every change so a running instance's window title can be checked
 # against what's actually in this file -- handy when the app runs on a machine
 # separate from wherever this source file is being edited.
-APP_VERSION = "2026-10-26.1"
+APP_VERSION = "2026-10-26.2"
 
 import os
 import sys
@@ -51839,10 +51839,13 @@ def neuropil_alpha_sweep(F, Fneu, stat, alphas, exclude_px, Ly, Lx,
 # The minimum of the sweep curve (alpha_min) is NOT the right alpha: it
 # assumes the cells' real activity is uncorrelated with the neuropil, so it
 # overshoots whenever the population is correlated (and because each cell's
-# own light leaks into its ring). What it IS good for is an anchor: adding
-# contamination k moves alpha_min and every optimal alpha by exactly k
-# (F + k*Fneu - alpha*Fneu = F - (alpha - k)*Fneu), so "optimum - alpha_min"
-# does not depend on the unknown contamination. Those offsets come from a
+# own light leaks into its ring). What it IS good for is an anchor: more
+# contamination moves alpha_min and every optimal alpha by about the same
+# amount (exactly so if the extra contamination were k*Fneu; approximately in
+# practice, because the cell's own light and the noise in Fneu do not scale
+# with contamination -- in the simulation grid the offsets stayed within
+# ~0.1-0.2 across contamination x0.7-1.3), so "optimum - alpha_min" depends
+# little on the unknown contamination. Those offsets come from a
 # ground-truth simulation (Allen Huang et al. 2021 calibrated, OMSI spike
 # inference, scored against the true spikes) and are stored per simulated
 # condition in alpha_calibration.json (built by tools/build_alpha_calibration.py);
@@ -52027,7 +52030,8 @@ def suggest_alpha_ranges(sweep, rec_stats, calib):
     out = {"alpha_min": a_min, "alpha_min_at_edge": at_edge,
            "condition": ", ".join(c.get("name", "?") for c in pool),
            "distance": best_d, "provisional": bool(calib.get("provisional", True)),
-           "source": calib.get("_path", ""), "goals": {}}
+           "source": calib.get("_path", ""), "goals": {},
+           "absolute": calib.get("absolute_summary")}
     for g in ALPHA_GOALS:
         lo, hi, be = [], [], []
         for c in pool:
@@ -55111,6 +55115,20 @@ class KurtosisChecker:
             L.append(("Bright bar: best alpha across simulated correlation", TEXT_DIM, 7.5, "normal"))
             L.append(("levels (true correlation unknown). Pale: near-optimal.", TEXT_DIM, 7.5, "normal"))
             L.append(("", TEXT_MAIN, 4, "normal"))
+            ab = sug.get("absolute")
+            if ab:
+                L.append(("Across all simulated recordings (Allen-like optics):", TEXT_BRIGHT, 8, "bold"))
+                for g in goals:
+                    if g in ab:
+                        a_ = ab[g]
+                        L.append((f"  {ALPHA_GOALS[g][0]}:  median {a_['median']:.2f}  (middle half {a_['q25']:.2f}–{a_['q75']:.2f})",
+                                  goal_col[g], 8, "normal"))
+                pz = ab.get("pooled_spike_precision_correlation")
+                if pz:
+                    L.append((f"  Single default (spike-train, precision, corr.):  {pz['median']:.2f}  ({pz['q25']:.2f}–{pz['q75']:.2f})",
+                              TEXT_MAIN, 8, "bold"))
+                L.append(("  Absolute values: shift with contamination, so only for similar optics.", TEXT_DIM, 7, "normal"))
+                L.append(("", TEXT_MAIN, 4, "normal"))
             prov = "PROVISIONAL — " if sug["provisional"] else ""
             L.append((f"{prov}calibration: {sug['condition']}", C_FLOOR if sug["provisional"] else TEXT_MAIN, 8, "bold"))
             L.append((f"  (distance {sug['distance']:.2f} in log stats; source: {os.path.basename(str(sug['source']))})",
