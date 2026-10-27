@@ -77,7 +77,7 @@ Optional (only for the raw-TIFF NormCorre fallback in gain mode): caiman
 # Bump this on every change so a running instance's window title can be checked
 # against what's actually in this file -- handy when the app runs on a machine
 # separate from wherever this source file is being edited.
-APP_VERSION = "2026-10-27.3"
+APP_VERSION = "2026-10-27.4"
 
 import os
 import sys
@@ -53057,13 +53057,16 @@ class KurtosisChecker:
                                      "'Filter by kurtosis' above is "
                                      "checked.")
 
-        # ── Suggested interval: which goal is shaded on the sweep ────────
-        self.np_goal_var = tk.StringVar(value="spike_train")
-        goal_body = self._sidebar_card("SHADED INTERVAL", parent=ip)
+        # ── Suggested intervals: which goals are shaded (overlaid) ────────
+        # default: everything except recall (recall barely changes with alpha)
+        self.np_goal_vars = {g: tk.BooleanVar(value=(g != "recall")) for g in ALPHA_GOALS}
+        goal_body = self._sidebar_card("SHADED INTERVALS", parent=ip)
+        goal_fg = {"spike_train": C_TOP, "precision": "#9b59b6", "recall": C_MID, "correlation": C_HIST}
         for g, (lbl, _) in ALPHA_GOALS.items():
-            tk.Radiobutton(goal_body, text=lbl, variable=self.np_goal_var, value=g,
-                           bg=CARD_BG, fg=TEXT_BRIGHT, selectcolor=CARD_BG,
-                           activebackground=CARD_BG, font=(FONT_FAMILY, 10), anchor="w",
+            tk.Checkbutton(goal_body, text=lbl, variable=self.np_goal_vars[g],
+                           bg=CARD_BG, fg=goal_fg[g], selectcolor=CARD_BG,
+                           activebackground=CARD_BG, activeforeground=goal_fg[g],
+                           font=(FONT_FAMILY, 10), anchor="w",
                            command=self._rerender_neuropil_if_done).pack(fill=tk.X)
         tk.Label(goal_body, text="Click the sweep (or use ← →) to choose "
                  "alpha; example cells (high / mid / low kurtosis) update on "
@@ -55280,10 +55283,17 @@ class KurtosisChecker:
         mean_c = r["mean_corr"]; sem_c = r["sem_corr"]
         goal_col = {"spike_train": C_TOP, "precision": "#9b59b6", "recall": C_MID, "correlation": C_HIST}
         goals = list(ALPHA_GOALS)
-        g_sel = self.np_goal_var.get() if hasattr(self, "np_goal_var") else "spike_train"
-        if self.np_sel_alpha is None:                    # default: middle of the shaded best range
-            if sug and g_sel in sug["goals"]:
-                b0, b1 = sug["goals"][g_sel]["best"]; target = 0.5 * (b0 + b1)
+        gv = getattr(self, "np_goal_vars", None)
+        g_on = [g for g in goals if (gv[g].get() if gv else g != "recall")]
+        g_on = [g for g in g_on if sug and g in sug["goals"]]
+        if self.np_sel_alpha is None:
+            # default: middle of the overlap of the shaded best ranges (or of
+            # their midpoints if they do not overlap)
+            if g_on:
+                lo_ = max(sug["goals"][g]["best"][0] for g in g_on)
+                hi_ = min(sug["goals"][g]["best"][1] for g in g_on)
+                target = 0.5 * (lo_ + hi_) if lo_ <= hi_ else \
+                    float(np.median([0.5 * sum(sug["goals"][g]["best"]) for g in g_on]))
             else:
                 target = 0.0
             self.np_sel_alpha = float(alphas[int(np.argmin(np.abs(alphas - target)))])
@@ -55318,15 +55328,26 @@ class KurtosisChecker:
         ax.fill_between(alphas, mean_c - sem_c, mean_c + sem_c, color=C_INCL, alpha=0.25, zorder=1)
         ax.plot(alphas, mean_c, color=C_INCL, lw=2, zorder=2, marker="o", ms=3)
         ax.axhline(0, color="#555", lw=1, ls=":", zorder=0)
-        if sug and g_sel in sug["goals"]:
-            lo, hi = sug["goals"][g_sel]["range"]
-            b0, b1 = sug["goals"][g_sel]["best"]
+        # shaded intervals: best range of every selected goal, overlaid; where
+        # they overlap the colours mix. Near-optimal ranges are outlined at the
+        # top of the sweep so the overlay stays readable.
+        yb = 0.02
+        for gi, g in enumerate(g_on):
+            lo, hi = sug["goals"][g]["range"]
+            b0, b1 = sug["goals"][g]["best"]
             for a_ in left:
-                a_.axvspan(lo, hi, color=goal_col[g_sel], alpha=0.07, lw=0, zorder=0)
-                a_.axvspan(b0, max(b1, b0 + 0.01), color=goal_col[g_sel], alpha=0.18, lw=0, zorder=0)
-            ax.text(0.01, 0.02, f"shaded: suggested alpha for {ALPHA_GOALS[g_sel][0].lower()}  "
-                    f"(best {b0:.2f}–{b1:.2f}, near-optimal {lo:.2f}–{hi:.2f})",
-                    transform=ax.transAxes, color=goal_col[g_sel], fontsize=8, va="bottom")
+                a_.axvspan(b0, max(b1, b0 + 0.01), color=goal_col[g], alpha=0.13, lw=0, zorder=0)
+            ax.plot([lo, hi], [1.0 - 0.012 * (gi + 1)] * 2, transform=ax.get_xaxis_transform(),
+                    color=goal_col[g], lw=2.5, alpha=0.6, solid_capstyle="butt", zorder=4)
+            ax.text(0.01, yb, f"{ALPHA_GOALS[g][0]}: best {b0:.2f}–{b1:.2f}  (near-optimal {lo:.2f}–{hi:.2f})",
+                    transform=ax.transAxes, color=goal_col[g], fontsize=7.5, va="bottom")
+            yb += 0.045
+        if len(g_on) > 1:
+            lo_ = max(sug["goals"][g]["best"][0] for g in g_on)
+            hi_ = min(sug["goals"][g]["best"][1] for g in g_on)
+            msg = (f"all selected goals' best ranges overlap at {lo_:.2f}–{hi_:.2f}" if lo_ <= hi_
+                   else "the selected goals' best ranges do not overlap")
+            ax.text(0.01, yb, msg, transform=ax.transAxes, color=TEXT_BRIGHT, fontsize=7.5, va="bottom")
         if sug:
             for a_ in left:
                 a_.axvline(sug["alpha_min"], color=TEXT_DIM, lw=1.0, ls="--", zorder=1)
